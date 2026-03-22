@@ -341,21 +341,39 @@ async def live_tracking(
             "data": conn_data,
         })
 
-        # Message loop (90s timeout = ~6× ping interval of 15s)
-        _WS_RECEIVE_TIMEOUT = 90.0
+        # Message loop with server-side keepalive ping.
+        # Railway's TCP proxy closes idle connections after ~30 s, so we must
+        # actively send something before that window expires.
+        # Strategy: wait up to _SERVER_PING_INTERVAL for a client message;
+        # on timeout send a server ping instead of closing. After
+        # _MAX_MISSED_PINGS consecutive timeouts without a pong, treat
+        # connection as dead and close cleanly.
+        _SERVER_PING_INTERVAL = 20.0   # send server ping every 20 s of silence
+        _MAX_MISSED_PINGS     = 3       # dead after 3 × 20 s = 60 s of silence
+        _missed_pings         = 0
+
         while True:
             try:
                 raw = await asyncio.wait_for(
                     websocket.receive_text(),
-                    timeout=_WS_RECEIVE_TIMEOUT,
+                    timeout=_SERVER_PING_INTERVAL,
                 )
+                _missed_pings = 0   # any message resets the counter
             except asyncio.TimeoutError:
-                disconnect_reason = f"انقطاع الاتصال — لا بيانات لمدة {_WS_RECEIVE_TIMEOUT:.0f} ثانية"
-                logger.warning(
-                    "⏰ [%s] No data from user=%s for %.0fs — closing",
-                    train_id, user_id[:8], _WS_RECEIVE_TIMEOUT,
-                )
-                break
+                _missed_pings += 1
+                if _missed_pings >= _MAX_MISSED_PINGS:
+                    disconnect_reason = "انقطاع الاتصال — لا استجابة"
+                    logger.warning(
+                        "⏰ [%s] No response from user=%s after %d pings — closing",
+                        train_id, user_id[:8], _missed_pings,
+                    )
+                    break
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    disconnect_reason = "انقطاع الاتصال — فشل إرسال ping"
+                    break
+                continue
 
             try:
                 msg = json.loads(raw)
