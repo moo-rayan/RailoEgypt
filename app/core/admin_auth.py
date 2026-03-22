@@ -13,15 +13,11 @@ Admin Levels:
 import logging
 from typing import Optional
 
+import httpx
 from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import cast, select
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.database import get_db
 from app.core.security import verify_supabase_token
-from app.models.profile import Profile
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +41,38 @@ class AdminUser:
         return self.admin_level == "monitor"
 
 
+async def _fetch_admin_profile(user_id: str) -> Optional[dict]:
+    """
+    Query the profiles table via Supabase PostgREST REST API.
+    Avoids SQLAlchemy/asyncpg entirely — no pgbouncer prepared-statement issues.
+    """
+    url = (
+        f"{settings.supabase_url}/rest/v1/profiles"
+        f"?select=is_admin,admin_level,email,display_name"
+        f"&id=eq.{user_id}"
+        f"&limit=1"
+    )
+    headers = {
+        "Authorization": f"Bearer {settings.supabase_service_role_key}",
+        "apikey": settings.supabase_service_role_key,
+        "Accept": "application/json",
+        "Accept-Profile": "EgRailway",  # profiles table lives in EgRailway schema
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            logger.error("Admin profile fetch failed: HTTP %s", resp.status_code)
+            return None
+        rows = resp.json()
+        return rows[0] if rows else None
+    except Exception as exc:
+        logger.error("Admin profile fetch error: %s", exc)
+        return None
+
+
 async def get_admin_user(
     authorization: str = Header(..., description="Bearer <supabase_jwt>"),
-    db: AsyncSession = Depends(get_db),
 ) -> AdminUser:
     """
     Verify Supabase JWT and ensure the user is an admin.
@@ -83,25 +108,20 @@ async def get_admin_user(
             detail="User ID not found in token",
         )
 
-    # 3. Check admin status in profiles table
-    result = await db.execute(
-        select(
-            Profile.is_admin,
-            Profile.admin_level,
-            Profile.email,
-            Profile.display_name,
-        ).where(Profile.id == cast(str(user_id), PG_UUID))
-    )
-    row = result.one_or_none()
+    # 3. Check admin status via Supabase REST API (avoids pgbouncer prepared-stmt issues)
+    profile = await _fetch_admin_profile(user_id)
 
-    if row is None:
+    if profile is None:
         logger.warning("Admin auth: profile not found for user %s", user_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied — profile not found",
         )
 
-    is_admin, admin_level, email, display_name = row
+    is_admin = profile.get("is_admin", False)
+    admin_level = profile.get("admin_level", "")
+    email = profile.get("email", "")
+    display_name = profile.get("display_name", "")
 
     if not is_admin or admin_level not in ("fulladmin", "monitor"):
         logger.warning(
@@ -138,7 +158,6 @@ async def require_fulladmin(
 async def get_admin_or_legacy_key(
     authorization: Optional[str] = Header(None),
     x_admin_key: Optional[str] = Header(None),
-    db: AsyncSession = Depends(get_db),
 ) -> AdminUser:
     """
     Transitional dependency: accepts either Supabase JWT or legacy X-Admin-Key.
@@ -147,7 +166,7 @@ async def get_admin_or_legacy_key(
     """
     # If JWT is provided, it MUST be valid — fail immediately if not
     if authorization and authorization.startswith("Bearer "):
-        return await get_admin_user(authorization=authorization, db=db)
+        return await get_admin_user(authorization=authorization)
 
     # Legacy key ONLY when no JWT is provided (for WebSocket/external tools)
     if x_admin_key:
