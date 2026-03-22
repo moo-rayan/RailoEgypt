@@ -11,9 +11,7 @@ def _async_url(url: str) -> str:
     return url
 
 
-_CONNECT_ARGS: dict = {}
-if "pooler.supabase.com" in settings.database_url and ":6543" in settings.database_url:
-    _CONNECT_ARGS = {"prepared_statement_cache_size": 0, "statement_cache_size": 0}
+_CONNECT_ARGS: dict = {"prepared_statement_cache_size": 0, "statement_cache_size": 0}
 
 engine = create_async_engine(
     _async_url(settings.database_url),
