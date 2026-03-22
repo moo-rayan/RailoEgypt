@@ -11,15 +11,19 @@ def _async_url(url: str) -> str:
     return url
 
 
-_CONNECT_ARGS: dict = {"prepared_statement_cache_size": 0, "statement_cache_size": 0}
+_CONNECT_ARGS: dict = {
+    "statement_cache_size": 0,
+    "prepared_statement_cache_size": 0,
+    "server_settings": {"jit": "off"},
+}
 
 engine = create_async_engine(
     _async_url(settings.database_url),
     connect_args=_CONNECT_ARGS,
-    pool_size=10,
-    max_overflow=20,
+    pool_size=5,
+    max_overflow=10,
     pool_pre_ping=True,
-    pool_recycle=1800,
+    pool_recycle=300,
     pool_timeout=30,
     echo=False,
 )
