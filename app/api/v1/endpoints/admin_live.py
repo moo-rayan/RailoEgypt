@@ -1,0 +1,200 @@
+"""
+Admin endpoints for live tracking management.
+
+All endpoints require admin authentication (Supabase JWT + is_admin).
+Read endpoints: monitor + fulladmin. Write endpoints: fulladmin only.
+"""
+
+import logging
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import BaseModel
+
+from app.core.admin_auth import AdminUser, get_admin_or_legacy_key, require_fulladmin
+from app.services.ban_service import ban_contributor, is_banned, list_bans, unban_contributor
+from app.services.tracking_manager import tracking_manager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/live/admin", tags=["Live Admin"])
+
+
+# ── Request schemas ───────────────────────────────────────────────────────────
+
+class BanRequest(BaseModel):
+    user_id: str
+    reason: str = ""
+    duration_minutes: int = 0  # 0 = permanent
+
+
+class UnbanRequest(BaseModel):
+    user_id: str
+
+
+class SetLeaderRequest(BaseModel):
+    train_id: str
+    user_id: str
+
+
+class RemoveLeaderRequest(BaseModel):
+    train_id: str
+
+
+class SetMaxContributorsRequest(BaseModel):
+    train_id: str
+    max_active: int  # new limit (1-50)
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/ban", dependencies=[Depends(require_fulladmin)])
+async def ban_contributor_endpoint(body: BanRequest):
+    """
+    Ban a contributor from contributing.
+    duration_minutes=0 means permanent ban.
+    Also kicks them from any active room.
+    """
+    # First kick from all active rooms
+    for room in tracking_manager.all_rooms_info():
+        for c in room["contributors"]:
+            if c["user_id"] == body.user_id:
+                await tracking_manager.kick_contributor(
+                    train_id=room["train_id"],
+                    user_id=body.user_id,
+                    reason=f"banned: {body.reason}",
+                )
+                break
+
+    # Store ban in Redis
+    success = await ban_contributor(
+        user_id=body.user_id,
+        reason=body.reason,
+        duration_minutes=body.duration_minutes,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to store ban",
+        )
+
+    duration_text = f"{body.duration_minutes} minutes" if body.duration_minutes > 0 else "permanent"
+    return {"ok": True, "message": f"User {body.user_id[:8]}... banned ({duration_text})"}
+
+
+@router.post("/unban", dependencies=[Depends(require_fulladmin)])
+async def unban_contributor_endpoint(body: UnbanRequest):
+    """Remove a contributor's ban."""
+    removed = await unban_contributor(body.user_id)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active ban found for this user",
+        )
+    return {"ok": True, "message": f"User {body.user_id[:8]}... unbanned"}
+
+
+@router.get("/bans", dependencies=[Depends(get_admin_or_legacy_key)])
+async def list_bans_endpoint():
+    """List all currently banned contributors."""
+    bans = await list_bans()
+    return {"total": len(bans), "bans": bans}
+
+
+@router.post("/set-leader", dependencies=[Depends(require_fulladmin)])
+async def set_leader_endpoint(body: SetLeaderRequest):
+    """Set a contributor as the room leader (only their updates are used)."""
+    success = tracking_manager.set_leader(
+        train_id=body.train_id,
+        user_id=body.user_id,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contributor not found in the specified room",
+        )
+    return {"ok": True, "message": f"User {body.user_id[:8]}... set as leader"}
+
+
+@router.post("/remove-leader", dependencies=[Depends(require_fulladmin)])
+async def remove_leader_endpoint(body: RemoveLeaderRequest):
+    """Remove leader from a room (revert to auto aggregation)."""
+    success = tracking_manager.remove_leader(body.train_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No leader set for this room",
+        )
+    return {"ok": True, "message": "Leader removed, reverted to auto aggregation"}
+
+
+@router.get("/logs/{train_id}", dependencies=[Depends(get_admin_or_legacy_key)])
+async def get_room_logs(train_id: str):
+    """Get event log for a tracking room."""
+    logs = tracking_manager.get_room_logs(train_id)
+    return {"train_id": train_id, "total": len(logs), "logs": logs}
+
+
+@router.get("/rooms", dependencies=[Depends(get_admin_or_legacy_key)])
+async def get_admin_rooms():
+    """List all active rooms with full details (for admin dashboard)."""
+    rooms = tracking_manager.all_rooms_info()
+    total_contributors = sum(r["contributors_count"] for r in rooms)
+    total_listeners = sum(r["listeners_count"] for r in rooms)
+    total_waiting = sum(r.get("waiting_count", 0) for r in rooms)
+    return {
+        "total_rooms": len(rooms),
+        "total_contributors": total_contributors,
+        "total_listeners": total_listeners,
+        "total_waiting": total_waiting,
+        "rooms": rooms,
+    }
+
+
+@router.get("/feed/{train_id}", dependencies=[Depends(get_admin_or_legacy_key)])
+async def get_room_feed(train_id: str):
+    """Get live GPS update feed for a tracking room (last 100 updates)."""
+    feed = tracking_manager.get_room_feed(train_id)
+    return {"train_id": train_id, "total": len(feed), "feed": feed}
+
+
+@router.post("/set-max-contributors", dependencies=[Depends(require_fulladmin)])
+async def set_max_contributors_endpoint(body: SetMaxContributorsRequest):
+    """Update the max active contributors limit for a room."""
+    if body.max_active < 1 or body.max_active > 50:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="max_active must be between 1 and 50",
+        )
+    room = tracking_manager.get_room(body.train_id)
+    if not room:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Room not found",
+        )
+    old_max = room.max_active_contributors
+    room.max_active_contributors = body.max_active
+    logger.info(
+        "⚙️ [%s] max_active_contributors changed: %d → %d",
+        body.train_id, old_max, body.max_active,
+    )
+    # If limit increased and there are waiting contributors, promote
+    if body.max_active > old_max and room.waiting_list:
+        await tracking_manager._promote_from_waiting_list(room)
+    return {
+        "ok": True,
+        "train_id": body.train_id,
+        "old_max": old_max,
+        "new_max": body.max_active,
+        "active": len(room.contributors),
+        "waiting": len(room.waiting_list),
+    }
+
+
+@router.get("/check-ban/{user_id}", dependencies=[Depends(get_admin_or_legacy_key)])
+async def check_ban_endpoint(user_id: str):
+    """Check if a specific user is currently banned."""
+    ban_info = await is_banned(user_id)
+    if ban_info is None:
+        return {"banned": False, "user_id": user_id}
+    return {"banned": True, "user_id": user_id, "ban_info": ban_info}
