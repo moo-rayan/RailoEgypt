@@ -21,8 +21,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import WebSocket
-
 from app.core.cache import cache_delete, cache_get, cache_set
 from app.core.config import settings
 from app.services.railway_service import railway_graph, _haversine
@@ -62,7 +60,6 @@ class RoomEvent:
 @dataclass
 class Contributor:
     user_id: str
-    ws: WebSocket
     display_name: str = ""
     avatar_url: str = ""
     lat: float = 0.0
@@ -82,7 +79,6 @@ class Contributor:
 class WaitingContributor:
     """A contributor waiting for an active slot."""
     user_id: str
-    ws: WebSocket
     display_name: str = ""
     avatar_url: str = ""
     from_station_name: str = ""
@@ -104,10 +100,11 @@ class TrainRoom:
 
     # Participants
     contributors: dict[str, Contributor] = field(default_factory=dict)  # user_id → Contributor
-    listeners: dict[str, WebSocket] = field(default_factory=dict)       # user_id → ws
     waiting_list: list[WaitingContributor] = field(default_factory=list) # sorted by trip_distance desc
     leader_id: Optional[str] = None   # if set, only this contributor's updates are used
     max_active_contributors: int = field(default_factory=lambda: settings.max_active_contributors)
+    # Temporary kick block: user_id → timestamp until which they cannot rejoin
+    kicked_until: dict[str, float] = field(default_factory=dict)
 
     # Event log (ring buffer, last 200 events)
     event_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
@@ -251,16 +248,22 @@ class TrackingManager:
             )
         return total_m / 1000.0  # metres → km
 
-    async def add_contributor(self, train_id: str, user_id: str, ws: WebSocket) -> dict:
+    async def add_contributor(self, train_id: str, user_id: str) -> dict:
         """
-        Add a contributor to a room. Returns status dict:
+        Register a contributor in a room (HTTP model — no WebSocket).
+        Returns status dict:
           {"status": "active"} or {"status": "waiting", "position": N, "total": M}
+          {"status": "kicked"}  if temporarily blocked
 
-        Captain priority: a captain ALWAYS gets an active slot. If the room
-        is full, the lowest-priority non-captain contributor is demoted to
-        the waiting list to make room.
+        Captain priority: a captain ALWAYS gets an active slot.
         """
         room = self.get_or_create_room(train_id)
+
+        # Check temporary kick block
+        kick_expiry = room.kicked_until.get(user_id, 0)
+        if time.time() < kick_expiry:
+            return {"status": "kicked", "message_ar": "تم طردك من الغرفة مؤقتاً"}
+
         avatar = self._user_avatars.get(user_id, "")
         name = self._user_display_names.get(user_id, "")
         is_captain = self._user_captains.get(user_id, False)
@@ -293,7 +296,7 @@ class TrackingManager:
                 demoted = non_captains[0]
                 # Move demoted to waiting list
                 waiting_entry = WaitingContributor(
-                    user_id=demoted.user_id, ws=demoted.ws,
+                    user_id=demoted.user_id,
                     display_name=demoted.display_name, avatar_url=demoted.avatar_url,
                     from_station_name=demoted.from_station_name,
                     to_station_name=demoted.to_station_name,
@@ -311,24 +314,13 @@ class TrackingManager:
                     "⬇️ [%s] Demoted %s to waiting (captain %s joining)",
                     train_id, demoted.user_id[:8], user_id[:8],
                 )
-                # Notify demoted user
-                try:
-                    await demoted.ws.send_json({
-                        "type": "demoted_to_waiting",
-                        "data": {
-                            "message_ar": "تم نقلك لقائمة الانتظار لإفساح المجال لقائد القطار.",
-                            "message_en": "You have been moved to waiting list for a train captain.",
-                        },
-                    })
-                except Exception:
-                    pass
                 has_slot = True
 
         # Check if there's room for an active contributor
         if has_slot:
-            captain_label = " 🚂Captain" if is_captain else ""
+            captain_label = " �Captain" if is_captain else ""
             room.contributors[user_id] = Contributor(
-                user_id=user_id, ws=ws, display_name=name, avatar_url=avatar,
+                user_id=user_id, display_name=name, avatar_url=avatar,
                 from_station_name=from_name, to_station_name=to_name,
                 trip_distance_km=distance_km, is_captain=is_captain,
             )
@@ -352,7 +344,7 @@ class TrackingManager:
 
         # Room full (and not a captain) → add to waiting list
         waiting = WaitingContributor(
-            user_id=user_id, ws=ws, display_name=name, avatar_url=avatar,
+            user_id=user_id, display_name=name, avatar_url=avatar,
             from_station_name=from_name, to_station_name=to_name,
             trip_distance_km=distance_km, joined_at=time.time(),
             is_captain=is_captain,
@@ -372,16 +364,6 @@ class TrackingManager:
             len(room.waiting_list),
         )
         return {"status": "waiting", "position": position, "total": len(room.waiting_list)}
-
-    async def add_listener(self, train_id: str, user_id: str, ws: WebSocket) -> None:
-        room = self.get_or_create_room(train_id)
-        room.listeners[user_id] = ws
-        self._log_event(room, "join", user_id, f"listener joined (total: {len(room.listeners)})")
-        logger.info("👁️+ [%s] Listener joined: %s (total: %d)", train_id, user_id, len(room.listeners))
-
-        # Send initial position if tracking is active
-        if room.status != "waiting":
-            await self._send_initial_position(ws, room)
 
     async def remove_participant(self, train_id: str, user_id: str, disconnect_reason: str = "") -> None:
         room = self._rooms.get(train_id)
@@ -410,11 +392,6 @@ class TrackingManager:
                 logger.info("⏳- [%s] Waiting contributor left: %s (remaining waiting: %d)", train_id, user_id[:8], len(room.waiting_list))
                 break
 
-        if user_id in room.listeners:
-            del room.listeners[user_id]
-            removed = True
-            logger.info("👁️- [%s] Listener left: %s (remaining: %d)", train_id, user_id, len(room.listeners))
-
         if removed:
             # If the removed user was the leader, clear leader
             if room.leader_id == user_id:
@@ -435,23 +412,16 @@ class TrackingManager:
                 await cache_delete(f"train_pos:{train_id}")
                 logger.info("⏸️  [%s] No contributors — status → waiting, max_progress reset, Redis cache cleared", train_id)
 
-            # Broadcast updated state immediately so listeners see the
-            # correct contributor count, avatars, speed and status.
-            if was_contributor and (room.contributors or room.listeners):
-                await self._broadcast_update(room)
-
             self._cleanup_room(train_id)
 
     async def _promote_from_waiting_list(self, room: TrainRoom) -> None:
         """Promote the highest-priority waiting contributor to active."""
         while room.waiting_list and len(room.contributors) < room.max_active_contributors:
-            # Waiting list is already sorted by distance desc → first = longest trip
             promoted = room.waiting_list.pop(0)
             name = promoted.display_name or promoted.user_id[:8]
 
             room.contributors[promoted.user_id] = Contributor(
                 user_id=promoted.user_id,
-                ws=promoted.ws,
                 display_name=promoted.display_name,
                 avatar_url=promoted.avatar_url,
                 from_station_name=promoted.from_station_name,
@@ -471,33 +441,21 @@ class TrackingManager:
                 len(room.contributors), room.max_active_contributors, len(room.waiting_list),
             )
 
-            # Notify the promoted contributor
-            try:
-                await promoted.ws.send_json({
-                    "type": "promoted",
-                    "data": {
-                        "message": "تمت ترقيتك إلى مساهم نشط. يمكنك الآن إرسال تحديثات الموقع.",
-                        "message_en": "You have been promoted to active contributor.",
-                    },
-                })
-            except Exception as exc:
-                logger.warning("⚠️ [%s] Failed to notify promoted user %s: %s", room.train_id, promoted.user_id[:8], exc)
-
     # ── Admin actions ──────────────────────────────────────────────────────
 
+    _KICK_BLOCK_SECONDS = 300  # 5 minutes block after kick
+
     async def kick_contributor(self, train_id: str, user_id: str, reason: str = "") -> bool:
-        """Remove a contributor and close their WebSocket."""
+        """Remove a contributor and block them from re-joining for 5 minutes."""
         room = self._rooms.get(train_id)
         if not room or user_id not in room.contributors:
             return False
-        contributor = room.contributors[user_id]
         self._log_event(room, "kick", user_id, reason or "kicked by admin")
-        try:
-            await contributor.ws.close(code=4002, reason="kicked_by_admin")
-        except Exception:
-            pass
+        # Set temporary kick block so next HTTP POST gets rejected
+        room.kicked_until[user_id] = time.time() + self._KICK_BLOCK_SECONDS
         await self.remove_participant(train_id, user_id)
-        logger.info("🚫 [%s] Contributor %s kicked: %s", train_id, user_id, reason)
+        logger.info("🚫 [%s] Contributor %s kicked (blocked %ds): %s",
+                    train_id, user_id, self._KICK_BLOCK_SECONDS, reason)
         return True
 
     def set_leader(self, train_id: str, user_id: str) -> bool:
@@ -735,14 +693,11 @@ class TrackingManager:
         # Update status
         room.status = "moving" if speed > 2.0 else "stopped"
 
-        # Broadcast to all listeners
-        await self._broadcast_update(room)
-
-        # Cache train position in Redis
+        # Cache full position data in Redis for HTTP polling
         if room.lat != 0.0 or room.lng != 0.0:
             await cache_set(
                 f"train_pos:{room.train_id}",
-                {"lat": room.lat, "lng": room.lng, "speed": room.speed},
+                self.get_position_data(room),
                 ttl=_TRAIN_POS_TTL,
             )
 
@@ -941,85 +896,42 @@ class TrackingManager:
                     break
         return infos
 
-    async def _send_initial_position(self, ws: WebSocket, room: TrainRoom) -> None:
-        """Send current aggregated position to a newly connected listener."""
-        msg = {
-            "t": "ip",
-            "d": {
-                "tid": room.train_id,
-                "la": round(room.lat, 6),
-                "ln": round(room.lng, 6),
-                "sp": round(room.speed, 1),
-                "st": room.status,
-                "cn": self._active_contributor_count(room),
-                "dir": room.direction,
-                "ss": room.start_station,
-                "es": room.end_station,
-                "ts": _iso_now(),
-            },
-        }
-        try:
-            await ws.send_json(msg)
-            logger.info("📤 [%s] Sent initial_position to listener", room.train_id)
-        except Exception as exc:
-            logger.warning("Failed to send initial_position: %s", exc)
+    async def cleanup_stale_contributors(self) -> int:
+        """Remove contributors whose last update is older than _STALE_TIMEOUT_S.
 
-    async def _broadcast_update(self, room: TrainRoom) -> None:
-        """Broadcast position update to all listeners + contributors."""
-        msg = {
-            "t": "pu",
-            "d": {
-                "tid": room.train_id,
-                "la": round(room.lat, 6),
-                "ln": round(room.lng, 6),
-                "sp": round(room.speed, 1),
-                "st": room.status,
-                "cn": self._active_contributor_count(room),
-                "dir": room.direction,
-                "ts": _iso_now(),
-            },
-        }
+        Called by a background task every 60 seconds.  Returns the number of
+        contributors removed across all rooms.
+        """
+        now = time.time()
+        removed_count = 0
+        for train_id in list(self._rooms.keys()):
+            room = self._rooms.get(train_id)
+            if not room:
+                continue
+            stale = [
+                uid for uid, c in room.contributors.items()
+                if c.last_update > 0 and (now - c.last_update) > _STALE_TIMEOUT_S
+            ]
+            for uid in stale:
+                display = room.contributors[uid].display_name or uid[:8]
+                del room.contributors[uid]
+                removed_count += 1
+                self._log_event(room, "leave", uid, f"{display} محذوف تلقائياً (انقطع عن الإرسال)")
+                logger.info("🧹 [%s] Stale contributor removed: %s", train_id, uid[:8])
+                # Promote waiting contributors if a slot freed up
+                if room.waiting_list:
+                    await self._promote_from_waiting_list(room)
+            if stale:
+                if not room.contributors:
+                    room.status = "waiting"
+                    room.max_progress = 0.0
+                    room.max_lat = 0.0
+                    room.max_lng = 0.0
+                    await cache_delete(f"train_pos:{train_id}")
+                self._cleanup_room(train_id)
+        return removed_count
 
-        all_ws: list[tuple[str, WebSocket, str]] = []  # (uid, ws, role)
-        for uid, ws in room.listeners.items():
-            all_ws.append((uid, ws, "listener"))
-        for uid, c in room.contributors.items():
-            all_ws.append((uid, c.ws, "contributor"))
-        for w in room.waiting_list:
-            all_ws.append((w.user_id, w.ws, "waiting"))
-
-        dead_listeners: list[str] = []
-        for uid, ws, role in all_ws:
-            try:
-                await ws.send_json(msg)
-            except Exception as exc:
-                if role == "contributor":
-                    # Don't remove contributors here — their WS handler
-                    # loop will detect the disconnect and clean up properly.
-                    logger.warning(
-                        "⚠️ [%s] Broadcast send failed for contributor %s: %s",
-                        room.train_id, uid[:8], exc,
-                    )
-                elif role == "waiting":
-                    # Waiting contributors also clean up via their WS handler
-                    logger.warning(
-                        "⚠️ [%s] Broadcast send failed for waiting %s: %s",
-                        room.train_id, uid[:8], exc,
-                    )
-                else:
-                    dead_listeners.append(uid)
-
-        # Only remove dead listeners (contributors clean up via their handler)
-        for uid in dead_listeners:
-            await self.remove_participant(room.train_id, uid)
-
-        active_count = len(room.listeners) + len(room.contributors)
-        logger.info(
-            "📢 [%s] Broadcast: (%.6f, %.6f) speed=%.1f status=%s → %d clients",
-            room.train_id, room.lat, room.lng, room.speed, room.status, active_count,
-        )
-
-    # ── Stats ─────────────────────────────────────────────────────────────
+    # ── Stats ───────────────────────────────────────────────────────────────────
 
     @property
     def active_rooms(self) -> int:
@@ -1027,6 +939,7 @@ class TrackingManager:
 
     def all_rooms_info(self) -> list[dict]:
         """Return detailed info for every active room (for dashboard)."""
+        now = time.time()
         results = []
         for tid, room in self._rooms.items():
             contributors = []
@@ -1039,13 +952,13 @@ class TrackingManager:
                     "lng": round(c.lng, 6),
                     "speed": round(c.speed, 1),
                     "last_update": c.last_update,
+                    "is_stale": c.last_update > 0 and (now - c.last_update) > _STALE_TIMEOUT_S,
                     "is_leader": uid == room.leader_id,
                     "is_captain": c.is_captain,
                     "from_station": c.from_station_name,
                     "to_station": c.to_station_name,
                     "trip_distance_km": round(c.trip_distance_km, 1),
                 })
-            # Sort: captains first, then leaders, then by trip distance
             contributors.sort(key=lambda x: (not x["is_captain"], not x["is_leader"], -x["trip_distance_km"]))
             waiting = []
             for w in room.waiting_list:
@@ -1069,7 +982,7 @@ class TrackingManager:
                 "start_station": room.start_station,
                 "end_station": room.end_station,
                 "contributors_count": len(room.contributors),
-                "listeners_count": len(room.listeners),
+                "listeners_count": 0,  # HTTP model — listeners not tracked
                 "waiting_count": len(room.waiting_list),
                 "max_active_contributors": room.max_active_contributors,
                 "leader_id": room.leader_id,
@@ -1085,7 +998,7 @@ class TrackingManager:
         return {
             "train_id": train_id,
             "contributors": len(room.contributors),
-            "listeners": len(room.listeners),
+            "listeners": 0,
             "status": room.status,
             "lat": room.lat,
             "lng": room.lng,

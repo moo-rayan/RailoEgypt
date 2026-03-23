@@ -224,6 +224,21 @@ async def _build_and_store_bundle() -> None:
         logger.error("Failed to build data bundle: %s", exc)
 
 
+async def _stale_contributor_scheduler():
+    """Background task: remove stale contributors (no update for 120s) every 60s."""
+    from app.services.tracking_manager import tracking_manager
+    while True:
+        try:
+            await asyncio.sleep(60)
+            removed = await tracking_manager.cleanup_stale_contributors()
+            if removed:
+                logger.info("🧹 Stale contributor cleanup: removed %d", removed)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Stale contributor scheduler error: %s", exc)
+
+
 async def _account_deletion_scheduler():
     """Background task: process expired account deletion requests every 6 hours."""
     from datetime import datetime, timezone
@@ -343,17 +358,19 @@ async def lifespan(app: FastAPI):
             logger.info("R2 miss, building bundle from scratch...")
             await _build_and_store_bundle()
 
-    # ── 5. Start account deletion scheduler ──────────────────────────────
+    # ── 5. Start background tasks ────────────────────────────────────────────
     deletion_task = asyncio.create_task(_account_deletion_scheduler())
+    stale_task = asyncio.create_task(_stale_contributor_scheduler())
 
     yield
 
     # Cleanup: cancel background tasks
-    deletion_task.cancel()
-    try:
-        await deletion_task
-    except asyncio.CancelledError:
-        pass
+    for task in (deletion_task, stale_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 class _WebSocketSafeRateLimiter:

@@ -1,32 +1,29 @@
 """
-Real-time train tracking WebSocket endpoint.
+HTTP-based live train tracking endpoints.
 
-POST /api/v1/live/ticket
-    Get a short-lived HMAC ticket for WebSocket connection.
+POST /api/v1/live/{train_id}/location
+    Contributor sends GPS update every 30 s.
     Requires Supabase JWT in Authorization header.
 
-WS   /api/v1/live/{train_id}?ticket=<ticket>
-    Real-time tracking: contributors send GPS, listeners receive updates.
+GET  /api/v1/live/position/{train_id}
+    Listener polls for the latest aggregated train position every 30 s.
+    Requires Supabase JWT in Authorization header.
 
 GET  /api/v1/live/status/{train_id}
     Quick check if tracking is active for a train.
 """
 
-import asyncio
-import json
 import logging
-from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
-
-from app.core.admin_auth import get_admin_or_legacy_key
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import cast, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.admin_auth import get_admin_or_legacy_key
 from app.core.database import AsyncSessionFactory, get_db
-from app.core.security import create_ticket, require_authenticated_user, verify_supabase_token, verify_ticket
+from app.core.security import require_authenticated_user, verify_supabase_token
 from app.models.profile import Profile
 from app.models.station import Station
 from app.models.trip import TripStop
@@ -37,176 +34,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/live", tags=["Live Tracking"])
 
 
-# ── Ticket request schema ────────────────────────────────────────────────────
+# ── HTTP: Contributor sends GPS location update ───────────────────────────────
 
-class TicketRequest(BaseModel):
-    train_id: str
-    role: str = "listener"  # "contributor" or "listener"
+class LocationUpdateRequest(BaseModel):
+    lat: float
+    lng: float
+    speed: float = 0.0
+    bearing: float = 0.0
     trip_id: int | None = None
-    from_station_name: str | None = None  # contributor's boarding station (Arabic)
-    to_station_name: str | None = None    # contributor's alighting station (Arabic)
+    from_station_name: str | None = None
+    to_station_name: str | None = None
 
 
-class TicketResponse(BaseModel):
-    ticket: str
-    expires_in: int = 43200  # 12 hours
-
-
-# ── REST: Get ticket ─────────────────────────────────────────────────────────
-
-@router.post("/ticket", response_model=TicketResponse)
-async def get_tracking_ticket(
-    body: TicketRequest,
-    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Exchange a Supabase JWT for a short-lived HMAC ticket.
-    The ticket is used to authenticate the WebSocket connection.
-    """
-    # Extract bearer token
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    token = authorization[7:]
-
-    # Verify with Supabase
-    user = await verify_supabase_token(token)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    user_id = user.get("id", "")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID not found in token")
-
-    # Validate role
-    if body.role not in ("contributor", "listener"):
-        raise HTTPException(status_code=400, detail="Role must be 'contributor' or 'listener'")
-
-    # Check if contributor is banned
-    if body.role == "contributor":
-        from app.services.ban_service import is_banned
-        ban_info = await is_banned(user_id)
-        if ban_info:
-            raise HTTPException(
-                status_code=403,
-                detail="You are banned from contributing",
-            )
-
-    # Store user avatar and display name for contributor broadcasts
-    user_meta = user.get("user_metadata", {}) or {}
-    avatar_url = user_meta.get("avatar_url", "") or user_meta.get("picture", "") or ""
-    display_name = (
-        user_meta.get("display_name", "")
-        or user_meta.get("full_name", "")
-        or user_meta.get("name", "")
-        or user.get("email", "").split("@")[0]
-    )
-    if avatar_url:
-        tracking_manager.set_user_avatar(user_id, avatar_url)
-    if display_name:
-        tracking_manager.set_user_display_name(user_id, display_name)
-
-    # Store contributor's personal trip info (boarding → alighting)
-    if body.role == "contributor":
-        tracking_manager.set_user_trip_info(
-            user_id,
-            from_station_name=body.from_station_name or "",
-            to_station_name=body.to_station_name or "",
-        )
-
-        # Check if user is a train captain
-        profile = (await db.execute(
-            select(Profile.is_captain).where(Profile.id == cast(user_id, PG_UUID))
-        )).scalar()
-        tracking_manager.set_user_captain(user_id, bool(profile))
-
-    logger.info(
-        "🎫 Ticket issued: user=%s train=%s role=%s",
-        user_id[:8], body.train_id, body.role,
-    )
-
-    # If contributor provides trip_id, load stations from DB (secure)
-    if body.trip_id:
-        # Load trip stops with station coordinates from database
-        rows = (
-            await db.execute(
-                select(TripStop, Station)
-                .outerjoin(Station, TripStop.station_id == Station.id)
-                .where(TripStop.trip_id == body.trip_id)
-                .order_by(TripStop.stop_order)
-            )
-        ).all()
-
-        stations = []
-        start_station = ""
-        end_station = ""
-
-        for stop, station in rows:
-            if station and station.latitude and station.longitude:
-                stations.append({
-                    "order": stop.stop_order,
-                    "name_ar": station.name_ar,
-                    "name_en": station.name_en,
-                    "lat": station.latitude,
-                    "lon": station.longitude,
-                    "time_ar": stop.time_ar or "",
-                    "time_en": stop.time_en or "",
-                })
-                if stop.stop_order == 1:
-                    start_station = station.name_ar
-                if stop.stop_order == len(rows):
-                    end_station = station.name_ar
-
-        if stations:
-            tracking_manager.set_trip_info(
-                train_id=body.train_id,
-                trip_id=body.trip_id,
-                stations=stations,
-                start_station=start_station,
-                end_station=end_station,
-            )
-
-    ticket = create_ticket(user_id, body.train_id, body.role)
-    return TicketResponse(ticket=ticket)
-
-
-# ── REST: Active trains (for authenticated users) ────────────────────────────
-
-@router.get("/active-trains")
-async def get_active_trains(
-    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
-):
-    """
-    Return a lightweight list of trains with active tracking rooms.
-    Requires a valid Supabase JWT (any authenticated user).
-    """
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    token = authorization[7:]
-
-    user = await verify_supabase_token(token)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    trains = []
-    for room in tracking_manager.all_rooms_info():
-        if room["contributors_count"] == 0:
-            continue
-        trains.append({
-            "train_id": room["train_id"],
-            "start_station": room.get("start_station", ""),
-            "end_station": room.get("end_station", ""),
-            "speed": room["speed"],
-            "status": room["status"],
-            "contributors_count": room["contributors_count"],
-            "listeners_count": room["listeners_count"],
-        })
-    return {"trains": trains, "total": len(trains)}
-
-
-# ── Helper: load trip stations into room ──────────────────────────────────────
-
-async def _ensure_trip_info(train_id: str, trip_id: int) -> None:
+async def _load_trip_info(train_id: str, trip_id: int) -> None:
     """Load trip stations from DB into the tracking room (if not already set)."""
     try:
         async with AsyncSessionFactory() as session:
@@ -248,241 +88,214 @@ async def _ensure_trip_info(train_id: str, trip_id: int) -> None:
                     end_station=end_station,
                 )
                 logger.info(
-                    "📍 [%s] Trip info loaded via WS handler: %d stations",
-                    train_id, len(stations),
+                    "📍 [%s] Trip info loaded: %d stations (trip_id=%d)",
+                    train_id, len(stations), trip_id,
                 )
     except Exception as exc:
-        logger.warning("⚠️ [%s] Failed to load trip info in WS: %s", train_id, exc)
+        logger.warning("⚠️ [%s] Failed to load trip info: %s", train_id, exc)
 
 
-# ── WebSocket: Live tracking ─────────────────────────────────────────────────
-
-@router.websocket("/{train_id}")
-async def live_tracking(
-    websocket: WebSocket,
+@router.post("/{train_id}/location")
+async def post_contributor_location(
     train_id: str,
-    ticket: str = Query(..., description="HMAC-signed ticket from /live/ticket"),
-    trip_id: int | None = Query(None, description="Trip ID for loading stations (contributor)"),
+    body: LocationUpdateRequest,
+    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    WebSocket for real-time train tracking.
-
-    Contributors send:
-      {"type": "location_update", "lat": ..., "lng": ..., "speed": ..., "bearing": ...}
-
-    All clients receive (compact keys):
-      {"t": "ip", "d": {...}}   — initial_position
-      {"t": "pu", "d": {...}}   — position_update
-
-    Contributors also receive:
-      {"type": "update_ack", "ok": true/false, "error": "...", ...}
+    Contributor sends their GPS location every 30 seconds.
+    Automatically registers the contributor in the room on first call.
+    Returns the current room status (active/waiting) and the latest
+    aggregated train position (so contributors can also see the map).
     """
-    # URL-decode ticket (WebSocket query params may arrive percent-encoded)
-    ticket = unquote(ticket)
-    logger.info("🔑 [%s] Ticket received (len=%d)", train_id, len(ticket))
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization[7:]
 
-    # Verify ticket
-    ticket_data = verify_ticket(ticket, train_id)
-    if ticket_data is None:
-        await websocket.close(code=4001, reason="Invalid or expired ticket")
-        logger.warning("🚫 WS rejected: invalid ticket for train %s", train_id)
-        return
+    user = await verify_supabase_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    user_id = ticket_data["user_id"]
-    role = ticket_data["role"]
+    user_id = user.get("id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    # Check if contributor is banned (ticket may have been issued before ban)
-    if role == "contributor":
-        from app.services.ban_service import is_banned
-        ban_info = await is_banned(user_id)
-        if ban_info:
-            await websocket.close(code=4003, reason="banned")
-            logger.warning("🚫 WS rejected: user %s is banned (train %s)", user_id[:8], train_id)
-            return
+    # Ban check
+    from app.services.ban_service import is_banned
+    ban_info = await is_banned(user_id)
+    if ban_info:
+        raise HTTPException(status_code=403, detail="You are banned from contributing")
 
-    await websocket.accept()
-    logger.info("✅ [%s] WS accepted for user=%s role=%s", train_id, user_id[:8], role)
-    logger.info("🔌 [%s] WS connected: user=%s role=%s", train_id, user_id[:8], role)
+    # Store user metadata
+    user_meta = user.get("user_metadata", {}) or {}
+    avatar_url = user_meta.get("avatar_url", "") or user_meta.get("picture", "") or ""
+    display_name = (
+        user_meta.get("display_name", "")
+        or user_meta.get("full_name", "")
+        or user_meta.get("name", "")
+        or user.get("email", "").split("@")[0]
+    )
+    if avatar_url:
+        tracking_manager.set_user_avatar(user_id, avatar_url)
+    if display_name:
+        tracking_manager.set_user_display_name(user_id, display_name)
 
-    disconnect_reason = "unknown"
-    contributor_status = None  # "active" or "waiting" for contributors
-    try:
-        # Register participant
-        if role == "contributor":
-            # Ensure room has trip station data BEFORE add_contributor
-            # (needed for distance calculation)
-            if trip_id:
-                room = tracking_manager.get_room(train_id)
-                if not room or not room.stations:
-                    await _ensure_trip_info(train_id, trip_id)
-
-            result = await tracking_manager.add_contributor(train_id, user_id, websocket)
-            contributor_status = result.get("status", "active")
-        else:
-            await tracking_manager.add_listener(train_id, user_id, websocket)
-
-        # Send connection confirmation
-        conn_data = {
-            "user_id": user_id,
-            "role": role,
-            "train_id": train_id,
-            "room_info": tracking_manager.room_info(train_id),
-        }
-        if contributor_status == "waiting":
-            conn_data["status"] = "waiting"
-            conn_data["position"] = result.get("position", 0)
-            conn_data["total_waiting"] = result.get("total", 0)
-            conn_data["message_ar"] = f"أنت في قائمة الانتظار (#{result.get('position', 0)}). سيتم ترقيتك تلقائياً."
-        elif contributor_status == "active":
-            conn_data["status"] = "active"
-
-        await websocket.send_json({
-            "type": "connected",
-            "data": conn_data,
-        })
-
-        # Message loop with server-side keepalive ping.
-        # Railway's TCP proxy closes idle connections after ~30 s, so we must
-        # actively send something before that window expires.
-        # Strategy: wait up to _SERVER_PING_INTERVAL for a client message;
-        # on timeout send a server ping instead of closing. After
-        # _MAX_MISSED_PINGS consecutive timeouts without a pong, treat
-        # connection as dead and close cleanly.
-        _SERVER_PING_INTERVAL = 20.0   # send server ping every 20 s of silence
-        _MAX_MISSED_PINGS     = 3       # dead after 3 × 20 s = 60 s of silence
-        _missed_pings         = 0
-
-        while True:
-            try:
-                raw = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=_SERVER_PING_INTERVAL,
-                )
-                _missed_pings = 0   # any message resets the counter
-            except asyncio.TimeoutError:
-                _missed_pings += 1
-                if _missed_pings >= _MAX_MISSED_PINGS:
-                    disconnect_reason = "انقطاع الاتصال — لا استجابة"
-                    logger.warning(
-                        "⏰ [%s] No response from user=%s after %d pings — closing",
-                        train_id, user_id[:8], _missed_pings,
-                    )
-                    break
-                try:
-                    await websocket.send_json({"type": "ping"})
-                except Exception:
-                    disconnect_reason = "انقطاع الاتصال — فشل إرسال ping"
-                    break
-                continue
-
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
-                continue
-
-            msg_type = msg.get("type", "")
-
-            if msg_type == "location_update" and role == "contributor":
-                lat = msg.get("lat")
-                lng = msg.get("lng")
-                speed = msg.get("speed", 0.0)
-                bearing = msg.get("bearing", 0.0)
-
-                if lat is None or lng is None:
-                    await websocket.send_json({
-                        "type": "update_ack",
-                        "ok": False,
-                        "error": "lat and lng are required",
-                    })
-                    continue
-
-                result = await tracking_manager.process_update(
-                    train_id=train_id,
-                    user_id=user_id,
-                    lat=float(lat),
-                    lng=float(lng),
-                    speed=float(speed),
-                    bearing=float(bearing),
-                )
-
-                await websocket.send_json({"type": "update_ack", **result})
-
-                # Silent disconnect after exceeding far-from-rail limit
-                if result.get("error") == "silent_disconnect":
-                    dist = result.get("distance_m", 0)
-                    disconnect_reason = f"فصل تلقائي — بعيد عن المسار ({dist:.0f}م)"
-                    logger.info(
-                        "🔇 [%s] Silent disconnect for user=%s",
-                        train_id, user_id[:8],
-                    )
-                    await tracking_manager.remove_participant(train_id, user_id, disconnect_reason)
-                    await websocket.close(code=4003, reason="silent_disconnect")
-                    return
-
-            elif msg_type == "ping":
-                await websocket.send_json({"type": "pong"})
-
-            else:
-                if role != "contributor" and msg_type == "location_update":
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Only contributors can send location updates",
-                    })
-                # Listeners just keep connection open for receiving broadcasts
-
-    except WebSocketDisconnect as wsd:
-        code = getattr(wsd, 'code', 'unknown')
-        if code == 1000 or code == 1001:
-            disconnect_reason = "المستخدم أنهى الاتصال بنفسه"
-        elif code == 4002:
-            disconnect_reason = "تم الطرد بواسطة الإدارة (حظر)"
-        else:
-            disconnect_reason = f"انقطاع الاتصال (code={code})"
-        logger.info(
-            "🔌 [%s] WS disconnected: user=%s (code=%s)",
-            train_id, user_id[:8], code,
+    # Store trip info (from/to station names)
+    if body.from_station_name or body.to_station_name:
+        tracking_manager.set_user_trip_info(
+            user_id,
+            from_station_name=body.from_station_name or "",
+            to_station_name=body.to_station_name or "",
         )
-    except Exception as exc:
-        disconnect_reason = f"خطأ غير متوقع: {type(exc).__name__}"
-        logger.error("🔌 [%s] WS error for user=%s: %s", train_id, user_id[:8], exc)
-    finally:
-        await tracking_manager.remove_participant(train_id, user_id, disconnect_reason)
+
+    # Load trip stations from DB if needed
+    if body.trip_id:
+        room = tracking_manager.get_room(train_id)
+        if not room or not room.stations:
+            await _load_trip_info(train_id, body.trip_id)
+
+    # Register contributor if not already in the room
+    room = tracking_manager.get_room(train_id)
+    is_new_contributor = not room or (
+        user_id not in (room.contributors if room else {})
+        and not any(w.user_id == user_id for w in (room.waiting_list if room else []))
+    )
+
+    if is_new_contributor:
+        # Check captain status from DB (only on first join)
+        if user_id not in tracking_manager._user_captains:
+            try:
+                profile = (await db.execute(
+                    select(Profile.is_captain).where(
+                        Profile.id == cast(user_id, PG_UUID)
+                    )
+                )).scalar()
+                tracking_manager.set_user_captain(user_id, bool(profile))
+            except Exception as exc:
+                logger.warning("⚠️ [%s] Captain check failed for %s: %s", train_id, user_id[:8], exc)
+
+        join_result = await tracking_manager.add_contributor(train_id, user_id)
+        join_status = join_result.get("status", "active")
+
+        if join_status == "kicked":
+            raise HTTPException(
+                status_code=403,
+                detail=join_result.get("message_ar", "You are temporarily blocked"),
+            )
+
+        logger.info(
+            "👤+ [%s] New contributor %s joined (%s)",
+            train_id, user_id[:8], join_status,
+        )
+
+    # Process the location update
+    result = await tracking_manager.process_update(
+        train_id=train_id,
+        user_id=user_id,
+        lat=body.lat,
+        lng=body.lng,
+        speed=body.speed,
+        bearing=body.bearing,
+    )
+
+    # Build response — include current aggregated position so the contributor
+    # can also display the train on their map without a separate poll
+    room = tracking_manager.get_room(train_id)
+    position_data = tracking_manager.get_position_data(room) if room else None
+
+    # Determine contributor's current waiting-list status
+    contributor_status = "active"
+    waiting_position = 0
+    total_waiting = 0
+    if room and user_id not in room.contributors:
+        for i, w in enumerate(room.waiting_list):
+            if w.user_id == user_id:
+                contributor_status = "waiting"
+                waiting_position = i + 1
+                total_waiting = len(room.waiting_list)
+                break
+
+    return {
+        "ok": result.get("ok", False),
+        "status": contributor_status,
+        "waiting_position": waiting_position,
+        "total_waiting": total_waiting,
+        "error": result.get("error"),
+        "message_ar": result.get("message_ar"),
+        "distance_m": result.get("distance_m"),
+        "position_data": position_data,
+    }
 
 
-# ── REST: Tracking status ────────────────────────────────────────────────────
+# ── REST: Active trains (for authenticated users) ────────────────────────────
+
+@router.get("/active-trains")
+async def get_active_trains(
+    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
+):
+    """
+    Return a lightweight list of trains with active tracking rooms.
+    Requires a valid Supabase JWT (any authenticated user).
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization[7:]
+
+    user = await verify_supabase_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    trains = []
+    for room in tracking_manager.all_rooms_info():
+        if room["contributors_count"] == 0:
+            continue
+        trains.append({
+            "train_id": room["train_id"],
+            "start_station": room.get("start_station", ""),
+            "end_station": room.get("end_station", ""),
+            "speed": room["speed"],
+            "status": room["status"],
+            "contributors_count": room["contributors_count"],
+        })
+    return {"trains": trains, "total": len(trains)}
+
+
+# ── REST: Listener polls for latest train position ────────────────────────────
 
 @router.get("/position/{train_id}")
-async def get_last_position(
+async def get_train_position(
     train_id: str,
     authorization: str = Header(..., description="Bearer <supabase_access_token>"),
 ):
     """
-    Get the last known position of a train from Redis cache.
-    Returns immediately without waiting for WebSocket updates.
-    Useful for showing train location instantly when entering the map screen.
-    Requires authentication.
+    Listener polls this endpoint every 30 seconds to get the latest aggregated
+    train position. Checks in-memory room first (most up-to-date), falls back
+    to Redis cache. Requires authentication.
     """
-    # Extract and verify bearer token
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     token = authorization[7:]
-    
+
     user = await verify_supabase_token(token)
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-    
+
+    # 1. Check live in-memory room (most accurate)
+    room = tracking_manager.get_room(train_id)
+    if room and (room.lat != 0.0 or room.lng != 0.0):
+        return {
+            "found": True,
+            "train_id": train_id,
+            "data": tracking_manager.get_position_data(room),
+        }
+
+    # 2. Fall back to Redis cache (survives server restarts)
     from app.core.cache import cache_get
-    
     cached = await cache_get(f"train_pos:{train_id}")
-    if cached is None:
-        return {"found": False, "train_id": train_id}
-    
-    return {
-        "found": True,
-        "train_id": train_id,
-        "data": cached,
-    }
+    if cached is not None:
+        return {"found": True, "train_id": train_id, "data": cached}
+
+    return {"found": False, "train_id": train_id}
 
 
 @router.get("/status/{train_id}", dependencies=[Depends(require_authenticated_user)])
