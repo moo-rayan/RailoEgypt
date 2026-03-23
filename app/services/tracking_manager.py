@@ -937,6 +937,22 @@ class TrackingManager:
     def active_rooms(self) -> int:
         return len(self._rooms)
 
+    def get_position_data(self, room: "TrainRoom") -> dict:
+        """Return compact position dict suitable for HTTP responses."""
+        return {
+            "tid": room.train_id,
+            "la": round(room.lat, 6),
+            "ln": round(room.lng, 6),
+            "sp": round(room.speed, 1),
+            "st": room.status,
+            "cn": self._active_contributor_count(room),
+            "dir": room.direction,
+            "ss": room.start_station,
+            "es": room.end_station,
+            "ts": _iso_now(),
+            "ci": self._top_contributor_infos(room),
+        }
+
     def all_rooms_info(self) -> list[dict]:
         """Return detailed info for every active room (for dashboard)."""
         now = time.time()
