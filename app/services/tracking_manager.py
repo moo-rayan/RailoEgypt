@@ -32,7 +32,7 @@ _MAX_FAR_WARNINGS    = 3       # consecutive far updates before silent disconnec
 _UPDATE_COOLDOWN_S   = 25.0    # min seconds between contributor updates
 _STALE_TIMEOUT_S     = 120.0   # remove contributor after 120 s silence
 _MAX_TRAIN_DISTANCE_M = 1000.0  # contributor must be within this of train
-_TRAIN_POS_TTL       = 3600    # Redis TTL for cached train position (seconds)
+_TRAIN_POS_TTL       = 90      # Redis TTL for cached train position (seconds)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────

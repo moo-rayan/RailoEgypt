@@ -280,16 +280,18 @@ async def get_train_position(
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-    # 1. Check live in-memory room (most accurate)
+    # 1. In-memory room — only if there are active contributors right now
     room = tracking_manager.get_room(train_id)
     if room and (room.lat != 0.0 or room.lng != 0.0):
-        return {
-            "found": True,
-            "train_id": train_id,
-            "data": tracking_manager.get_position_data(room),
-        }
+        cn = tracking_manager._active_contributor_count(room)
+        if cn > 0:
+            return {
+                "found": True,
+                "train_id": train_id,
+                "data": tracking_manager.get_position_data(room),
+            }
 
-    # 2. Fall back to Redis cache (survives server restarts)
+    # 2. Redis cache — cleared immediately when last contributor stops
     from app.core.cache import cache_get
     cached = await cache_get(f"train_pos:{train_id}")
     if cached is not None:
