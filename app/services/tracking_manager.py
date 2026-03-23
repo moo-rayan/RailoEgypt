@@ -31,7 +31,7 @@ _MAX_RAIL_DISTANCE_M = 500.0   # accept if ≤ 500 m from rail
 _MAX_FAR_WARNINGS    = 3       # consecutive far updates before silent disconnect
 _UPDATE_COOLDOWN_S   = 25.0    # min seconds between contributor updates
 _STALE_TIMEOUT_S     = 120.0   # remove contributor after 120 s silence
-_MAX_TRAIN_DISTANCE_M = 1000.0  # contributor must be within this of train
+_MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
 _TRAIN_POS_TTL       = 90      # Redis TTL for cached train position (seconds)
 
 
@@ -176,7 +176,7 @@ class TrackingManager:
 
     def _cleanup_room(self, train_id: str) -> None:
         room = self._rooms.get(train_id)
-        if room and not room.contributors and not room.listeners and not room.waiting_list:
+        if room and not room.contributors and not room.waiting_list:
             del self._rooms[train_id]
             logger.info("🗑️  [%s] Room destroyed (empty)", train_id)
 
@@ -613,27 +613,34 @@ class TrackingManager:
             # ≤ 500 m → accepted, reset warning counter
             contributor.far_from_rail_count = 0
 
-        # ── Train proximity check (1000 m from current train position) ────
-        train_lat, train_lng = room.lat, room.lng
-        if train_lat == 0.0 and train_lng == 0.0:
-            cached = await cache_get(f"train_pos:{train_id}")
-            if cached:
-                train_lat = cached.get("lat", 0.0)
-                train_lng = cached.get("lng", 0.0)
-        if train_lat != 0.0 or train_lng != 0.0:
-            dist_to_train = _haversine(lng, lat, train_lng, train_lat)
-            if dist_to_train > _MAX_TRAIN_DISTANCE_M:
-                self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن القطار {dist_to_train:.0f}م")
-                logger.warning(
-                    "🚫 [%s] User %s too far from train: %.0fm → silent disconnect",
-                    train_id, user_id, dist_to_train,
-                )
-                return {
-                    "ok": False,
-                    "error": "silent_disconnect",
-                    "distance_m": dist_to_train,
-                    "message_ar": f"موقعك بعيد عن القطار ({dist_to_train:.0f}م).",
-                }
+        # ── Train proximity check ──────────────────────────────────────────────
+        # Skip when this contributor is the sole source of the train position.
+        # Comparing their new reading against their own previous position makes
+        # no sense for validation and always fails for fast trains (~1.3 km/30 s).
+        active_count = self._active_contributor_count(room)
+        is_sole_contributor = active_count <= 1 and user_id in room.contributors
+        if not is_sole_contributor:
+            train_lat, train_lng = room.lat, room.lng
+            if train_lat == 0.0 and train_lng == 0.0:
+                cached = await cache_get(f"train_pos:{train_id}")
+                if cached:
+                    # Compact keys used by get_position_data: 'la' / 'ln'
+                    train_lat = cached.get("la", cached.get("lat", 0.0))
+                    train_lng = cached.get("ln", cached.get("lng", 0.0))
+            if train_lat != 0.0 or train_lng != 0.0:
+                dist_to_train = _haversine(lng, lat, train_lng, train_lat)
+                if dist_to_train > _MAX_TRAIN_DISTANCE_M:
+                    self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن القطار {dist_to_train:.0f}م")
+                    logger.warning(
+                        "🚫 [%s] User %s too far from train: %.0fm → silent disconnect",
+                        train_id, user_id, dist_to_train,
+                    )
+                    return {
+                        "ok": False,
+                        "error": "silent_disconnect",
+                        "distance_m": dist_to_train,
+                        "message_ar": f"موقعك بعيد عن القطار ({dist_to_train:.0f}م).",
+                    }
 
         # Update contributor data
         contributor.lat = lat
