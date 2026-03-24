@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 _MAX_RAIL_DISTANCE_M = 500.0   # accept if ≤ 500 m from rail
 _MAX_FAR_WARNINGS    = 3       # consecutive far updates before silent disconnect
 _UPDATE_COOLDOWN_S   = 25.0    # min seconds between contributor updates
-_STALE_TIMEOUT_S     = 120.0   # remove contributor after 120 s silence
+_STALE_TIMEOUT_S     = 240.0   # remove contributor after 240 s silence
 _MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
 _TRAIN_POS_TTL       = 90      # Redis TTL for cached train position (seconds)
 
@@ -840,6 +840,14 @@ class TrackingManager:
                 return
             # Leader is stale/inactive — fall through to normal aggregation
 
+        # Captain priority: if no explicit leader, prefer captain's position
+        captain = next((c for c in active if c.is_captain), None)
+        if captain:
+            room.lat = captain.lat
+            room.lng = captain.lng
+            room.speed = captain.speed
+            return
+
         if len(room.stations) < 2:
             # No route data → use the most recent contributor
             c = max(active, key=lambda x: x.last_update)
@@ -886,7 +894,8 @@ class TrackingManager:
     def _top_contributor_infos(self, room: TrainRoom, limit: int = 3) -> list[dict]:
         """Return compact info dicts for the top N active contributors (captain first).
 
-        Keys: a=avatar_url, n=display_name, cap=is_captain (only if True).
+        Keys: n=display_name, cap=is_captain (only if True).
+        Avatar URLs are no longer included to reduce payload size.
         """
         sorted_contribs = sorted(
             room.contributors.values(),
@@ -894,13 +903,12 @@ class TrackingManager:
         )
         infos: list[dict] = []
         for c in sorted_contribs:
-            if c.avatar_url:
-                entry: dict = {"a": c.avatar_url, "n": c.display_name}
-                if c.is_captain:
-                    entry["cap"] = True
-                infos.append(entry)
-                if len(infos) >= limit:
-                    break
+            entry: dict = {"n": c.display_name or c.user_id[:6]}
+            if c.is_captain:
+                entry["cap"] = True
+            infos.append(entry)
+            if len(infos) >= limit:
+                break
         return infos
 
     async def cleanup_stale_contributors(self) -> int:
