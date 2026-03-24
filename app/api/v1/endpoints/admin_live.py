@@ -140,12 +140,10 @@ async def get_admin_rooms():
     """List all active rooms with full details (for admin dashboard)."""
     rooms = tracking_manager.all_rooms_info()
     total_contributors = sum(r["contributors_count"] for r in rooms)
-    total_listeners = sum(r["listeners_count"] for r in rooms)
     total_waiting = sum(r.get("waiting_count", 0) for r in rooms)
     return {
         "total_rooms": len(rooms),
         "total_contributors": total_contributors,
-        "total_listeners": total_listeners,
         "total_waiting": total_waiting,
         "rooms": rooms,
     }
