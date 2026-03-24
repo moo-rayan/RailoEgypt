@@ -227,6 +227,31 @@ async def post_contributor_location(
     }
 
 
+# ── REST: Contributor explicit leave ─────────────────────────────────────────
+
+@router.post("/{train_id}/leave")
+async def contributor_leave(
+    train_id: str,
+    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
+):
+    """
+    Called by the contributor app when the user explicitly stops contributing.
+    Removes them from the room immediately rather than waiting for stale cleanup.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization[7:]
+
+    user = await verify_supabase_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user_id = user["id"]
+    await tracking_manager.remove_participant(train_id, user_id, "user_left")
+    logger.info("🚪 [%s] Contributor %s left voluntarily", train_id, user_id[:8])
+    return {"ok": True}
+
+
 # ── REST: Active trains (for authenticated users) ────────────────────────────
 
 @router.get("/active-trains")
