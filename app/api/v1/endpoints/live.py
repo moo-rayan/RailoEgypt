@@ -14,6 +14,7 @@ GET  /api/v1/live/status/{train_id}
 """
 
 import logging
+import time
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
