@@ -194,6 +194,17 @@ async def post_contributor_location(
                 detail=join_result.get("message_ar", "You are temporarily blocked"),
             )
 
+        # Double-check: voluntary_left might have been set while add_contributor was running
+        # (race condition: /leave and GPS POST arrive simultaneously)
+        if tracking_manager.check_voluntary_left(user_id):
+            await tracking_manager.remove_participant(train_id, user_id, "cleanup")
+            logger.info(
+                "🚫 [%s] %s re-join race condition caught — removed after add",
+                train_id, user_id[:8],
+            )
+            return {"ok": False, "status": "left", "error": "recently_left",
+                    "position_data": None, "waiting_position": 0, "total_waiting": 0}
+
         logger.info(
             "👤+ [%s] New contributor %s joined (%s)",
             train_id, user_id[:8], join_status,
