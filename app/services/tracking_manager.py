@@ -388,21 +388,27 @@ class TrackingManager:
         return {"status": "waiting", "position": position, "total": len(room.waiting_list)}
 
     async def remove_participant(self, train_id: str, user_id: str, disconnect_reason: str = "") -> None:
+        reason_text = disconnect_reason or "unknown"
+
+        # Register voluntary leave IMMEDIATELY — before any room lookup.
+        # This is the only guarantee that check_voluntary_left() blocks stale GPS
+        # POSTs even when the room was already cleaned up (room=None).
+        if reason_text == "user_left":
+            self._voluntary_left[user_id] = time.time()
+            logger.debug("🔒 [%s] voluntary_left registered for %s", train_id, user_id[:8])
+
         room = self._rooms.get(train_id)
         if not room:
             return
         removed = False
         was_contributor = False
         was_waiting = False
-        reason_text = disconnect_reason or "unknown"
 
         if user_id in room.contributors:
             display = room.contributors[user_id].display_name or user_id[:8]
             del room.contributors[user_id]
             removed = True
             was_contributor = True
-            if reason_text == "user_left":
-                self._voluntary_left[user_id] = time.time()  # persists beyond room lifetime
             self._log_event(room, "leave", user_id, f"{display} — {reason_text} (remaining: {len(room.contributors)})")
             logger.info("👤- [%s] Contributor left: %s reason=%s (remaining: %d)", train_id, user_id, reason_text, len(room.contributors))
 
