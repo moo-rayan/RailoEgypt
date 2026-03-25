@@ -155,17 +155,15 @@ async def post_contributor_location(
         if not room or not room.stations:
             await _load_trip_info(train_id, body.trip_id)
 
-    # Block stale in-flight POSTs from re-adding a user who just left voluntarily
-    _room_check = tracking_manager.get_room(train_id)
-    if _room_check:
-        _leave_ts = _room_check.voluntary_left.get(user_id, 0)
-        if time.time() - _leave_ts < 30:
-            logger.info(
-                "🚫 [%s] %s recently left voluntarily (%.0fs ago) — ignoring stale POST",
-                train_id, user_id[:8], time.time() - _leave_ts,
-            )
-            return {"ok": False, "status": "left", "error": "recently_left",
-                    "position_data": None, "waiting_position": 0, "total_waiting": 0}
+    # Block stale in-flight POSTs from re-adding a user who just left voluntarily.
+    # Checked at manager level so it works even if the room was deleted after last contributor left.
+    if tracking_manager.check_voluntary_left(user_id):
+        logger.info(
+            "🚫 [%s] %s recently left voluntarily — ignoring stale POST",
+            train_id, user_id[:8],
+        )
+        return {"ok": False, "status": "left", "error": "recently_left",
+                "position_data": None, "waiting_position": 0, "total_waiting": 0}
 
     # Register contributor if not already in the room
     room = tracking_manager.get_room(train_id)

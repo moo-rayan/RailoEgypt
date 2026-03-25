@@ -32,7 +32,7 @@ _MAX_FAR_WARNINGS    = 3       # consecutive far updates before silent disconnec
 _UPDATE_COOLDOWN_S   = 25.0    # min seconds between contributor updates
 _STALE_TIMEOUT_S     = 240.0   # remove contributor after 240 s silence
 _MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
-_TRAIN_POS_TTL       = 90      # Redis TTL for cached train position (seconds)
+_TRAIN_POS_TTL       = 3600    # Redis TTL for cached train position (1 hour)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -107,8 +107,6 @@ class TrainRoom:
     max_active_contributors: int = field(default_factory=lambda: settings.max_active_contributors)
     # Temporary kick block: user_id → timestamp until which they cannot rejoin
     kicked_until: dict[str, float] = field(default_factory=dict)
-    # Voluntary-leave timestamps: prevents stale in-flight POSTs from re-adding user
-    voluntary_left: dict[str, float] = field(default_factory=dict)
 
     # Event log (ring buffer, last 200 events)
     event_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
@@ -137,6 +135,8 @@ class TrackingManager:
         self._user_trip_info: dict[str, dict] = {}  # user_id → {from_station_name, to_station_name}
         self._user_captains: dict[str, bool] = {}  # user_id → is_captain
         self._last_positions: dict[str, tuple] = {}  # user_id → (lat, lng, speed)
+        # Manager-level voluntary-leave registry (survives room deletion)
+        self._voluntary_left: dict[str, float] = {}  # user_id → leave_timestamp
 
     def set_user_avatar(self, user_id: str, avatar_url: str) -> None:
         """Store user avatar for later use when contributor joins WS."""
@@ -158,6 +158,18 @@ class TrackingManager:
     def set_user_captain(self, user_id: str, is_captain: bool) -> None:
         """Store whether user is a train captain."""
         self._user_captains[user_id] = is_captain
+
+    _VOLUNTARY_LEFT_BLOCK_S = 60.0  # seconds to block re-join after voluntary leave
+
+    def check_voluntary_left(self, user_id: str) -> bool:
+        """Return True if user recently left voluntarily and should be blocked from re-joining."""
+        leave_ts = self._voluntary_left.get(user_id, 0)
+        if leave_ts and time.time() - leave_ts < self._VOLUNTARY_LEFT_BLOCK_S:
+            return True
+        # Expired — clean up
+        if leave_ts:
+            del self._voluntary_left[user_id]
+        return False
 
     def _log_event(self, room: TrainRoom, event_type: str, user_id: str, detail: str = "") -> None:
         """Append an event to the room's ring-buffer log."""
@@ -390,7 +402,7 @@ class TrackingManager:
             removed = True
             was_contributor = True
             if reason_text == "user_left":
-                room.voluntary_left[user_id] = time.time()
+                self._voluntary_left[user_id] = time.time()  # persists beyond room lifetime
             self._log_event(room, "leave", user_id, f"{display} — {reason_text} (remaining: {len(room.contributors)})")
             logger.info("👤- [%s] Contributor left: %s reason=%s (remaining: %d)", train_id, user_id, reason_text, len(room.contributors))
 
@@ -415,14 +427,20 @@ class TrackingManager:
             if was_contributor and room.waiting_list:
                 await self._promote_from_waiting_list(room)
 
-            # If no contributors left, set status back to waiting
+            # If no contributors left, reset all tracked state
             if not room.contributors:
                 room.status = "waiting"
+                room.lat = 0.0
+                room.lng = 0.0
                 room.max_progress = 0.0
                 room.max_lat = 0.0
                 room.max_lng = 0.0
+                room.last_best_user_id = None
                 await cache_delete(f"train_pos:{train_id}")
-                logger.info("⏸️  [%s] No contributors — status → waiting, max_progress reset, Redis cache cleared", train_id)
+                logger.info(
+                    "⏸️  [%s] No contributors — all state reset, Redis cache cleared",
+                    train_id,
+                )
 
             self._cleanup_room(train_id)
 
