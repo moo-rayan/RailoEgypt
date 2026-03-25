@@ -68,6 +68,7 @@ class Contributor:
     bearing: float = 0.0
     last_update: float = 0.0
     far_from_rail_count: int = 0   # consecutive updates too far from railway
+    dist_to_rail: float = float("inf")  # metres to nearest rail segment (updated each GPS)
     # Contributor's personal trip (boarding → alighting)
     from_station_name: str = ""
     to_station_name: str = ""
@@ -658,6 +659,7 @@ class TrackingManager:
         contributor.lng = lng
         contributor.speed = speed
         contributor.bearing = bearing
+        contributor.dist_to_rail = distance if distance is not None else 0.0
         # Persist last known position (survives room deletion/recreation)
         self._last_positions[user_id] = (lat, lng, speed)
 
@@ -883,25 +885,34 @@ class TrackingManager:
             )
             return
 
-        # Find contributor with maximum route progress (works for 1 or N)
+        # Step 1: compute route progress for all active contributors
         progress_map: dict[str, float] = {}
         for c in active:
             progress_map[c.user_id] = TrackingManager._compute_route_progress(
                 c.lat, c.lng, room.stations,
             )
 
-        best_uid = max(progress_map, key=lambda uid: progress_map[uid])
-        best_c = next(c for c in active if c.user_id == best_uid)
+        best_progress = max(progress_map.values())
 
-        # Hysteresis: only switch from current best if the new leader is ≥100 m ahead.
-        # This prevents GPS noise (~30–50 m) from oscillating the selection every POST.
-        _SWITCH_THRESHOLD_M = 100.0
-        if room.last_best_user_id and room.last_best_user_id != best_uid:
-            last_progress = progress_map.get(room.last_best_user_id)
-            if last_progress is not None:
-                if progress_map[best_uid] - last_progress < _SWITCH_THRESHOLD_M:
-                    # Not significantly ahead — keep current best contributor
-                    best_c = next(c for c in active if c.user_id == room.last_best_user_id)
+        # Step 2: lead group — contributors within 100 m of the maximum progress
+        # (GPS noise is ~30–50 m, so 100 m captures genuine co-leaders)
+        _LEAD_THRESHOLD_M = 100.0
+        lead_group = [
+            c for c in active
+            if progress_map[c.user_id] >= best_progress - _LEAD_THRESHOLD_M
+        ]
+
+        # Step 3: among lead group, prefer the contributor closest to the railway
+        best_c = min(lead_group, key=lambda c: c.dist_to_rail)
+
+        # Step 4: hysteresis — only switch from last_best_user_id if they dropped
+        # out of the lead group (fell >100 m behind the new leader).
+        # Within the lead group, always prefer the one closest to rail (step 3).
+        if room.last_best_user_id and room.last_best_user_id != best_c.user_id:
+            last_best = next((c for c in active if c.user_id == room.last_best_user_id), None)
+            if last_best and progress_map.get(room.last_best_user_id, 0) >= best_progress - _LEAD_THRESHOLD_M:
+                # Still in lead group — keep them to avoid unnecessary switches
+                best_c = last_best
 
         room.lat = best_c.lat
         room.lng = best_c.lng
