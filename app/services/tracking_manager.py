@@ -159,17 +159,32 @@ class TrackingManager:
         """Store whether user is a train captain."""
         self._user_captains[user_id] = is_captain
 
-    _VOLUNTARY_LEFT_BLOCK_S = 60.0  # seconds to block re-join after voluntary leave
+    _VOLUNTARY_LEFT_BLOCK_S = 60.0  # seconds since LAST blocked attempt before re-join is allowed
 
     def check_voluntary_left(self, user_id: str) -> bool:
-        """Return True if user recently left voluntarily and should be blocked from re-joining."""
+        """Return True (and extend block) if user recently left voluntarily.
+
+        Uses a ROLLING window: every time a stale GPS POST is blocked, the
+        60-second countdown restarts from NOW.  This keeps the block active as
+        long as the background isolate keeps sending — the block only expires
+        after 60 s of complete silence from that user.
+        """
         leave_ts = self._voluntary_left.get(user_id, 0)
         if leave_ts and time.time() - leave_ts < self._VOLUNTARY_LEFT_BLOCK_S:
+            # Extend: reset the 60-s window from now so a still-running isolate
+            # can never sneak through just because 60 s elapsed since /leave.
+            self._voluntary_left[user_id] = time.time()
             return True
         # Expired — clean up
         if leave_ts:
             del self._voluntary_left[user_id]
         return False
+
+    def clear_voluntary_left(self, user_id: str) -> None:
+        """Explicitly clear the voluntary-leave block for a user.
+        Called when the user intentionally wants to re-join (taps 'Start Contributing').
+        """
+        self._voluntary_left.pop(user_id, None)
 
     def _log_event(self, room: TrainRoom, event_type: str, user_id: str, detail: str = "") -> None:
         """Append an event to the room's ring-buffer log."""

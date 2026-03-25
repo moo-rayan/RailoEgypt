@@ -249,6 +249,32 @@ async def post_contributor_location(
     }
 
 
+# ── REST: Contributor explicit join (clears voluntary-leave block) ───────────
+
+@router.post("/{train_id}/join")
+async def contributor_join(
+    train_id: str,
+    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
+):
+    """
+    Called by the contributor app when the user intentionally wants to start
+    contributing (taps 'Start Contributing').  Clears any voluntary-leave block
+    so that the first GPS POST is not rejected.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization[7:]
+
+    user = await verify_supabase_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user_id = user["id"]
+    tracking_manager.clear_voluntary_left(user_id)
+    logger.info("✅ [%s] Voluntary-leave block cleared for %s (join intent)", train_id, user_id[:8])
+    return {"ok": True}
+
+
 # ── REST: Contributor explicit leave ─────────────────────────────────────────
 
 @router.post("/{train_id}/leave")
