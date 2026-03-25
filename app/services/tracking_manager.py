@@ -102,6 +102,7 @@ class TrainRoom:
     contributors: dict[str, Contributor] = field(default_factory=dict)  # user_id → Contributor
     waiting_list: list[WaitingContributor] = field(default_factory=list) # sorted by trip_distance desc
     leader_id: Optional[str] = None   # if set, only this contributor's updates are used
+    last_best_user_id: Optional[str] = None  # last contributor selected by _aggregate_position
     max_active_contributors: int = field(default_factory=lambda: settings.max_active_contributors)
     # Temporary kick block: user_id → timestamp until which they cannot rejoin
     kicked_until: dict[str, float] = field(default_factory=dict)
@@ -294,8 +295,8 @@ class TrackingManager:
                 c for c in room.contributors.values() if not c.is_captain
             ]
             if non_captains:
-                # Sort by trip_distance ascending → first = shortest trip = lowest priority
-                non_captains.sort(key=lambda c: c.trip_distance_km)
+                # Demote least-recently-updated non-captain (longest inactive = lowest priority)
+                non_captains.sort(key=lambda c: c.last_update)
                 demoted = non_captains[0]
                 # Move demoted to waiting list
                 waiting_entry = WaitingContributor(
@@ -307,7 +308,7 @@ class TrackingManager:
                     joined_at=time.time(),
                 )
                 room.waiting_list.append(waiting_entry)
-                room.waiting_list.sort(key=lambda w: w.trip_distance_km, reverse=True)
+                # FIFO: no sort — first to wait = first to promote
                 del room.contributors[demoted.user_id]
                 self._log_event(
                     room, "demoted", demoted.user_id,
@@ -359,17 +360,16 @@ class TrackingManager:
             is_captain=is_captain,
         )
         room.waiting_list.append(waiting)
-        # Sort by distance descending (longest trip first = highest priority)
-        room.waiting_list.sort(key=lambda w: w.trip_distance_km, reverse=True)
-        position = next(i for i, w in enumerate(room.waiting_list) if w.user_id == user_id) + 1
+        # FIFO: no sort — insertion order = waiting priority
+        position = len(room.waiting_list)  # last in queue
         self._log_event(
             room, "waiting", user_id,
-            f"{name or user_id[:8]} في قائمة الانتظار #{position} ({from_name}→{to_name}, {distance_km:.1f}km) "
+            f"{name or user_id[:8]} في قائمة الانتظار #{position} ({from_name}→{to_name}) "
             f"[انتظار: {len(room.waiting_list)}]",
         )
         logger.info(
-            "⏳ [%s] Contributor %s → WAITING #%d (%.1fkm, %s→%s) [waiting: %d]",
-            train_id, user_id[:8], position, distance_km, from_name, to_name,
+            "⏳ [%s] Contributor %s → WAITING #%d (%s→%s) [waiting: %d]",
+            train_id, user_id[:8], position, from_name, to_name,
             len(room.waiting_list),
         )
         return {"status": "waiting", "position": position, "total": len(room.waiting_list)}
@@ -862,28 +862,51 @@ class TrackingManager:
             return
 
         if len(room.stations) < 2:
-            # No route data → use the most recent contributor
+            # No route data → sticky selection (prevents oscillation between contributors)
+            # Keep last selected contributor if still active; avoids alternating A/B each POST
+            if room.last_best_user_id:
+                sticky = next((c for c in active if c.user_id == room.last_best_user_id), None)
+                if sticky:
+                    room.lat = sticky.lat
+                    room.lng = sticky.lng
+                    room.speed = sticky.speed
+                    return
+            # First time (no prior selection): use the most recently updated contributor
             c = max(active, key=lambda x: x.last_update)
             room.lat = c.lat
             room.lng = c.lng
             room.speed = c.speed
+            room.last_best_user_id = c.user_id
+            logger.info(
+                "📍 [%s] No station data — sticky contributor: %s (%.6f, %.6f)",
+                room.train_id, c.user_id[:8], c.lat, c.lng,
+            )
             return
 
         # Find contributor with maximum route progress (works for 1 or N)
-        best_c = active[0]
-        best_progress = -1.0
-
+        progress_map: dict[str, float] = {}
         for c in active:
-            progress = TrackingManager._compute_route_progress(
+            progress_map[c.user_id] = TrackingManager._compute_route_progress(
                 c.lat, c.lng, room.stations,
             )
-            if progress > best_progress:
-                best_progress = progress
-                best_c = c
+
+        best_uid = max(progress_map, key=lambda uid: progress_map[uid])
+        best_c = next(c for c in active if c.user_id == best_uid)
+
+        # Hysteresis: only switch from current best if the new leader is ≥100 m ahead.
+        # This prevents GPS noise (~30–50 m) from oscillating the selection every POST.
+        _SWITCH_THRESHOLD_M = 100.0
+        if room.last_best_user_id and room.last_best_user_id != best_uid:
+            last_progress = progress_map.get(room.last_best_user_id)
+            if last_progress is not None:
+                if progress_map[best_uid] - last_progress < _SWITCH_THRESHOLD_M:
+                    # Not significantly ahead — keep current best contributor
+                    best_c = next(c for c in active if c.user_id == room.last_best_user_id)
 
         room.lat = best_c.lat
         room.lng = best_c.lng
         room.speed = best_c.speed
+        room.last_best_user_id = best_c.user_id
 
     # ── Direction helper ──────────────────────────────────────────────────
 
