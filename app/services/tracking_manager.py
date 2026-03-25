@@ -105,6 +105,8 @@ class TrainRoom:
     max_active_contributors: int = field(default_factory=lambda: settings.max_active_contributors)
     # Temporary kick block: user_id → timestamp until which they cannot rejoin
     kicked_until: dict[str, float] = field(default_factory=dict)
+    # Voluntary-leave timestamps: prevents stale in-flight POSTs from re-adding user
+    voluntary_left: dict[str, float] = field(default_factory=dict)
 
     # Event log (ring buffer, last 200 events)
     event_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
@@ -132,6 +134,7 @@ class TrackingManager:
         self._user_display_names: dict[str, str] = {}  # user_id → display_name
         self._user_trip_info: dict[str, dict] = {}  # user_id → {from_station_name, to_station_name}
         self._user_captains: dict[str, bool] = {}  # user_id → is_captain
+        self._last_positions: dict[str, tuple] = {}  # user_id → (lat, lng, speed)
 
     def set_user_avatar(self, user_id: str, avatar_url: str) -> None:
         """Store user avatar for later use when contributor joins WS."""
@@ -324,6 +327,12 @@ class TrackingManager:
                 from_station_name=from_name, to_station_name=to_name,
                 trip_distance_km=distance_km, is_captain=is_captain,
             )
+            # Restore last known position so contributor is in active list immediately
+            last = self._last_positions.get(user_id)
+            if last:
+                c = room.contributors[user_id]
+                c.lat, c.lng, c.speed = last
+                c.last_update = time.time() - 1
             self._log_event(
                 room, "join", user_id,
                 f"{name or user_id[:8]}{captain_label} انضم كمساهم نشط ({from_name}→{to_name}, {distance_km:.1f}km) "
@@ -379,6 +388,8 @@ class TrackingManager:
             del room.contributors[user_id]
             removed = True
             was_contributor = True
+            if reason_text == "user_left":
+                room.voluntary_left[user_id] = time.time()
             self._log_event(room, "leave", user_id, f"{display} — {reason_text} (remaining: {len(room.contributors)})")
             logger.info("👤- [%s] Contributor left: %s reason=%s (remaining: %d)", train_id, user_id, reason_text, len(room.contributors))
 
@@ -647,6 +658,8 @@ class TrackingManager:
         contributor.lng = lng
         contributor.speed = speed
         contributor.bearing = bearing
+        # Persist last known position (survives room deletion/recreation)
+        self._last_positions[user_id] = (lat, lng, speed)
 
         # Log to update feed for admin monitoring
         room.update_feed.append({
