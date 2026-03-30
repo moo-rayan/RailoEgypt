@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     app_jwt_secret: str = ""
     # Token lifetime in hours (e.g. 720=30d, 168=7d, 24=1d)
     app_token_expiry_hours: int = 720
+    # Grace period after expiry during which self-refresh is still allowed (hours)
+    app_token_refresh_grace_hours: int = 168  # 7 days
 
     # Google Maps
     google_maps_api_key: str = ""

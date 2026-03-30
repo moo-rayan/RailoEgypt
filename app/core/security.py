@@ -165,6 +165,54 @@ def verify_app_token(token: str) -> Optional[dict]:
     return user_data
 
 
+def verify_app_token_for_refresh(token: str) -> Optional[dict]:
+    """
+    Verify an App JWT for self-refresh purposes.
+
+    Same as verify_app_token BUT allows expired tokens within the grace period.
+    This enables the token to renew itself without needing Supabase.
+
+    Uses `leeway` to accept tokens expired within grace_hours.
+
+    Returns user dict or None.
+    """
+    if not settings.app_jwt_secret or len(settings.app_jwt_secret) < _MIN_SECRET_LEN:
+        return None
+
+    grace_seconds = settings.app_token_refresh_grace_hours * 3600
+
+    # ── Decode: verify signature, use leeway for grace period ──
+    try:
+        payload = jwt.decode(
+            token,
+            settings.app_jwt_secret,
+            algorithms=["HS256"],
+            options={
+                "require_exp": True,
+                "require_iat": True,
+                "require_sub": True,
+                "leeway": grace_seconds,
+            },
+        )
+    except JWTError:
+        return None
+
+    # ── Validate issuer ──
+    if payload.get("iss") != "trainlive":
+        return None
+
+    # ── Validate sub is a real UUID ──
+    sub = payload.get("sub", "")
+    if not sub or not _validate_uuid(sub):
+        return None
+
+    return {
+        "id": sub,
+        "email": payload.get("email", ""),
+        "user_metadata": payload.get("user_metadata", {}),
+    }
+
+
 # ── Supabase JWT verification (backwards compat) ─────────────────────────────
 
 
