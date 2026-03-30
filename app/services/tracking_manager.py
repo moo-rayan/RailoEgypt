@@ -138,6 +138,9 @@ class TrackingManager:
         self._user_trip_info: dict[str, dict] = {}  # user_id → {from_station_name, to_station_name}
         self._user_captains: dict[str, bool] = {}  # user_id → is_captain
         self._last_positions: dict[str, tuple] = {}  # user_id → (lat, lng, speed)
+        # Deduplication: one contribution alert per user per train per hour
+        # key = "{user_id}:{train_id}", value = last alert timestamp
+        self._contribution_alert_sent: dict[str, float] = {}
 
     def set_user_avatar(self, user_id: str, avatar_url: str) -> None:
         """Store user avatar for later use when contributor joins WS."""
@@ -1128,7 +1131,20 @@ class TrackingManager:
         self, train_id: str, user_id: str, display_name: str,
         from_station: str, to_station: str,
     ) -> None:
-        """Fire-and-forget: create a dashboard alert for a new contribution."""
+        """Fire-and-forget: create a dashboard alert for a new contribution.
+        Deduplication: at most one alert per contributor per train per hour.
+        """
+        dedup_key = f"{user_id}:{train_id}"
+        now = time.monotonic()
+        last_sent = self._contribution_alert_sent.get(dedup_key, 0.0)
+        if now - last_sent < 3600:  # 1 hour window
+            logger.debug(
+                "⏭️ Skipping duplicate contribution alert for %s on train %s (%.0fs ago)",
+                user_id[:8], train_id, now - last_sent,
+            )
+            return
+        self._contribution_alert_sent[dedup_key] = now
+
         try:
             from app.services.admin_alert_service import create_alert
             name = display_name or user_id[:8]
