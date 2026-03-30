@@ -52,14 +52,21 @@ def _cleanup_cache() -> None:
         _token_cache.pop(k, None)
 
 
-def _verify_jwt_local(access_token: str) -> Optional[dict]:
+_NO_SECRET = "NO_SECRET"  # sentinel: JWT secret not configured
+_REJECTED = "REJECTED"    # sentinel: token is definitively invalid/expired
+
+
+def _verify_jwt_local(access_token: str) -> str | dict:
     """
     Verify a Supabase JWT locally using the JWT secret (HS256).
-    Returns a user dict compatible with the Supabase /auth/v1/user response,
-    or None if the secret is not configured or the token is invalid.
+
+    Returns:
+      - dict:        valid user data
+      - _NO_SECRET:  JWT secret not configured → caller should try remote
+      - _REJECTED:   token is expired/invalid → caller should NOT try remote
     """
     if not settings.supabase_jwt_secret:
-        return None  # no secret → fall through to remote
+        return _NO_SECRET
 
     now = time.time()
 
@@ -80,11 +87,11 @@ def _verify_jwt_local(access_token: str) -> Optional[dict]:
             audience="authenticated",
         )
     except JWTError:
-        return None
+        return _REJECTED  # expired, bad signature, etc. → don't waste time on remote
 
     sub = payload.get("sub", "")
     if not sub:
-        return None
+        return _REJECTED
 
     user_data = {
         "id": sub,
@@ -145,15 +152,21 @@ async def verify_supabase_token(access_token: str) -> Optional[dict]:
 
     Strategy (fast → slow):
       1. Local HS256 verification + in-memory cache  (~0.01-0.1ms)
-      2. Remote /auth/v1/user call                   (~100-500ms)
+      2. Remote /auth/v1/user call                   (~100-500ms)  [only if no JWT secret]
 
-    Local verification is preferred because it eliminates the network
-    round-trip that was the #1 performance bottleneck.
+    If the JWT secret is configured and the token is expired/invalid,
+    we return None immediately without wasting time on a remote call.
     """
     # ── Fast path: local JWT verification ──
     result = _verify_jwt_local(access_token)
-    if result is not None:
-        return result
+
+    if isinstance(result, dict):
+        return result  # valid token
+
+    if result is _REJECTED:
+        return None  # expired/invalid — no point calling remote
+
+    # result is _NO_SECRET → fall through to remote
 
     # ── Slow path: remote Supabase API call (fallback) ──
     global _supabase_client
