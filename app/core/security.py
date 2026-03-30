@@ -30,19 +30,20 @@ logger = logging.getLogger(__name__)
 _TICKET_TTL = 43200  # seconds (12 hours - enough for full train journey)
 
 
-# ── Shared token cache (used by both App JWT and Supabase JWT) ─────────────
+# ── Separate token caches (prevents cross-contamination between App JWT and Supabase JWT)
 
-_token_cache: dict[str, tuple[dict, float]] = {}
-_CACHE_MAX_SIZE = 20_000
+_app_token_cache: dict[str, tuple[dict, float]] = {}
+_supabase_token_cache: dict[str, tuple[dict, float]] = {}
+_CACHE_MAX_SIZE = 10_000
 _CACHE_TTL = 300  # 5 minutes
 
 
-def _cleanup_cache() -> None:
-    """Remove expired entries from the token cache."""
+def _cleanup_cache(cache: dict) -> None:
+    """Remove expired entries from a token cache."""
     now = time.time()
-    expired = [k for k, (_, exp) in _token_cache.items() if now >= exp]
+    expired = [k for k, (_, exp) in cache.items() if now >= exp]
     for k in expired:
-        _token_cache.pop(k, None)
+        cache.pop(k, None)
 
 
 # ── Custom App JWT (primary, long-lived) ──────────────────────────────────────
@@ -111,13 +112,13 @@ def verify_app_token(token: str) -> Optional[dict]:
 
     now = time.time()
 
-    # ── Cache hit ──
-    cached = _token_cache.get(token)
+    # ── Cache hit (App JWT cache only) ──
+    cached = _app_token_cache.get(token)
     if cached is not None:
         user_data, expires_at = cached
         if now < expires_at:
             return user_data
-        _token_cache.pop(token, None)
+        _app_token_cache.pop(token, None)
 
     # ── Decode & verify signature + exp + nbf ──
     try:
@@ -158,9 +159,9 @@ def verify_app_token(token: str) -> Optional[dict]:
     # ── Cache until token expiry or TTL, whichever is sooner ──
     token_exp = payload.get("exp", 0)
     cache_until = min(token_exp, now + _CACHE_TTL) if token_exp else now + _CACHE_TTL
-    _token_cache[token] = (user_data, cache_until)
-    if len(_token_cache) > _CACHE_MAX_SIZE:
-        _cleanup_cache()
+    _app_token_cache[token] = (user_data, cache_until)
+    if len(_app_token_cache) > _CACHE_MAX_SIZE:
+        _cleanup_cache(_app_token_cache)
 
     return user_data
 
@@ -234,13 +235,13 @@ def _verify_jwt_local(access_token: str) -> str | dict:
 
     now = time.time()
 
-    # ── Cache hit ──
-    cached = _token_cache.get(access_token)
+    # ── Cache hit (Supabase cache only) ──
+    cached = _supabase_token_cache.get(access_token)
     if cached is not None:
         user_data, expires_at = cached
         if now < expires_at:
             return user_data
-        _token_cache.pop(access_token, None)
+        _supabase_token_cache.pop(access_token, None)
 
     # ── Decode & verify ──
     try:
@@ -251,7 +252,7 @@ def _verify_jwt_local(access_token: str) -> str | dict:
             audience="authenticated",
         )
     except JWTError:
-        return _REJECTED  # expired, bad signature, etc. → don't waste time on remote
+        return _REJECTED  # expired, bad signature, etc. → don’t waste time on remote
 
     sub = payload.get("sub", "")
     if not sub:
@@ -269,11 +270,11 @@ def _verify_jwt_local(access_token: str) -> str | dict:
     # ── Cache until token expiry or TTL, whichever is sooner ──
     token_exp = payload.get("exp", 0)
     cache_until = min(token_exp, now + _CACHE_TTL) if token_exp else now + _CACHE_TTL
-    _token_cache[access_token] = (user_data, cache_until)
+    _supabase_token_cache[access_token] = (user_data, cache_until)
 
     # Periodic cleanup
-    if len(_token_cache) > _CACHE_MAX_SIZE:
-        _cleanup_cache()
+    if len(_supabase_token_cache) > _CACHE_MAX_SIZE:
+        _cleanup_cache(_supabase_token_cache)
 
     return user_data
 
