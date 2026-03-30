@@ -1,23 +1,22 @@
 """
-WebSocket security: HMAC-signed tickets + Supabase JWT verification.
+Security module: Custom App JWT + Supabase JWT verification + HMAC tickets.
 
-Flow:
-  1. Client calls POST /api/v1/live/ticket  (Authorization: Bearer <supabase_jwt>)
-  2. Backend verifies JWT locally (HS256) → gets user_id  [FAST ~0.1ms]
-  3. Backend returns HMAC-signed ticket (valid 12h, bound to user + train + role)
-  4. Client connects to ws://.../api/v1/live/{train_id}?ticket=<ticket>
-  5. Backend verifies HMAC ticket on WebSocket handshake
+Token Strategy:
+  1. Client authenticates via Supabase (Google/Facebook OAuth).
+  2. Client calls POST /auth/token with Supabase JWT.
+  3. Backend verifies Supabase JWT → issues long-lived App JWT (30 days).
+  4. Client uses App JWT for ALL subsequent API calls.
+  5. When App JWT expires → client re-exchanges via Supabase token.
 
-Performance:
-  Local JWT verification eliminates the remote HTTP call to Supabase /auth/v1/user
-  that was the #1 bottleneck (~100-500ms per request). With in-memory caching,
-  repeated tokens are verified in ~0.01ms.
+App JWT is verified locally with zero network calls (~0.01ms with cache).
+Supabase JWT is still accepted for backwards compatibility.
 """
 
 import hashlib
 import hmac
 import logging
 import time
+import uuid
 from typing import Optional
 
 import httpx
@@ -31,13 +30,7 @@ logger = logging.getLogger(__name__)
 _TICKET_TTL = 43200  # seconds (12 hours - enough for full train journey)
 
 
-# ── Local JWT verification (fast path) ────────────────────────────────────────
-#
-# Supabase JWTs are signed with HS256. By verifying locally we avoid a
-# network round-trip to Supabase /auth/v1/user on every request.
-# An in-memory cache further speeds up repeated tokens (~0.01ms).
-# Remote verification is kept as a fallback when no JWT secret is configured.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── Shared token cache (used by both App JWT and Supabase JWT) ─────────────
 
 _token_cache: dict[str, tuple[dict, float]] = {}
 _CACHE_MAX_SIZE = 20_000
@@ -50,6 +43,129 @@ def _cleanup_cache() -> None:
     expired = [k for k, (_, exp) in _token_cache.items() if now >= exp]
     for k in expired:
         _token_cache.pop(k, None)
+
+
+# ── Custom App JWT (primary, long-lived) ──────────────────────────────────────
+
+_MIN_SECRET_LEN = 32  # minimum secret length for security
+
+
+def _validate_uuid(value: str) -> bool:
+    """Check if a string is a valid UUID v4."""
+    try:
+        uuid.UUID(value, version=4)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def create_app_token(user_id: str, email: str = "",
+                     user_metadata: dict | None = None) -> str:
+    """
+    Issue a long-lived app JWT after Supabase authentication.
+
+    Security:
+      - Rejects empty/short secrets
+      - Validates user_id is a valid UUID
+      - Includes: sub, email, iss, iat, exp, nbf, jti
+      - Expiry controlled by APP_TOKEN_EXPIRY_HOURS env var
+    """
+    if not settings.app_jwt_secret or len(settings.app_jwt_secret) < _MIN_SECRET_LEN:
+        raise ValueError("APP_JWT_SECRET is missing or too short (min 32 chars)")
+
+    if not user_id or not _validate_uuid(user_id):
+        raise ValueError(f"Invalid user_id: must be a valid UUID")
+
+    now = int(time.time())
+    expiry = now + (settings.app_token_expiry_hours * 3600)
+
+    payload = {
+        "sub": user_id,
+        "email": email or "",
+        "user_metadata": user_metadata or {},
+        "iss": "trainlive",
+        "iat": now,
+        "nbf": now,           # not valid before this time
+        "exp": expiry,
+        "jti": uuid.uuid4().hex,  # unique token ID
+    }
+    return jwt.encode(payload, settings.app_jwt_secret, algorithm="HS256")
+
+
+def verify_app_token(token: str) -> Optional[dict]:
+    """
+    Verify a custom app JWT. Returns user dict or None.
+
+    Security checks:
+      1. Secret must be configured (≥32 chars)
+      2. Signature verification (HS256)
+      3. Required claims: sub, iss, iat, exp, nbf
+      4. Issuer must be "trainlive"
+      5. sub must be a valid UUID
+      6. iat must not be in the future (clock skew ≤60s)
+      7. exp/nbf enforced by jose library
+    Uses in-memory cache for repeated tokens.
+    """
+    if not settings.app_jwt_secret or len(settings.app_jwt_secret) < _MIN_SECRET_LEN:
+        return None
+
+    now = time.time()
+
+    # ── Cache hit ──
+    cached = _token_cache.get(token)
+    if cached is not None:
+        user_data, expires_at = cached
+        if now < expires_at:
+            return user_data
+        _token_cache.pop(token, None)
+
+    # ── Decode & verify signature + exp + nbf ──
+    try:
+        payload = jwt.decode(
+            token,
+            settings.app_jwt_secret,
+            algorithms=["HS256"],
+            options={
+                "require_exp": True,
+                "require_iat": True,
+                "require_sub": True,
+            },
+        )
+    except JWTError:
+        return None
+
+    # ── Validate issuer ──
+    if payload.get("iss") != "trainlive":
+        return None
+
+    # ── Validate sub is a real UUID ──
+    sub = payload.get("sub", "")
+    if not sub or not _validate_uuid(sub):
+        return None
+
+    # ── Validate iat not from the future (allow 60s clock skew) ──
+    iat = payload.get("iat", 0)
+    if iat > now + 60:
+        logger.warning("App JWT iat is in the future: %s", iat)
+        return None
+
+    user_data = {
+        "id": sub,
+        "email": payload.get("email", ""),
+        "user_metadata": payload.get("user_metadata", {}),
+    }
+
+    # ── Cache until token expiry or TTL, whichever is sooner ──
+    token_exp = payload.get("exp", 0)
+    cache_until = min(token_exp, now + _CACHE_TTL) if token_exp else now + _CACHE_TTL
+    _token_cache[token] = (user_data, cache_until)
+    if len(_token_cache) > _CACHE_MAX_SIZE:
+        _cleanup_cache()
+
+    return user_data
+
+
+# ── Supabase JWT verification (backwards compat) ─────────────────────────────
 
 
 _NO_SECRET = "NO_SECRET"  # sentinel: JWT secret not configured
@@ -146,29 +262,32 @@ async def _verify_remote(access_token: str) -> Optional[dict]:
     return None
 
 
-async def verify_supabase_token(access_token: str) -> Optional[dict]:
+async def verify_token(access_token: str) -> Optional[dict]:
     """
-    Verify a Supabase access token.
+    Verify an access token (App JWT or Supabase JWT).
 
-    Strategy (fast → slow):
-      1. Local HS256 verification + in-memory cache  (~0.01-0.1ms)
-      2. Remote /auth/v1/user call                   (~100-500ms)  [only if no JWT secret]
-
-    If the JWT secret is configured and the token is expired/invalid,
-    we return None immediately without wasting time on a remote call.
+    Priority:
+      1. Custom App JWT  (~0.01ms, long-lived)
+      2. Supabase JWT local verification  (~0.01-0.1ms)
+      3. Supabase remote /auth/v1/user  (~100-500ms, only if no secrets)
     """
-    # ── Fast path: local JWT verification ──
+    # ── 1. Try custom App JWT first (fastest, preferred) ──
+    app_result = verify_app_token(access_token)
+    if app_result is not None:
+        return app_result
+
+    # ── 2. Try Supabase JWT local verification ──
     result = _verify_jwt_local(access_token)
 
     if isinstance(result, dict):
-        return result  # valid token
+        return result  # valid Supabase token
 
     if result is _REJECTED:
         return None  # expired/invalid — no point calling remote
 
     # result is _NO_SECRET → fall through to remote
 
-    # ── Slow path: remote Supabase API call (fallback) ──
+    # ── 3. Slow path: remote Supabase API call (fallback) ──
     global _supabase_client
     for attempt in range(2):
         try:
@@ -187,14 +306,18 @@ async def verify_supabase_token(access_token: str) -> Optional[dict]:
     return None
 
 
+# Backwards-compatible alias
+verify_supabase_token = verify_token
+
+
 # ── User authentication dependency ───────────────────────────────────────────
 
 
 async def require_authenticated_user(
-    authorization: str = Header(..., description="Bearer <supabase_jwt>"),
+    authorization: str = Header(..., description="Bearer <app_jwt or supabase_jwt>"),
 ) -> str:
     """
-    Verify Supabase JWT and return user_id.
+    Verify JWT (App or Supabase) and return user_id.
     Use this for Flutter app endpoints that need authenticated users (not admin).
     Raises 401 if token is missing, invalid, or expired.
     """
@@ -205,7 +328,7 @@ async def require_authenticated_user(
     if not token:
         raise HTTPException(status_code=401, detail="Missing access token")
 
-    user = await verify_supabase_token(token)
+    user = await verify_token(token)
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 

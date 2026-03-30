@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     supabase_service_role_key: str = ""
     supabase_jwt_secret: str = ""
 
+    # Custom app JWT (issued after Supabase auth, long-lived)
+    # REQUIRED in production — must be a strong random secret (≥48 chars)
+    app_jwt_secret: str = ""
+    # Token lifetime in hours (e.g. 720=30d, 168=7d, 24=1d)
+    app_token_expiry_hours: int = 720
+
     # Google Maps
     google_maps_api_key: str = ""
 
