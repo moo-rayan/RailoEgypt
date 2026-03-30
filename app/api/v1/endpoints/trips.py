@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
@@ -92,15 +92,26 @@ async def add_trip_stop(
     body: AddStopRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Add a new stop to a trip."""
+    """Add a new stop to a trip, shifting existing stops to make room."""
     trip = await trip_crud.get_by_id(db, trip_id)
     if not trip:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
 
+    # Clamp stop_order: min=1, max=len+1 (append)
+    max_order = max((s.stop_order for s in trip.stops), default=0)
+    insert_at = max(1, min(body.stop_order, max_order + 1))
+
+    # Shift all stops with stop_order >= insert_at up by 1
+    await db.execute(
+        update(TripStop)
+        .where(TripStop.trip_id == trip_id, TripStop.stop_order >= insert_at)
+        .values(stop_order=TripStop.stop_order + 1)
+    )
+
     stop = TripStop(
         trip_id=trip_id,
         station_id=body.station_id,
-        stop_order=body.stop_order,
+        stop_order=insert_at,
         time_ar=body.time_ar,
         time_en=body.time_en or body.time_ar,
     )
@@ -122,7 +133,7 @@ async def remove_trip_stop(
     stop_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove a stop from a trip."""
+    """Remove a stop and re-sequence the remaining stops."""
     result = await db.execute(
         select(TripStop).where(
             TripStop.id == stop_id,
@@ -133,7 +144,16 @@ async def remove_trip_stop(
     if not stop:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stop not found")
 
+    deleted_order = stop.stop_order
     await db.delete(stop)
+    await db.flush()
+
+    # Shift all stops after the deleted one down by 1
+    await db.execute(
+        update(TripStop)
+        .where(TripStop.trip_id == trip_id, TripStop.stop_order > deleted_order)
+        .values(stop_order=TripStop.stop_order - 1)
+    )
 
     trip = await trip_crud.get_by_id(db, trip_id)
     if trip:
