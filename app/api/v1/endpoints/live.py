@@ -14,7 +14,6 @@ GET  /api/v1/live/status/{train_id}
 """
 
 import logging
-import time
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
@@ -155,16 +154,6 @@ async def post_contributor_location(
         if not room or not room.stations:
             await _load_trip_info(train_id, body.trip_id)
 
-    # Block stale in-flight POSTs from re-adding a user who just left voluntarily.
-    # Checked at manager level so it works even if the room was deleted after last contributor left.
-    if tracking_manager.check_voluntary_left(user_id):
-        logger.info(
-            "🚫 [%s] %s recently left voluntarily — ignoring stale POST",
-            train_id, user_id[:8],
-        )
-        return {"ok": False, "status": "left", "error": "recently_left",
-                "position_data": None, "waiting_position": 0, "total_waiting": 0}
-
     # Register contributor if not already in the room
     room = tracking_manager.get_room(train_id)
     is_new_contributor = not room or (
@@ -194,17 +183,6 @@ async def post_contributor_location(
                 detail=join_result.get("message_ar", "You are temporarily blocked"),
             )
 
-        # Double-check: voluntary_left might have been set while add_contributor was running
-        # (race condition: /leave and GPS POST arrive simultaneously)
-        if tracking_manager.check_voluntary_left(user_id):
-            await tracking_manager.remove_participant(train_id, user_id, "cleanup")
-            logger.info(
-                "🚫 [%s] %s re-join race condition caught — removed after add",
-                train_id, user_id[:8],
-            )
-            return {"ok": False, "status": "left", "error": "recently_left",
-                    "position_data": None, "waiting_position": 0, "total_waiting": 0}
-
         logger.info(
             "👤+ [%s] New contributor %s joined (%s)",
             train_id, user_id[:8], join_status,
@@ -221,9 +199,13 @@ async def post_contributor_location(
     )
 
     # Build response — include current aggregated position so the contributor
-    # can also display the train on their map without a separate poll
+    # can also display the train on their map without a separate poll.
+    # IMPORTANT: don't send (0,0) — room starts at (0,0) before first
+    # successful aggregate; sending it causes the map to zoom to Null Island.
     room = tracking_manager.get_room(train_id)
-    position_data = tracking_manager.get_position_data(room) if room else None
+    position_data = None
+    if room and (room.lat != 0.0 or room.lng != 0.0):
+        position_data = tracking_manager.get_position_data(room)
 
     # Determine contributor's current waiting-list status
     contributor_status = "active"
@@ -247,32 +229,6 @@ async def post_contributor_location(
         "distance_m": result.get("distance_m"),
         "position_data": position_data,
     }
-
-
-# ── REST: Contributor explicit join (clears voluntary-leave block) ───────────
-
-@router.post("/{train_id}/join")
-async def contributor_join(
-    train_id: str,
-    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
-):
-    """
-    Called by the contributor app when the user intentionally wants to start
-    contributing (taps 'Start Contributing').  Clears any voluntary-leave block
-    so that the first GPS POST is not rejected.
-    """
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization header")
-    token = authorization[7:]
-
-    user = await verify_supabase_token(token)
-    if user is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    user_id = user["id"]
-    tracking_manager.clear_voluntary_left(user_id)
-    logger.info("✅ [%s] Voluntary-leave block cleared for %s (join intent)", train_id, user_id[:8])
-    return {"ok": True}
 
 
 # ── REST: Contributor explicit leave ─────────────────────────────────────────

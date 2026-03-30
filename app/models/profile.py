@@ -59,6 +59,15 @@ class Profile(Base):
         comment="Admin role: fulladmin (full access) | monitor (read-only limited access)",
     )
 
+    chat_alias: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, default=None,
+        comment="Anonymous alias for train chat, e.g. مسافر 1234",
+    )
+    chat_anonymous: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+        comment="Whether user prefers anonymous mode in train chat",
+    )
+
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()

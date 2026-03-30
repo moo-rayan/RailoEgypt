@@ -3,6 +3,7 @@ Support endpoints: Contact Us + Report a Problem.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -45,6 +46,46 @@ async def _get_user(authorization: str = Header(...)) -> dict:
     return user
 
 
+async def _check_contact_rate_limit(user_id: str, db: AsyncSession) -> None:
+    """Check if user has sent a contact message in the last hour."""
+    logger.info(f"Checking rate limit for user: {user_id[:8]}")
+    
+    result = await db.execute(
+        text("""
+            SELECT created_at
+            FROM "EgRailway".contact_messages
+            WHERE user_id = CAST(:user_id AS UUID)
+            ORDER BY created_at DESC
+            LIMIT 1
+        """),
+        {"user_id": user_id}
+    )
+    row = result.mappings().first()
+    
+    if row:
+        last_message_time = row["created_at"]
+        logger.info(f"Last message time from DB: {last_message_time}, tzinfo: {last_message_time.tzinfo}")
+        
+        # Convert both times to UTC for comparison
+        if last_message_time.tzinfo is not None:
+            last_message_time = last_message_time.astimezone(timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        time_since_last = now - last_message_time
+        
+        logger.info(f"Now (UTC): {now}, Last (UTC): {last_message_time}, Diff: {time_since_last}, Minutes: {time_since_last.total_seconds() / 60}")
+        
+        if time_since_last < timedelta(hours=1):
+            minutes_remaining = int(60 - time_since_last.total_seconds() / 60)
+            logger.warning(f"Rate limit hit! User {user_id[:8]} must wait {minutes_remaining} minutes")
+            raise HTTPException(
+                status_code=429,
+                detail=f"يمكنك إرسال رسالة واحدة فقط كل ساعة. يرجى الانتظار {minutes_remaining} دقيقة أخرى."
+            )
+    else:
+        logger.info(f"No previous message found for user: {user_id[:8]}")
+
+
 # ── Contact Us ────────────────────────────────────────────────────────────────
 
 @router.post("/contact", status_code=201)
@@ -54,6 +95,10 @@ async def submit_contact(
     db: AsyncSession = Depends(get_db),
 ):
     user_id = user["id"]
+    
+    # Check rate limit - one message per hour
+    await _check_contact_rate_limit(user_id, db)
+    
     email = user.get("email", "")
     meta = user.get("user_metadata", {})
     display_name = meta.get("full_name") or meta.get("name") or email
@@ -91,7 +136,43 @@ async def submit_contact(
     return {"ok": True}
 
 
-# ── Report Problem ────────────────────────────────────────────────────────────
+async def _check_report_rate_limit(user_id: str, db: AsyncSession) -> None:
+    """Check if user has sent a report in the last hour."""
+    logger.info(f"Checking report rate limit for user: {user_id[:8]}")
+    
+    result = await db.execute(
+        text("""
+            SELECT created_at
+            FROM "EgRailway".problem_reports
+            WHERE user_id = CAST(:user_id AS UUID)
+            ORDER BY created_at DESC
+            LIMIT 1
+        """),
+        {"user_id": user_id}
+    )
+    row = result.mappings().first()
+    
+    if row:
+        last_report_time = row["created_at"]
+        
+        # Convert both times to UTC for comparison
+        if last_report_time.tzinfo is not None:
+            last_report_time = last_report_time.astimezone(timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        time_since_last = now - last_report_time
+        
+        logger.info(f"Now (UTC): {now}, Last (UTC): {last_report_time}, Diff: {time_since_last}, Minutes: {time_since_last.total_seconds() / 60}")
+        
+        if time_since_last < timedelta(hours=1):
+            minutes_remaining = int(60 - time_since_last.total_seconds() / 60)
+            logger.warning(f"Report rate limit hit! User {user_id[:8]} must wait {minutes_remaining} minutes")
+            raise HTTPException(
+                status_code=429,
+                detail=f"يمكنك إرسال بلاغ واحد فقط كل ساعة. يرجى الانتظار {minutes_remaining} دقيقة أخرى."
+            )
+    else:
+        logger.info(f"No previous report found for user: {user_id[:8]}")
 
 @router.post("/report", status_code=201)
 async def submit_report(
@@ -100,6 +181,10 @@ async def submit_report(
     db: AsyncSession = Depends(get_db),
 ):
     user_id = user["id"]
+    
+    # Check rate limit - one report per hour
+    await _check_report_rate_limit(user_id, db)
+    
     email = user.get("email", "")
     meta = user.get("user_metadata", {})
     display_name = meta.get("full_name") or meta.get("name") or email

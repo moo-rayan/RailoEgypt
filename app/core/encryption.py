@@ -40,7 +40,8 @@ def encrypt_bundle(data: dict) -> dict:
         {
             "iv":   "<base64 IV>",
             "data": "<base64 ciphertext>",
-            "mac":  "<hex HMAC-SHA256>"
+            "mac":  "<hex HMAC-SHA256>",
+            "metadata": "<Part 3 of AES key disguised as chunk_hash>"
         }
     """
     key = _get_key()
@@ -62,10 +63,17 @@ def encrypt_bundle(data: dict) -> dict:
     # 4. HMAC-SHA256 for integrity (encrypt-then-MAC)
     mac = hmac.new(key, iv + ciphertext, hashlib.sha256).hexdigest()
 
+    # 5. Extract Part 3 of the key (12 chars = indices 32-43)
+    # Key: L3EwRkXEzSPEHqNYCsi1+x3ulJtZlpkgLuRdROrUw7M= (44 chars)
+    # Part 3: LuRdROrUw7M= (disguised as 'chunk_hash')
+    key_b64 = base64.b64encode(key).decode("ascii")
+    key_part = key_b64[32:44]  # 12 characters
+
     return {
         "iv": base64.b64encode(iv).decode("ascii"),
         "data": base64.b64encode(ciphertext).decode("ascii"),
         "mac": mac,
+        "chunk_hash": key_part,
     }
 
 

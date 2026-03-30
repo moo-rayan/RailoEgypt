@@ -225,7 +225,8 @@ async def get_data_bundle():
             "version": "abc123...",
             "iv":   "<base64>",
             "data": "<base64 AES-256-CBC ciphertext>",
-            "mac":  "<HMAC-SHA256 hex>"
+            "mac":  "<HMAC-SHA256 hex>",
+            "chunk_hash": "<opaque chunk verification hash>"
         }
     """
     gzip_bytes = bundle_store.gzip_bytes

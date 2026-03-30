@@ -28,11 +28,12 @@ from app.services.railway_service import railway_graph, _haversine
 logger = logging.getLogger(__name__)
 
 _MAX_RAIL_DISTANCE_M = 500.0   # accept if ≤ 500 m from rail
+_MAX_TRIP_ROUTE_DISTANCE_M = 200.0  # stricter threshold for trip-route fallback (GeoJSON gap)
 _MAX_FAR_WARNINGS    = 3       # consecutive far updates before silent disconnect
 _UPDATE_COOLDOWN_S   = 25.0    # min seconds between contributor updates
 _STALE_TIMEOUT_S     = 240.0   # remove contributor after 240 s silence
 _MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
-_TRAIN_POS_TTL       = 3600    # Redis TTL for cached train position (1 hour)
+_TRAIN_POS_TTL       = 60      # Redis TTL for cached train position (60 seconds)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -123,6 +124,8 @@ class TrainRoom:
     max_progress: float = 0.0   # furthest route progress in metres
     max_lat: float = 0.0        # lat at max_progress (forward-only anchor)
     max_lng: float = 0.0        # lng at max_progress (forward-only anchor)
+    _last_snapped_lat: float = 0.0  # last successfully snapped position
+    _last_snapped_lng: float = 0.0
 
 
 # ── Manager singleton ────────────────────────────────────────────────────────
@@ -135,8 +138,6 @@ class TrackingManager:
         self._user_trip_info: dict[str, dict] = {}  # user_id → {from_station_name, to_station_name}
         self._user_captains: dict[str, bool] = {}  # user_id → is_captain
         self._last_positions: dict[str, tuple] = {}  # user_id → (lat, lng, speed)
-        # Manager-level voluntary-leave registry (survives room deletion)
-        self._voluntary_left: dict[str, float] = {}  # user_id → leave_timestamp
 
     def set_user_avatar(self, user_id: str, avatar_url: str) -> None:
         """Store user avatar for later use when contributor joins WS."""
@@ -158,33 +159,6 @@ class TrackingManager:
     def set_user_captain(self, user_id: str, is_captain: bool) -> None:
         """Store whether user is a train captain."""
         self._user_captains[user_id] = is_captain
-
-    _VOLUNTARY_LEFT_BLOCK_S = 60.0  # seconds since LAST blocked attempt before re-join is allowed
-
-    def check_voluntary_left(self, user_id: str) -> bool:
-        """Return True (and extend block) if user recently left voluntarily.
-
-        Uses a ROLLING window: every time a stale GPS POST is blocked, the
-        60-second countdown restarts from NOW.  This keeps the block active as
-        long as the background isolate keeps sending — the block only expires
-        after 60 s of complete silence from that user.
-        """
-        leave_ts = self._voluntary_left.get(user_id, 0)
-        if leave_ts and time.time() - leave_ts < self._VOLUNTARY_LEFT_BLOCK_S:
-            # Extend: reset the 60-s window from now so a still-running isolate
-            # can never sneak through just because 60 s elapsed since /leave.
-            self._voluntary_left[user_id] = time.time()
-            return True
-        # Expired — clean up
-        if leave_ts:
-            del self._voluntary_left[user_id]
-        return False
-
-    def clear_voluntary_left(self, user_id: str) -> None:
-        """Explicitly clear the voluntary-leave block for a user.
-        Called when the user intentionally wants to re-join (taps 'Start Contributing').
-        """
-        self._voluntary_left.pop(user_id, None)
 
     def _log_event(self, room: TrainRoom, event_type: str, user_id: str, detail: str = "") -> None:
         """Append an event to the room's ring-buffer log."""
@@ -361,7 +335,7 @@ class TrackingManager:
             if last:
                 c = room.contributors[user_id]
                 c.lat, c.lng, c.speed = last
-                c.last_update = time.time() - 1
+                c.last_update = time.time() - _UPDATE_COOLDOWN_S - 1
             self._log_event(
                 room, "join", user_id,
                 f"{name or user_id[:8]}{captain_label} انضم كمساهم نشط ({from_name}→{to_name}, {distance_km:.1f}km) "
@@ -404,13 +378,6 @@ class TrackingManager:
 
     async def remove_participant(self, train_id: str, user_id: str, disconnect_reason: str = "") -> None:
         reason_text = disconnect_reason or "unknown"
-
-        # Register voluntary leave IMMEDIATELY — before any room lookup.
-        # This is the only guarantee that check_voluntary_left() blocks stale GPS
-        # POSTs even when the room was already cleaned up (room=None).
-        if reason_text == "user_left":
-            self._voluntary_left[user_id] = time.time()
-            logger.debug("🔒 [%s] voluntary_left registered for %s", train_id, user_id[:8])
 
         room = self._rooms.get(train_id)
         if not room:
@@ -614,7 +581,7 @@ class TrackingManager:
             # GeoJSON says far — but check trip-route fallback first
             # (covers GeoJSON data gaps using DB station coordinates)
             route_dist = self._distance_to_trip_route(lng, lat, room.stations)
-            if route_dist is not None and route_dist <= _MAX_RAIL_DISTANCE_M:
+            if route_dist is not None and route_dist <= _MAX_TRIP_ROUTE_DISTANCE_M:
                 # Close to trip route → accept, GeoJSON just has a gap here
                 logger.info(
                     "✅ [%s] User %s: far from GeoJSON rail (%.0fm) but "
@@ -622,7 +589,9 @@ class TrackingManager:
                     train_id, user_id, distance, route_dist,
                 )
                 contributor.far_from_rail_count = 0
-                distance = route_dist  # use the closer distance for logging
+                # IMPORTANT: keep original GeoJSON distance in `distance` so that
+                # dist_to_rail reflects real distance to the visible railway.
+                # This lets _aggregate_position quality-filter correctly.
             else:
                 # Actually far from both sources → warn
                 contributor.far_from_rail_count += 1
@@ -808,16 +777,43 @@ class TrackingManager:
 
     @staticmethod
     def _snap_position_to_rail(room: "TrainRoom") -> None:
-        """Snap the room's aggregated position to the nearest railway segment."""
+        """Snap the room's aggregated position to the nearest railway segment.
+
+        Protection: if the new position can't be snapped (too far from any rail),
+        revert to the previous good position so the train icon NEVER drifts off track.
+        """
         if not railway_graph.is_built or room.lat == 0.0:
             return
+
+        prev_lat, prev_lng = room.lat, room.lng
         result = railway_graph.snap_to_rail(room.lng, room.lat)
+
         if result is None:
+            # No rail found — keep previous snapped position
+            if room._last_snapped_lat != 0.0:
+                room.lat = room._last_snapped_lat
+                room.lng = room._last_snapped_lng
+                logger.info(
+                    "🛡️ [%s] Snap failed — keeping last snapped position",
+                    room.train_id,
+                )
             return
+
         snapped_lon, snapped_lat, dist = result
-        if dist < 600:  # only snap if reasonably close
+        if dist < 600:  # close enough to snap
             room.lat = snapped_lat
             room.lng = snapped_lon
+            room._last_snapped_lat = snapped_lat
+            room._last_snapped_lng = snapped_lon
+        else:
+            # Too far to snap — revert to last known good snapped position
+            if room._last_snapped_lat != 0.0:
+                room.lat = room._last_snapped_lat
+                room.lng = room._last_snapped_lng
+                logger.info(
+                    "🛡️ [%s] Position %.0fm from rail — reverting to last snapped",
+                    room.train_id, dist,
+                )
 
     # ── Route progress calculation ────────────────────────────────────────
 
@@ -924,33 +920,40 @@ class TrackingManager:
             )
             return
 
-        # Step 1: compute route progress for all active contributors
+        # ── Quality-first selection ──────────────────────────────────────
+        # A contributor far from the railway likely has inaccurate/drifted GPS.
+        # Their inflated route-progress must NOT override a contributor who is
+        # genuinely on the train (close to rail).
+        #
+        # Strategy: prefer contributors close to rail (≤ 150 m).  Only fall
+        # back to ALL active contributors if none are close.
+        _RAIL_QUALITY_M = 150.0
+        on_rail = [c for c in active if c.dist_to_rail <= _RAIL_QUALITY_M]
+        candidates = on_rail if on_rail else active
+
+        # Step 1: compute route progress for candidates only
         progress_map: dict[str, float] = {}
-        for c in active:
+        for c in candidates:
             progress_map[c.user_id] = TrackingManager._compute_route_progress(
                 c.lat, c.lng, room.stations,
             )
 
         best_progress = max(progress_map.values())
 
-        # Step 2: lead group — contributors within 100 m of the maximum progress
-        # (GPS noise is ~30–50 m, so 100 m captures genuine co-leaders)
+        # Step 2: lead group — candidates within 100 m of the maximum progress
         _LEAD_THRESHOLD_M = 100.0
         lead_group = [
-            c for c in active
+            c for c in candidates
             if progress_map[c.user_id] >= best_progress - _LEAD_THRESHOLD_M
         ]
 
         # Step 3: among lead group, prefer the contributor closest to the railway
         best_c = min(lead_group, key=lambda c: c.dist_to_rail)
 
-        # Step 4: hysteresis — only switch from last_best_user_id if they dropped
-        # out of the lead group (fell >100 m behind the new leader).
-        # Within the lead group, always prefer the one closest to rail (step 3).
+        # Step 4: hysteresis — keep previous selection if still in lead group
         if room.last_best_user_id and room.last_best_user_id != best_c.user_id:
-            last_best = next((c for c in active if c.user_id == room.last_best_user_id), None)
-            if last_best and progress_map.get(room.last_best_user_id, 0) >= best_progress - _LEAD_THRESHOLD_M:
-                # Still in lead group — keep them to avoid unnecessary switches
+            last_best = next((c for c in lead_group if c.user_id == room.last_best_user_id), None)
+            if last_best:
                 best_c = last_best
 
         room.lat = best_c.lat
@@ -980,8 +983,8 @@ class TrackingManager:
     def _top_contributor_infos(self, room: TrainRoom, limit: int = 3) -> list[dict]:
         """Return compact info dicts for the top N active contributors (captain first).
 
-        Keys: n=display_name, cap=is_captain (only if True).
-        Avatar URLs are no longer included to reduce payload size.
+        Keys: uid=user_id (truncated), cap=is_captain (only if True).
+        Names and avatar URLs are excluded for privacy — only ids and captain status.
         """
         sorted_contribs = sorted(
             room.contributors.values(),
@@ -989,7 +992,7 @@ class TrackingManager:
         )
         infos: list[dict] = []
         for c in sorted_contribs:
-            entry: dict = {"n": c.display_name or c.user_id[:6]}
+            entry: dict = {"uid": c.user_id[:8]}
             if c.is_captain:
                 entry["cap"] = True
             infos.append(entry)

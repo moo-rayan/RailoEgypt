@@ -16,12 +16,17 @@ GET  /api/v1/train-chat/{train_id}/count
 
 import json
 import logging
+import random
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from sqlalchemy import select, update as sa_update, cast
+from sqlalchemy.dialects.postgresql import UUID
 
+from app.core.database import AsyncSessionFactory
 from app.core.security import verify_supabase_token, verify_ticket, create_ticket
+from app.models.profile import Profile
 from app.services.train_chat_manager import train_chat_manager
 from app.services.chat_report_service import submit_report, check_user_banned
 
@@ -32,9 +37,14 @@ router = APIRouter(prefix="/train-chat", tags=["Train Chat"])
 
 # ── REST: Get chat ticket ────────────────────────────────────────────────────
 
+class ChatTicketRequest(BaseModel):
+    anonymous: bool | None = None  # None = use stored preference
+
+
 @router.post("/ticket/{train_id}")
 async def get_chat_ticket(
     train_id: str,
+    body: ChatTicketRequest | None = None,
     authorization: str = Header(..., description="Bearer <supabase_access_token>"),
 ):
     """Get an HMAC ticket for chat WebSocket connection."""
@@ -50,9 +60,9 @@ async def get_chat_ticket(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found")
 
-    # Extract user info for chat display
+    # Extract user info from Supabase metadata
     user_meta = user.get("user_metadata", {}) or {}
-    user_name = (
+    real_name = (
         user_meta.get("full_name", "")
         or user_meta.get("name", "")
         or user_meta.get("display_name", "")
@@ -60,13 +70,55 @@ async def get_chat_ticket(
     )
     user_avatar = user_meta.get("avatar_url", "") or user_meta.get("picture", "") or ""
 
-    # Create ticket with role "chatter"
-    ticket = create_ticket(user_id, train_id, "listener")  # reuse role field
+    # ── Read profile & handle alias / anonymous preference ──
+    chat_alias = None
+    is_anonymous = False
+
+    async with AsyncSessionFactory() as session:
+        row = await session.execute(
+            select(Profile.chat_alias, Profile.chat_anonymous).where(Profile.id == cast(user_id, UUID))
+        )
+        profile = row.first()
+
+        if profile is not None:
+            chat_alias = profile.chat_alias
+            # Use stored preference unless client explicitly overrides
+            is_anonymous = profile.chat_anonymous if (body is None or body.anonymous is None) else body.anonymous
+
+            updates = {}
+
+            # Generate alias if not yet assigned
+            if not chat_alias:
+                chat_alias = f"مسافر {random.randint(1000, 9999)}"
+                updates["chat_alias"] = chat_alias
+
+            # Persist anonymous preference if client sent a new value
+            if body is not None and body.anonymous is not None and body.anonymous != profile.chat_anonymous:
+                updates["chat_anonymous"] = body.anonymous
+                is_anonymous = body.anonymous
+
+            if updates:
+                await session.execute(
+                    sa_update(Profile).where(Profile.id == cast(user_id, UUID)).values(**updates)
+                )
+                await session.commit()
+        else:
+            # No profile row (edge case) — use real name
+            chat_alias = f"مسافر {random.randint(1000, 9999)}"
+
+    # Decide which name to display
+    display_name = chat_alias if is_anonymous else real_name
+    display_avatar = "" if is_anonymous else user_avatar
+
+    # Create ticket
+    ticket = create_ticket(user_id, train_id, "listener")
 
     return {
         "ticket": ticket,
-        "user_name": user_name,
-        "user_avatar": user_avatar,
+        "user_name": display_name,
+        "user_avatar": display_avatar,
+        "chat_alias": chat_alias,
+        "chat_anonymous": is_anonymous,
     }
 
 
