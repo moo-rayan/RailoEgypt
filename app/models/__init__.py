@@ -1,6 +1,7 @@
 from app.models.account_deletion_request import AccountDeletionRequest
 from app.models.admin_alert import AdminAlert
 from app.models.app_config import AppConfig
+from app.models.audit_log import AuditLog
 from app.models.device_token import DeviceToken
 from app.models.notification_history import NotificationHistory
 from app.models.profile import Profile
@@ -13,6 +14,7 @@ __all__ = [
     "AccountDeletionRequest",
     "AdminAlert",
     "AppConfig",
+    "AuditLog",
     "DeviceToken",
     "NotificationHistory",
     "Profile",

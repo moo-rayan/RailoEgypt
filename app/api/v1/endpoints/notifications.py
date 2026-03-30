@@ -10,7 +10,7 @@ GET  /notifications/history           — Get sent notifications history (admin 
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import delete, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,7 @@ from app.models.admin_alert import AdminAlert
 from app.models.device_token import DeviceToken
 from app.models.notification_history import NotificationHistory
 from app.services import fcm_service
+from app.services.audit_service import audit
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ async def unregister_token(
 @router.post("/send", dependencies=[Depends(require_fulladmin)])
 async def send_notification(
     body: SendNotificationRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Send a push notification to all registered devices (admin only)."""
@@ -164,6 +166,17 @@ async def send_notification(
         invalid_removed=len(all_invalid),
     )
     db.add(history)
+
+    audit.log_admin_action(
+        request,
+        action="send_push_notification",
+        metadata={
+            "title": body.title,
+            "total_tokens": len(tokens),
+            "success": total_success,
+            "failure": total_failure,
+        },
+    )
 
     return {
         "status": "sent",

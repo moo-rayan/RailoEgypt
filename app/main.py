@@ -22,9 +22,11 @@ except (ImportError, AttributeError):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 from slowapi.util import get_remote_address
 
@@ -34,6 +36,8 @@ from app.core.cache import get_redis
 from app.core.config import settings
 from app.core.database import AsyncSessionFactory
 from app.core.logging import setup_logging
+from app.core.security_middleware import SecurityMiddleware
+from app.services.audit_service import audit
 from app.core.r2_storage import r2_download_bundle, r2_download_version, r2_upload_bundle
 from app.models.railway_graph import RailwayGraphData
 from app.services.railway_service import railway_graph
@@ -392,9 +396,19 @@ class _WebSocketSafeRateLimiter:
             await self._http_app(scope, receive, send)
 
 
+async def _audit_rate_limit_handler(request: StarletteRequest, exc: RateLimitExceeded) -> JSONResponse:
+    """Custom rate-limit handler that logs to the audit system."""
+    limit_info = str(exc.detail) if hasattr(exc, "detail") else "Rate limit exceeded"
+    audit.log_rate_limit(request, limit_info=limit_info)
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please slow down."},
+    )
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="TrainLiveEG API",
+        title="Railo Egypt API",
         description="API للقطارات المصرية - تتبع مباشر ومعلومات الرحلات",
         version="1.0.0",
         docs_url="/docs" if not settings.is_production else None,
@@ -404,8 +418,11 @@ def create_app() -> FastAPI:
 
     # Rate Limiting (custom wrapper skips WebSocket to prevent 400 errors)
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, _audit_rate_limit_handler)
     app.add_middleware(_WebSocketSafeRateLimiter)
+
+    # Security Middleware (analyzes every request for threats)
+    app.add_middleware(SecurityMiddleware)
 
     # CORS
     app.add_middleware(

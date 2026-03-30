@@ -8,7 +8,7 @@ PUT  /app/config           — Admin: update app configuration
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.admin_auth import require_fulladmin
 from app.models.app_config import AppConfig
+from app.services.audit_service import audit
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
 @router.put("/config", response_model=AppConfigResponse, dependencies=[Depends(require_fulladmin)])
 async def update_app_config(
     body: AppConfigUpdateRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Admin endpoint — update app configuration (maintenance mode, force update, etc.)."""
@@ -113,6 +115,11 @@ async def update_app_config(
     await db.refresh(config)
 
     logger.info("⚙️ App config updated: %s", list(update_data.keys()))
+    audit.log_admin_action(
+        request,
+        action="update_app_config",
+        metadata={"updated_fields": list(update_data.keys()), "values": update_data},
+    )
 
     return AppConfigResponse(
         is_maintenance_mode=config.is_maintenance_mode,

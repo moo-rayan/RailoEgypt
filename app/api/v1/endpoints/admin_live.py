@@ -8,10 +8,10 @@ Read endpoints: monitor + fulladmin. Write endpoints: fulladmin only.
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
-
 from app.core.admin_auth import AdminUser, get_admin_or_legacy_key, require_fulladmin
+from app.services.audit_service import audit
 from app.services.ban_service import ban_contributor, is_banned, list_bans, unban_contributor
 from app.services.tracking_manager import tracking_manager
 
@@ -49,7 +49,7 @@ class SetMaxContributorsRequest(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/ban", dependencies=[Depends(require_fulladmin)])
-async def ban_contributor_endpoint(body: BanRequest):
+async def ban_contributor_endpoint(body: BanRequest, request: Request):
     """
     Ban a contributor from contributing.
     duration_minutes=0 means permanent ban.
@@ -79,11 +79,16 @@ async def ban_contributor_endpoint(body: BanRequest):
         )
 
     duration_text = f"{body.duration_minutes} minutes" if body.duration_minutes > 0 else "permanent"
+    audit.log_admin_action(
+        request,
+        action=f"ban_contributor ({duration_text})",
+        metadata={"target_user": body.user_id, "reason": body.reason, "duration": body.duration_minutes},
+    )
     return {"ok": True, "message": f"User {body.user_id[:8]}... banned ({duration_text})"}
 
 
 @router.post("/unban", dependencies=[Depends(require_fulladmin)])
-async def unban_contributor_endpoint(body: UnbanRequest):
+async def unban_contributor_endpoint(body: UnbanRequest, request: Request):
     """Remove a contributor's ban."""
     removed = await unban_contributor(body.user_id)
     if not removed:
@@ -91,6 +96,7 @@ async def unban_contributor_endpoint(body: UnbanRequest):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No active ban found for this user",
         )
+    audit.log_admin_action(request, action="unban_contributor", metadata={"target_user": body.user_id})
     return {"ok": True, "message": f"User {body.user_id[:8]}... unbanned"}
 
 
@@ -102,7 +108,7 @@ async def list_bans_endpoint():
 
 
 @router.post("/set-leader", dependencies=[Depends(require_fulladmin)])
-async def set_leader_endpoint(body: SetLeaderRequest):
+async def set_leader_endpoint(body: SetLeaderRequest, request: Request):
     """Set a contributor as the room leader (only their updates are used)."""
     success = tracking_manager.set_leader(
         train_id=body.train_id,
@@ -113,11 +119,12 @@ async def set_leader_endpoint(body: SetLeaderRequest):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Contributor not found in the specified room",
         )
+    audit.log_admin_action(request, action="set_leader", metadata={"train_id": body.train_id, "target_user": body.user_id})
     return {"ok": True, "message": f"User {body.user_id[:8]}... set as leader"}
 
 
 @router.post("/remove-leader", dependencies=[Depends(require_fulladmin)])
-async def remove_leader_endpoint(body: RemoveLeaderRequest):
+async def remove_leader_endpoint(body: RemoveLeaderRequest, request: Request):
     """Remove leader from a room (revert to auto aggregation)."""
     success = tracking_manager.remove_leader(body.train_id)
     if not success:
@@ -125,6 +132,7 @@ async def remove_leader_endpoint(body: RemoveLeaderRequest):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No leader set for this room",
         )
+    audit.log_admin_action(request, action="remove_leader", metadata={"train_id": body.train_id})
     return {"ok": True, "message": "Leader removed, reverted to auto aggregation"}
 
 
@@ -157,7 +165,7 @@ async def get_room_feed(train_id: str):
 
 
 @router.post("/set-max-contributors", dependencies=[Depends(require_fulladmin)])
-async def set_max_contributors_endpoint(body: SetMaxContributorsRequest):
+async def set_max_contributors_endpoint(body: SetMaxContributorsRequest, request: Request):
     """Update the max active contributors limit for a room."""
     if body.max_active < 1 or body.max_active > 50:
         raise HTTPException(
