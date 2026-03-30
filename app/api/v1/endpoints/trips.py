@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
 from app.core.cache import cache_delete_pattern, cache_get, cache_set
 from app.core.database import get_db
 from app.crud.trips import trip_crud
-from app.models.trip import TripStop
+from app.models.trip import Trip, TripStop
 from app.schemas.trip import TripListOut, TripOut, TripStopOut
 
 router = APIRouter(prefix="/trips", tags=["trips"])
@@ -93,12 +94,16 @@ async def add_trip_stop(
     db: AsyncSession = Depends(get_db),
 ):
     """Add a new stop to a trip, shifting existing stops to make room."""
-    trip = await trip_crud.get_by_id(db, trip_id)
-    if not trip:
+    # Verify trip exists (lightweight check, no ORM load)
+    trip_exists = (await db.execute(select(Trip.id).where(Trip.id == trip_id))).scalar_one_or_none()
+    if trip_exists is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
 
-    # Clamp stop_order: min=1, max=len+1 (append)
-    max_order = max((s.stop_order for s in trip.stops), default=0)
+    # Get current max stop_order via SQL
+    max_order = (await db.execute(
+        select(func.max(TripStop.stop_order)).where(TripStop.trip_id == trip_id)
+    )).scalar() or 0
+
     insert_at = max(1, min(body.stop_order, max_order + 1))
 
     # Shift all stops with stop_order >= insert_at up by 1
@@ -108,19 +113,34 @@ async def add_trip_stop(
         .values(stop_order=TripStop.stop_order + 1)
     )
 
-    stop = TripStop(
+    # Insert new stop
+    new_stop = TripStop(
         trip_id=trip_id,
         station_id=body.station_id,
         stop_order=insert_at,
         time_ar=body.time_ar,
         time_en=body.time_en or body.time_ar,
     )
-    db.add(stop)
-    trip.stops_count = len(trip.stops) + 1
+    db.add(new_stop)
+
+    # Update stops_count via SQL (avoids stale ORM count)
+    await db.execute(
+        update(Trip).where(Trip.id == trip_id).values(stops_count=Trip.stops_count + 1)
+    )
+
+    await db.flush()           # populate new_stop.id
+    new_stop_id = new_stop.id
     await db.commit()
-    await db.refresh(stop, ["station"])
+
+    # Re-query with station relationship after commit
+    result = await db.execute(
+        select(TripStop)
+        .options(selectinload(TripStop.station))
+        .where(TripStop.id == new_stop_id)
+    )
+    fresh = result.scalar_one()
     await cache_delete_pattern("trips:*")
-    return TripStopOut.model_validate(stop)
+    return TripStopOut.model_validate(fresh)
 
 
 @router.delete(
