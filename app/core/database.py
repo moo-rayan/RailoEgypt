@@ -1,6 +1,5 @@
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
@@ -12,21 +11,21 @@ def _async_url(url: str) -> str:
     return url
 
 
-# ── pgbouncer (transaction mode) compatibility ───────────────────────────────
+# ── Supabase Supavisor — session mode (port 5432) ────────────────────────────
 #
-# pgbouncer in "transaction" pool mode does NOT support prepared statements.
-# asyncpg (used by SQLAlchemy) normally PREPAREs every query before EXECUTEing
-# it.  When SQLAlchemy keeps its own connection pool *on top of* pgbouncer,
-# a connection checked-out from the SA pool may now point to a different
-# PostgreSQL backend — and the old prepared statement doesn't exist there.
+# Supabase provides two pooler modes on the same hostname:
+#   • port 6543 — Transaction mode (pgbouncer): does NOT support prepared
+#                 statements. Requires NullPool + statement_cache_size=0.
+#   • port 5432 — Session mode (Supavisor): DOES support prepared statements.
+#                 Each client connection is pinned to one PostgreSQL backend
+#                 for its entire lifetime, so prepared statements stay valid.
 #
-# Fix:
-#   • NullPool  – no SA-side pooling; pgbouncer is already the pool.
-#                 Every session gets a fresh connection to pgbouncer, so
-#                 there is never a stale prepared-statement reference.
-#   • statement_cache_size=0  – asyncpg won't try to *reuse* prepared
-#                 statements across queries on the same connection.
-#   • server_settings jit=off – avoid JIT overhead for short OLTP queries.
+# We use session mode (port 5432) + SQLAlchemy's built-in connection pool.
+# This gives the best performance: warm TCP connections are reused across
+# requests, no reconnection overhead per query.
+#
+# statement_cache_size=0 is kept as defense-in-depth — it ensures asyncpg
+# never tries to reuse a cached prepared statement, avoiding any edge case.
 # ──────────────────────────────────────────────────────────────────────────────
 
 _CONNECT_ARGS: dict = {
@@ -37,7 +36,11 @@ _CONNECT_ARGS: dict = {
 engine = create_async_engine(
     _async_url(settings.database_url),
     connect_args=_CONNECT_ARGS,
-    poolclass=NullPool,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+    pool_recycle=600,
+    pool_timeout=30,
     echo=False,
 )
 
