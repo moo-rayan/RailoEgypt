@@ -5,17 +5,22 @@ GET /data/version  → lightweight version check
 GET /data/bundle   → AES-256 encrypted bundle of all stations, trips, trains, trip_paths
 """
 
+import gzip
 import hashlib
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.admin_auth import require_fulladmin
 from app.core.bundle_store import bundle_store
+from app.core.database import get_db
+from app.core.encryption import encrypt_bundle
+from app.core.r2_storage import r2_upload_bundle
 from app.models.station import Station
 from app.models.train import Train
 from app.models.trip import Trip, TripStop
@@ -194,6 +199,67 @@ def _compute_version(raw: dict) -> str:
     """SHA-256 hash of the raw bundle content → version fingerprint."""
     content = json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+
+# ── Rebuild endpoint ──────────────────────────────────────────────────────────
+
+@router.post(
+    "/rebuild",
+    dependencies=[Depends(require_fulladmin)],
+)
+async def rebuild_data_bundle(db: AsyncSession = Depends(get_db)):
+    """
+    Rebuild the encrypted data bundle from current DB state,
+    store in memory and upload to R2.
+    """
+    try:
+        logger.info("Admin triggered bundle rebuild...")
+        raw = await _build_raw_bundle(db)
+        version = _compute_version(raw)
+
+        old_version = bundle_store.version_info.get("version", "")[:8] if bundle_store.version_info else "none"
+
+        version_info = {
+            "version": version,
+            "stations_count": len(raw["stations"]),
+            "trips_count": len(raw["trips"]),
+            "trains_count": len(raw["trains"]),
+            "trip_paths_count": len(raw["trip_paths"]),
+        }
+
+        encrypted = encrypt_bundle(raw)
+        bundle_result = {"version": version, **encrypted}
+        bundle_json = json.dumps(bundle_result, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        gzip_bytes = gzip.compress(bundle_json, compresslevel=6)
+
+        # 1. Store in process memory
+        bundle_store.set(gzip_bytes, version_info)
+
+        # 2. Upload to R2
+        version_bytes = json.dumps(version_info, ensure_ascii=False).encode('utf-8')
+        r2_ok = await r2_upload_bundle(gzip_bytes, version_bytes)
+
+        logger.info(
+            "Bundle rebuilt: %s → %s, size=%.1fKB, R2=%s",
+            old_version, version[:8],
+            len(gzip_bytes) / 1024,
+            "ok" if r2_ok else "failed",
+        )
+
+        return {
+            "ok": True,
+            "old_version": old_version,
+            **version_info,
+            "size_kb": round(len(gzip_bytes) / 1024, 1),
+            "r2_uploaded": r2_ok,
+        }
+
+    except Exception as exc:
+        logger.error("Bundle rebuild failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Bundle rebuild failed: {exc}",
+        )
 
 
 @router.get("/version")
