@@ -22,7 +22,7 @@ async def get_redis() -> aioredis.Redis:
             socket_timeout=60,
             socket_keepalive=True,
             health_check_interval=30,
-            max_connections=10,
+            max_connections=50,
             retry_on_timeout=True,
         )
     return _redis
