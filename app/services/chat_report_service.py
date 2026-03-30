@@ -2,11 +2,14 @@
 Chat Report & Ban Service – handles report submission and ban checking.
 
 Uses direct database access via SQLAlchemy (asyncpg).
+Queries use inline literals (no bind parameters) to avoid prepared-statement
+errors with pgbouncer in transaction mode.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy import text
@@ -14,6 +17,24 @@ from sqlalchemy import text
 from app.core.database import AsyncSessionFactory
 
 logger = logging.getLogger(__name__)
+
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I,
+)
+
+
+def _q(val: str | None) -> str:
+    """Escape a string value for a SQL literal."""
+    if val is None:
+        return "NULL"
+    return "'" + str(val).replace("'", "''") + "'"
+
+
+def _quuid(val: str | None) -> str:
+    """Escape a UUID value."""
+    if not val or not _UUID_RE.match(str(val)):
+        return "NULL"
+    return "'" + str(val) + "'::uuid"
 
 
 async def check_user_banned(user_id: str) -> dict:
@@ -24,15 +45,14 @@ async def check_user_banned(user_id: str) -> dict:
     try:
         async with AsyncSessionFactory() as session:
             result = await session.execute(
-                text("""
-                    SELECT reason, ban_type, expires_at
-                    FROM "EgRailway".chat_bans
-                    WHERE user_id = :uid
-                      AND is_active = true
-                      AND (ban_type = 'permanent' OR expires_at > now())
-                    LIMIT 1
-                """),
-                {"uid": user_id},
+                text(
+                    'SELECT reason, ban_type, expires_at '
+                    'FROM "EgRailway".chat_bans '
+                    f"WHERE user_id = {_quuid(user_id)} "
+                    "AND is_active = true "
+                    "AND (ban_type = 'permanent' OR expires_at > now()) "
+                    "LIMIT 1"
+                ),
             )
             row = result.mappings().first()
 
@@ -68,25 +88,16 @@ async def submit_report(
         return {"ok": False, "error": "cannot_report_self"}
 
     try:
+        sql = (
+            'INSERT INTO "EgRailway".chat_reports '
+            "(reporter_id, reported_user_id, train_id, "
+            "message_id, message_text, report_reason, status) VALUES "
+            f"({_quuid(reporter_id)}, {_quuid(reported_user_id)}, {_q(train_id)}, "
+            f"{_q(message_id)}, {_q(message_text[:500])}, "
+            f"{_q((report_reason or '')[:300])}, 'pending')"
+        )
         async with AsyncSessionFactory() as session:
-            await session.execute(
-                text("""
-                    INSERT INTO "EgRailway".chat_reports
-                        (reporter_id, reported_user_id, train_id,
-                         message_id, message_text, report_reason, status)
-                    VALUES
-                        (:reporter_id, :reported_user_id, :train_id,
-                         :message_id, :message_text, :report_reason, 'pending')
-                """),
-                {
-                    "reporter_id": reporter_id,
-                    "reported_user_id": reported_user_id,
-                    "train_id": train_id,
-                    "message_id": message_id,
-                    "message_text": message_text[:500],
-                    "report_reason": (report_reason or "")[:300],
-                },
-            )
+            await session.execute(text(sql))
             await session.commit()
 
         logger.info(

@@ -3,10 +3,14 @@ Admin endpoints for chat management.
 
 All endpoints require admin authentication (Supabase JWT + is_admin).
 Read endpoints: monitor + fulladmin. Write endpoints: fulladmin only.
+
+Queries use inline literals (no bind parameters) to avoid prepared-statement
+errors with pgbouncer in transaction mode.
 """
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone, timedelta
 
@@ -20,6 +24,24 @@ from app.services.train_chat_manager import train_chat_manager
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
+
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I,
+)
+
+
+def _q(val: str | None) -> str:
+    """Escape a string value for a SQL literal."""
+    if val is None:
+        return "NULL"
+    return "'" + str(val).replace("'", "''") + "'"
+
+
+def _quuid(val: str | None) -> str:
+    """Escape a UUID value."""
+    if not val or not _UUID_RE.match(str(val)):
+        return "NULL"
+    return "'" + str(val) + "'::uuid"
 
 router = APIRouter(prefix="/admin/chat", tags=["Admin Chat"])
 
@@ -147,17 +169,16 @@ async def get_reports(
     """Get chat reports, optionally filtered by train and status."""
     try:
         async with AsyncSessionFactory() as session:
-            conditions = []
-            params: dict = {"lim": limit}
+            conditions: list[str] = []
+            _VALID_STATUSES = {"pending", "reviewed", "dismissed"}
 
-            if report_status != "all":
-                conditions.append('r.status = :st')
-                params["st"] = report_status
+            if report_status != "all" and report_status in _VALID_STATUSES:
+                conditions.append(f"r.status = '{report_status}'")
             if train_id:
-                conditions.append('r.train_id = :tid')
-                params["tid"] = train_id
+                conditions.append(f"r.train_id = {_q(train_id)}")
 
             where = "WHERE " + " AND ".join(conditions) if conditions else ""
+            safe_limit = int(limit)
 
             result = await session.execute(
                 text(f"""
@@ -171,9 +192,8 @@ async def get_reports(
                     LEFT JOIN "EgRailway".profiles p ON p.id = r.reported_user_id
                     {where}
                     ORDER BY r.created_at DESC
-                    LIMIT :lim
+                    LIMIT {safe_limit}
                 """),
-                params,
             )
             rows = result.mappings().all()
 
@@ -210,15 +230,16 @@ class ReviewReportRequest(BaseModel):
 async def review_report(report_id: str, body: ReviewReportRequest):
     """Update a report's status."""
     try:
+        _VALID_REVIEW = {"reviewed", "dismissed"}
+        safe_status = body.status if body.status in _VALID_REVIEW else "reviewed"
         async with AsyncSessionFactory() as session:
             result = await session.execute(
-                text("""
-                    UPDATE "EgRailway".chat_reports
-                    SET status = :st, admin_notes = :notes, updated_at = now()
-                    WHERE id = :rid
-                    RETURNING id
-                """),
-                {"rid": report_id, "st": body.status, "notes": body.admin_notes},
+                text(
+                    'UPDATE "EgRailway".chat_reports '
+                    f"SET status = '{safe_status}', admin_notes = {_q(body.admin_notes)}, updated_at = now() "
+                    f"WHERE id = {_quuid(report_id)} "
+                    "RETURNING id"
+                ),
             )
             updated = result.first()
             await session.commit()
@@ -252,31 +273,29 @@ async def ban_chat_user(body: ChatBanRequest):
         if body.ban_type == "temporary":
             expires_at = datetime.now(timezone.utc) + timedelta(hours=body.duration_hours)
 
+        _VALID_BAN = {"temporary", "permanent"}
+        safe_ban_type = body.ban_type if body.ban_type in _VALID_BAN else "temporary"
+        expires_sql = f"'{expires_at.isoformat()}'::timestamptz" if expires_at else "NULL"
+
         async with AsyncSessionFactory() as session:
             # Deactivate existing bans first
             await session.execute(
-                text("""
-                    UPDATE "EgRailway".chat_bans
-                    SET is_active = false, updated_at = now()
-                    WHERE user_id = :uid AND is_active = true
-                """),
-                {"uid": body.user_id},
+                text(
+                    'UPDATE "EgRailway".chat_bans '
+                    "SET is_active = false, updated_at = now() "
+                    f"WHERE user_id = {_quuid(body.user_id)} AND is_active = true"
+                ),
             )
 
             # Insert new ban
+            reason = body.reason or "محظور بواسطة المشرف"
             await session.execute(
-                text("""
-                    INSERT INTO "EgRailway".chat_bans
-                        (user_id, banned_by, reason, ban_type, expires_at, is_active)
-                    VALUES
-                        (:uid, :uid, :reason, :ban_type, :expires_at, true)
-                """),
-                {
-                    "uid": body.user_id,
-                    "reason": body.reason or "محظور بواسطة المشرف",
-                    "ban_type": body.ban_type,
-                    "expires_at": expires_at,
-                },
+                text(
+                    'INSERT INTO "EgRailway".chat_bans '
+                    "(user_id, banned_by, reason, ban_type, expires_at, is_active) VALUES "
+                    f"({_quuid(body.user_id)}, {_quuid(body.user_id)}, {_q(reason)}, "
+                    f"'{safe_ban_type}', {expires_sql}, true)"
+                ),
             )
             await session.commit()
 
@@ -303,13 +322,12 @@ async def unban_chat_user(body: ChatUnbanRequest):
     try:
         async with AsyncSessionFactory() as session:
             result = await session.execute(
-                text("""
-                    UPDATE "EgRailway".chat_bans
-                    SET is_active = false, updated_at = now()
-                    WHERE user_id = :uid AND is_active = true
-                    RETURNING id
-                """),
-                {"uid": body.user_id},
+                text(
+                    'UPDATE "EgRailway".chat_bans '
+                    "SET is_active = false, updated_at = now() "
+                    f"WHERE user_id = {_quuid(body.user_id)} AND is_active = true "
+                    "RETURNING id"
+                ),
             )
             updated = result.first()
             await session.commit()
@@ -336,6 +354,7 @@ async def get_chat_bans(
     try:
         async with AsyncSessionFactory() as session:
             active_filter = "AND b.is_active = true AND (b.ban_type = 'permanent' OR b.expires_at > now())" if active_only else ""
+            safe_limit = int(limit)
 
             result = await session.execute(
                 text(f"""
@@ -348,9 +367,8 @@ async def get_chat_bans(
                     LEFT JOIN "EgRailway".profiles p ON p.id = b.user_id
                     WHERE 1=1 {active_filter}
                     ORDER BY b.created_at DESC
-                    LIMIT :lim
+                    LIMIT {safe_limit}
                 """),
-                {"lim": limit},
             )
             rows = result.mappings().all()
 

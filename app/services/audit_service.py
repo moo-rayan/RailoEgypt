@@ -1,29 +1,33 @@
 """
 Security Audit Service — fire-and-forget logging of security events.
 
-All public methods are non-blocking: they schedule a DB write via
-asyncio.create_task so the caller is never slowed down.
+Events are buffered in memory and batch-inserted to the database every
+few seconds via a dedicated asyncpg pool.  This design:
+  • avoids prepared-statement errors with pgbouncer (transaction mode)
+  • keeps audit writes from competing with the main SQLAlchemy pool
+  • zero impact on request latency (append to deque ≈ 0 ms)
 
 Usage:
     from app.services.audit_service import audit
 
-    await audit.log_rate_limit(request, ...)
-    await audit.log_auth_failure(request, ...)
+    audit.log_rate_limit(request, ...)
+    audit.log_auth_failure(request, ...)
     # or the generic:
-    await audit.log(event_type="custom", severity="warning", ...)
+    audit.log(event_type="custom", severity="warning", ...)
 """
 
 import asyncio
+import json
 import logging
+import re
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
+from collections import defaultdict, deque
 from typing import Optional
 
+import asyncpg
 from fastapi import Request
-from sqlalchemy import text
 
-from app.core.database import AsyncSessionFactory
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +86,140 @@ _AUTH_FAIL_THRESHOLD = 10       # >10 auth failures/min = brute force
 _RATE_LIMIT_ESCALATION = 5     # >5 rate-limit hits/min = persistent abuser
 _PATH_SCAN_THRESHOLD = 5        # >5 invalid paths/min = scanner
 
+# ── Buffer & dedicated pool ──────────────────────────────────────────────────
+_FLUSH_INTERVAL = 5             # seconds between batch flushes
+_FLUSH_BATCH = 500              # max rows per INSERT
+_MAX_BUFFER = 10_000            # hard cap on pending events
+
+_buffer: deque[dict] = deque(maxlen=_MAX_BUFFER)
+_pool: Optional[asyncpg.Pool] = None
+_flush_task: Optional[asyncio.Task] = None
+
+_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I,
+)
+
+
+# ── SQL escaping (simple query protocol — no prepared statements) ─────────
+
+def _q(val: Optional[str]) -> str:
+    """Escape a string value for a SQL literal.  Returns NULL for None."""
+    if val is None:
+        return "NULL"
+    return "'" + str(val).replace("'", "''") + "'"
+
+
+def _qi(val) -> str:
+    """Escape an integer value."""
+    if val is None:
+        return "NULL"
+    return str(int(val))
+
+
+def _quuid(val: Optional[str]) -> str:
+    """Escape a UUID value."""
+    if not val or not _UUID_RE.match(str(val)):
+        return "NULL"
+    return "'" + str(val) + "'::uuid"
+
+
+def _qjsonb(val) -> str:
+    """Escape a JSONB value."""
+    if not val:
+        return "'{}'::jsonb"
+    if isinstance(val, str):
+        s = val
+    else:
+        try:
+            s = json.dumps(val, ensure_ascii=False, default=str)
+        except Exception:
+            s = "{}"
+    return "'" + s.replace("'", "''") + "'::jsonb"
+
+
+# ── Pool & flush loop ────────────────────────────────────────────────────────
+
+def _pg_dsn() -> str:
+    """Return a plain postgresql:// DSN for raw asyncpg (not SQLAlchemy)."""
+    url = settings.database_url
+    if url.startswith("postgresql+asyncpg://"):
+        return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+async def _get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None or _pool._closed:
+        _pool = await asyncpg.create_pool(
+            dsn=_pg_dsn(),
+            min_size=1,
+            max_size=2,
+            statement_cache_size=0,
+        )
+    return _pool
+
+
+def _start_flusher() -> None:
+    """Ensure the background flush loop is running."""
+    global _flush_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _flush_task is None or _flush_task.done():
+        _flush_task = loop.create_task(_flush_loop())
+
+
+async def _flush_loop() -> None:
+    """Periodically flush buffered events to the database."""
+    while True:
+        await asyncio.sleep(_FLUSH_INTERVAL)
+        try:
+            await _flush()
+        except Exception as exc:
+            logger.error("Audit flush error: %s", exc)
+
+
+async def _flush() -> None:
+    """Batch-insert all buffered events using simple query protocol."""
+    if not _buffer:
+        return
+
+    batch: list[dict] = []
+    while _buffer and len(batch) < _FLUSH_BATCH:
+        batch.append(_buffer.popleft())
+    if not batch:
+        return
+
+    values: list[str] = []
+    for e in batch:
+        values.append(
+            f"({_q(e['event_type'])},{_q(e['severity'])},"
+            f"{_q(e.get('ip_address'))},{_q(e.get('user_agent'))},"
+            f"{_q(e.get('method'))},{_q(e.get('path'))},"
+            f"{_qi(e.get('status_code'))},{_quuid(e.get('user_id'))},"
+            f"{_q(e['description'])},{_qjsonb(e.get('metadata'))},"
+            f"{_q(e.get('country_code'))})"
+        )
+
+    sql = (
+        'INSERT INTO "EgRailway".audit_log '
+        "(event_type,severity,ip_address,user_agent,method,"
+        "path,status_code,user_id,description,metadata,country_code) VALUES "
+        + ",".join(values)
+    )
+
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(sql)
+    except Exception as exc:
+        logger.error("Audit batch insert (%d rows) failed: %s", len(batch), exc)
+
+
+# ── Helper functions ─────────────────────────────────────────────────────────
 
 def _extract_ip(request: Request) -> str:
     """Extract the real client IP (handles proxies/CF)."""
@@ -118,57 +256,16 @@ def _prune_window(timestamps: list[float], window: float) -> list[float]:
 class AuditService:
     """Centralized security audit logger."""
 
-    async def _write(
-        self,
-        event_type: str,
-        severity: str,
-        description: str,
-        ip_address: Optional[str] = None,
-        user_agent: Optional[str] = None,
-        method: Optional[str] = None,
-        path: Optional[str] = None,
-        status_code: Optional[int] = None,
-        user_id: Optional[str] = None,
-        metadata: Optional[dict] = None,
-        country_code: Optional[str] = None,
-    ) -> None:
-        """Write an audit log entry to the database (internal)."""
-        try:
-            async with AsyncSessionFactory() as session:
-                await session.execute(
-                    text(
-                        'INSERT INTO "EgRailway".audit_log '
-                        "(event_type, severity, ip_address, user_agent, method, "
-                        "path, status_code, user_id, description, metadata, country_code) "
-                        "VALUES (:et, :sev, :ip, :ua, :meth, :p, :sc, "
-                        "CASE WHEN :uid = '' THEN NULL ELSE :uid::uuid END, "
-                        ":desc, :meta::jsonb, :cc)"
-                    ),
-                    {
-                        "et": event_type,
-                        "sev": severity,
-                        "ip": ip_address,
-                        "ua": (user_agent or "")[:2000],  # truncate huge UAs
-                        "meth": method,
-                        "p": (path or "")[:2000],
-                        "sc": status_code,
-                        "uid": user_id or "",
-                        "desc": description[:5000],
-                        "meta": _json_dumps(metadata or {}),
-                        "cc": country_code,
-                    },
-                )
-                await session.commit()
-        except Exception as exc:
-            logger.error("Audit log write failed: %s", exc)
-
     def _fire(self, **kwargs) -> None:
-        """Schedule a write without blocking the caller."""
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._write(**kwargs))
-        except RuntimeError:
-            pass  # No event loop — skip silently
+        """Buffer an event for periodic batch insert (zero-latency)."""
+        if kwargs.get("user_agent"):
+            kwargs["user_agent"] = kwargs["user_agent"][:2000]
+        if kwargs.get("path"):
+            kwargs["path"] = kwargs["path"][:2000]
+        if kwargs.get("description"):
+            kwargs["description"] = kwargs["description"][:5000]
+        _buffer.append(kwargs)
+        _start_flusher()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -435,14 +532,16 @@ class AuditService:
             for k in stale_keys:
                 del store[k]
 
-
-def _json_dumps(obj: dict) -> str:
-    """Safe JSON dumps for metadata."""
-    import json
-    try:
-        return json.dumps(obj, ensure_ascii=False, default=str)
-    except Exception:
-        return "{}"
+    async def shutdown(self) -> None:
+        """Flush remaining events and close the pool (call on app shutdown)."""
+        try:
+            await _flush()
+        except Exception:
+            pass
+        global _pool
+        if _pool is not None and not _pool._closed:
+            await _pool.close()
+            _pool = None
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

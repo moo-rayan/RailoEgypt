@@ -1,7 +1,6 @@
-import uuid
-
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
 
@@ -13,36 +12,32 @@ def _async_url(url: str) -> str:
     return url
 
 
-def _unique_ps_name() -> str:
-    """
-    Generate a globally unique name for every prepared statement.
-
-    Root cause of DuplicatePreparedStatementError:
-    asyncpg 0.29+ uses a per-connection sequential counter to name prepared
-    statements even when statement_cache_size=0.  When two SQLAlchemy pool
-    connections both reach counter N and pgbouncer (transaction mode) routes
-    them to the same backend PostgreSQL connection, the second PREPARE fails
-    with "already exists".
-
-    Using a UUID per statement makes collisions statistically impossible.
-    """
-    return f"__asyncpg_{uuid.uuid4().hex}__"
-
+# ── pgbouncer (transaction mode) compatibility ───────────────────────────────
+#
+# pgbouncer in "transaction" pool mode does NOT support prepared statements.
+# asyncpg (used by SQLAlchemy) normally PREPAREs every query before EXECUTEing
+# it.  When SQLAlchemy keeps its own connection pool *on top of* pgbouncer,
+# a connection checked-out from the SA pool may now point to a different
+# PostgreSQL backend — and the old prepared statement doesn't exist there.
+#
+# Fix:
+#   • NullPool  – no SA-side pooling; pgbouncer is already the pool.
+#                 Every session gets a fresh connection to pgbouncer, so
+#                 there is never a stale prepared-statement reference.
+#   • statement_cache_size=0  – asyncpg won't try to *reuse* prepared
+#                 statements across queries on the same connection.
+#   • server_settings jit=off – avoid JIT overhead for short OLTP queries.
+# ──────────────────────────────────────────────────────────────────────────────
 
 _CONNECT_ARGS: dict = {
-    "statement_cache_size": 0,           # Don't cache – execute-and-discard
-    "prepared_statement_name_func": _unique_ps_name,  # Unique names → no conflicts
+    "statement_cache_size": 0,
     "server_settings": {"jit": "off"},
 }
 
 engine = create_async_engine(
     _async_url(settings.database_url),
     connect_args=_CONNECT_ARGS,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=False,   # pgbouncer transaction mode + pre_ping can misbehave
-    pool_recycle=300,
-    pool_timeout=30,
+    poolclass=NullPool,
     echo=False,
 )
 

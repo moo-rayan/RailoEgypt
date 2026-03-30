@@ -4,13 +4,18 @@ Admin audit log endpoints.
 GET  /admin/audit/logs       — List audit log entries (with filters)
 GET  /admin/audit/stats      — Summary statistics
 GET  /admin/audit/top-ips    — Top offending IPs
+
+All queries use inline literals (no bind parameters) so that asyncpg
+sends them through the simple-query protocol.  This avoids the
+prepared-statement errors that pgbouncer (transaction mode) causes.
 """
 
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select, text
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import get_admin_or_legacy_key
@@ -19,6 +24,15 @@ from app.core.database import get_db
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/audit", tags=["Admin Audit"])
+
+# ── Whitelists for safe inline SQL ────────────────────────────────────────────
+_VALID_EVENT_TYPES = {
+    "rate_limit", "auth_failure", "brute_force", "bot_detected",
+    "path_scan", "spam", "attack", "suspicious", "admin_action",
+    "forbidden_access", "token_abuse", "invalid_input",
+}
+_VALID_SEVERITIES = {"info", "warning", "critical"}
+_IP_RE = re.compile(r'^[0-9a-fA-F.:]+$')
 
 
 @router.get("/logs", dependencies=[Depends(get_admin_or_legacy_key)])
@@ -31,24 +45,22 @@ async def get_audit_logs(
     offset: int = Query(0, ge=0),
 ):
     """List audit log entries with optional filters."""
-    conditions = []
-    params: dict = {"lim": limit, "off": offset}
+    conditions: list[str] = []
 
-    if event_type:
-        conditions.append("event_type = :et")
-        params["et"] = event_type
-    if severity:
-        conditions.append("severity = :sev")
-        params["sev"] = severity
-    if ip_address:
-        conditions.append("ip_address = :ip")
-        params["ip"] = ip_address
+    if event_type and event_type in _VALID_EVENT_TYPES:
+        conditions.append(f"event_type = '{event_type}'")
+    if severity and severity in _VALID_SEVERITIES:
+        conditions.append(f"severity = '{severity}'")
+    if ip_address and _IP_RE.match(ip_address):
+        conditions.append(f"ip_address = '{ip_address}'")
 
     where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    safe_limit = int(limit)
+    safe_offset = int(offset)
 
     # Count
     count_q = text(f'SELECT COUNT(*) FROM "EgRailway".audit_log{where_clause}')
-    total = (await db.execute(count_q, params)).scalar() or 0
+    total = (await db.execute(count_q)).scalar() or 0
 
     # Data
     data_q = text(
@@ -56,9 +68,9 @@ async def get_audit_logs(
         f'user_agent, method, path, status_code, user_id, '
         f'description, metadata, country_code '
         f'FROM "EgRailway".audit_log{where_clause} '
-        f'ORDER BY created_at DESC LIMIT :lim OFFSET :off'
+        f'ORDER BY created_at DESC LIMIT {safe_limit} OFFSET {safe_offset}'
     )
-    rows = (await db.execute(data_q, params)).all()
+    rows = (await db.execute(data_q)).all()
 
     return {
         "total": total,
@@ -89,27 +101,28 @@ async def get_audit_stats(
     hours: int = Query(24, ge=1, le=720, description="Time window in hours"),
 ):
     """Summary statistics for the audit log."""
+    safe_hours = int(hours)
     q = text(
-        'SELECT '
-        '  COUNT(*) AS total, '
-        '  COUNT(*) FILTER (WHERE severity = \'critical\') AS critical, '
-        '  COUNT(*) FILTER (WHERE severity = \'warning\') AS warning, '
-        '  COUNT(*) FILTER (WHERE severity = \'info\') AS info, '
-        '  COUNT(*) FILTER (WHERE event_type = \'rate_limit\') AS rate_limits, '
-        '  COUNT(*) FILTER (WHERE event_type = \'auth_failure\') AS auth_failures, '
-        '  COUNT(*) FILTER (WHERE event_type = \'brute_force\') AS brute_force, '
-        '  COUNT(*) FILTER (WHERE event_type = \'bot_detected\') AS bots, '
-        '  COUNT(*) FILTER (WHERE event_type = \'path_scan\') AS path_scans, '
-        '  COUNT(*) FILTER (WHERE event_type = \'spam\') AS spam, '
-        '  COUNT(*) FILTER (WHERE event_type = \'attack\') AS attacks, '
-        '  COUNT(*) FILTER (WHERE event_type = \'suspicious\') AS suspicious, '
-        '  COUNT(*) FILTER (WHERE event_type = \'admin_action\') AS admin_actions, '
-        '  COUNT(*) FILTER (WHERE event_type = \'forbidden_access\') AS forbidden, '
-        '  COUNT(DISTINCT ip_address) AS unique_ips '
-        'FROM "EgRailway".audit_log '
-        'WHERE created_at >= NOW() - make_interval(hours => :hrs)'
+        f"SELECT "
+        f"  COUNT(*) AS total, "
+        f"  COUNT(*) FILTER (WHERE severity = 'critical') AS critical, "
+        f"  COUNT(*) FILTER (WHERE severity = 'warning') AS warning, "
+        f"  COUNT(*) FILTER (WHERE severity = 'info') AS info, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'rate_limit') AS rate_limits, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'auth_failure') AS auth_failures, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'brute_force') AS brute_force, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'bot_detected') AS bots, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'path_scan') AS path_scans, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'spam') AS spam, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'attack') AS attacks, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'suspicious') AS suspicious, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'admin_action') AS admin_actions, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'forbidden_access') AS forbidden, "
+        f"  COUNT(DISTINCT ip_address) AS unique_ips "
+        f'FROM "EgRailway".audit_log '
+        f"WHERE created_at >= NOW() - make_interval(hours => {safe_hours})"
     )
-    row = (await db.execute(q, {"hrs": hours})).one()
+    row = (await db.execute(q)).one()
 
     return {
         "window_hours": hours,
@@ -142,23 +155,25 @@ async def get_top_offending_ips(
     limit: int = Query(20, ge=1, le=100),
 ):
     """Top offending IPs by event count."""
+    safe_hours = int(hours)
+    safe_limit = int(limit)
     q = text(
-        'SELECT '
-        '  ip_address, '
-        '  COUNT(*) AS event_count, '
-        '  COUNT(DISTINCT event_type) AS event_types, '
-        '  MAX(severity) AS max_severity, '
-        '  MIN(created_at) AS first_seen, '
-        '  MAX(created_at) AS last_seen, '
-        '  country_code '
-        'FROM "EgRailway".audit_log '
-        'WHERE created_at >= NOW() - make_interval(hours => :hrs) '
-        '  AND ip_address IS NOT NULL '
-        'GROUP BY ip_address, country_code '
-        'ORDER BY event_count DESC '
-        'LIMIT :lim'
+        f"SELECT "
+        f"  ip_address, "
+        f"  COUNT(*) AS event_count, "
+        f"  COUNT(DISTINCT event_type) AS event_types, "
+        f"  MAX(severity) AS max_severity, "
+        f"  MIN(created_at) AS first_seen, "
+        f"  MAX(created_at) AS last_seen, "
+        f"  country_code "
+        f'FROM "EgRailway".audit_log '
+        f"WHERE created_at >= NOW() - make_interval(hours => {safe_hours}) "
+        f"  AND ip_address IS NOT NULL "
+        f"GROUP BY ip_address, country_code "
+        f"ORDER BY event_count DESC "
+        f"LIMIT {safe_limit}"
     )
-    rows = (await db.execute(q, {"hrs": hours, "lim": limit})).all()
+    rows = (await db.execute(q)).all()
 
     return {
         "window_hours": hours,
