@@ -367,8 +367,12 @@ class AuditService:
         request: Request,
         reason: str = "Access denied",
         user_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> None:
         """Log a 403 Forbidden access attempt."""
+        meta = {"reason": reason}
+        if metadata:
+            meta.update(metadata)
         self._fire(
             event_type=FORBIDDEN_ACCESS,
             severity=WARNING,
@@ -379,7 +383,7 @@ class AuditService:
             path=str(request.url.path),
             status_code=403,
             user_id=user_id,
-            metadata={"reason": reason},
+            metadata=meta,
             country_code=_extract_country(request),
         )
 
