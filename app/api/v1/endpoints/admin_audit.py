@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/audit", tags=["Admin Audit"])
 
-# ── Whitelists for safe inline SQL ────────────────────────────────────────────
+# ── Whitelists for safe inline SQL ──────────────────────────────────────────
 _VALID_EVENT_TYPES = {
     "rate_limit", "auth_failure", "brute_force", "bot_detected",
     "path_scan", "spam", "attack", "suspicious", "admin_action",
