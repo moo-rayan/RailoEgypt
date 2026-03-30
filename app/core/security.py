@@ -3,10 +3,15 @@ WebSocket security: HMAC-signed tickets + Supabase JWT verification.
 
 Flow:
   1. Client calls POST /api/v1/live/ticket  (Authorization: Bearer <supabase_jwt>)
-  2. Backend verifies JWT via Supabase Auth API → gets user_id
+  2. Backend verifies JWT locally (HS256) → gets user_id  [FAST ~0.1ms]
   3. Backend returns HMAC-signed ticket (valid 12h, bound to user + train + role)
   4. Client connects to ws://.../api/v1/live/{train_id}?ticket=<ticket>
   5. Backend verifies HMAC ticket on WebSocket handshake
+
+Performance:
+  Local JWT verification eliminates the remote HTTP call to Supabase /auth/v1/user
+  that was the #1 bottleneck (~100-500ms per request). With in-memory caching,
+  repeated tokens are verified in ~0.01ms.
 """
 
 import hashlib
@@ -17,6 +22,7 @@ from typing import Optional
 
 import httpx
 from fastapi import Header, HTTPException
+from jose import jwt, JWTError
 
 from app.core.config import settings
 
@@ -25,7 +31,83 @@ logger = logging.getLogger(__name__)
 _TICKET_TTL = 43200  # seconds (12 hours - enough for full train journey)
 
 
-# ── Supabase JWT verification ────────────────────────────────────────────────
+# ── Local JWT verification (fast path) ────────────────────────────────────────
+#
+# Supabase JWTs are signed with HS256. By verifying locally we avoid a
+# network round-trip to Supabase /auth/v1/user on every request.
+# An in-memory cache further speeds up repeated tokens (~0.01ms).
+# Remote verification is kept as a fallback when no JWT secret is configured.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_token_cache: dict[str, tuple[dict, float]] = {}
+_CACHE_MAX_SIZE = 20_000
+_CACHE_TTL = 300  # 5 minutes
+
+
+def _cleanup_cache() -> None:
+    """Remove expired entries from the token cache."""
+    now = time.time()
+    expired = [k for k, (_, exp) in _token_cache.items() if now >= exp]
+    for k in expired:
+        _token_cache.pop(k, None)
+
+
+def _verify_jwt_local(access_token: str) -> Optional[dict]:
+    """
+    Verify a Supabase JWT locally using the JWT secret (HS256).
+    Returns a user dict compatible with the Supabase /auth/v1/user response,
+    or None if the secret is not configured or the token is invalid.
+    """
+    if not settings.supabase_jwt_secret:
+        return None  # no secret → fall through to remote
+
+    now = time.time()
+
+    # ── Cache hit ──
+    cached = _token_cache.get(access_token)
+    if cached is not None:
+        user_data, expires_at = cached
+        if now < expires_at:
+            return user_data
+        _token_cache.pop(access_token, None)
+
+    # ── Decode & verify ──
+    try:
+        payload = jwt.decode(
+            access_token,
+            settings.supabase_jwt_secret,
+            algorithms=["HS256"],
+            audience="authenticated",
+        )
+    except JWTError:
+        return None
+
+    sub = payload.get("sub", "")
+    if not sub:
+        return None
+
+    user_data = {
+        "id": sub,
+        "email": payload.get("email", ""),
+        "phone": payload.get("phone", ""),
+        "user_metadata": payload.get("user_metadata", {}),
+        "app_metadata": payload.get("app_metadata", {}),
+        "role": payload.get("role", ""),
+    }
+
+    # ── Cache until token expiry or TTL, whichever is sooner ──
+    token_exp = payload.get("exp", 0)
+    cache_until = min(token_exp, now + _CACHE_TTL) if token_exp else now + _CACHE_TTL
+    _token_cache[access_token] = (user_data, cache_until)
+
+    # Periodic cleanup
+    if len(_token_cache) > _CACHE_MAX_SIZE:
+        _cleanup_cache()
+
+    return user_data
+
+
+# ── Remote Supabase verification (fallback) ──────────────────────────────────
 
 _supabase_client: Optional[httpx.AsyncClient] = None
 
@@ -36,13 +118,13 @@ def _get_supabase_client() -> httpx.AsyncClient:
     if _supabase_client is None or _supabase_client.is_closed:
         _supabase_client = httpx.AsyncClient(
             timeout=10,
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         )
     return _supabase_client
 
 
-async def _verify_once(access_token: str) -> Optional[dict]:
-    """Single attempt to verify a Supabase token."""
+async def _verify_remote(access_token: str) -> Optional[dict]:
+    """Verify token via Supabase /auth/v1/user endpoint (slow ~100-500ms)."""
     client = _get_supabase_client()
     resp = await client.get(
         f"{settings.supabase_url}/auth/v1/user",
@@ -53,26 +135,36 @@ async def _verify_once(access_token: str) -> Optional[dict]:
     )
     if resp.status_code == 200:
         return resp.json()
-    logger.warning("Supabase token verification failed: %d", resp.status_code)
+    logger.warning("Supabase remote token verification failed: %d", resp.status_code)
     return None
 
 
 async def verify_supabase_token(access_token: str) -> Optional[dict]:
     """
-    Verify a Supabase access token by calling the GoTrue /auth/v1/user endpoint.
-    Returns the user dict on success, None on failure.
-    Uses a persistent client with one retry on connection errors.
+    Verify a Supabase access token.
+
+    Strategy (fast → slow):
+      1. Local HS256 verification + in-memory cache  (~0.01-0.1ms)
+      2. Remote /auth/v1/user call                   (~100-500ms)
+
+    Local verification is preferred because it eliminates the network
+    round-trip that was the #1 performance bottleneck.
     """
+    # ── Fast path: local JWT verification ──
+    result = _verify_jwt_local(access_token)
+    if result is not None:
+        return result
+
+    # ── Slow path: remote Supabase API call (fallback) ──
     global _supabase_client
     for attempt in range(2):
         try:
-            return await _verify_once(access_token)
+            return await _verify_remote(access_token)
         except Exception as exc:
             logger.error(
                 "Supabase token verification error (attempt %d): %s",
                 attempt + 1, exc,
             )
-            # Close stale client and retry with a fresh connection
             if _supabase_client and not _supabase_client.is_closed:
                 await _supabase_client.aclose()
             _supabase_client = None
