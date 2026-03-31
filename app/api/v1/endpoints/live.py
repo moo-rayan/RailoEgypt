@@ -309,6 +309,12 @@ async def get_train_position(
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+    user_id = user.get("id", "")
+    
+    # Track this user as a listener (for HTTP listener counting)
+    if user_id:
+        tracking_manager.track_http_listener(user_id, train_id)
+
     # 1. In-memory room — only if there are active contributors right now
     room = tracking_manager.get_room(train_id)
     if room and (room.lat != 0.0 or room.lng != 0.0):

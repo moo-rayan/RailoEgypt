@@ -141,6 +141,10 @@ class TrackingManager:
         # Deduplication: one contribution alert per user per train per hour
         # key = "{user_id}:{train_id}", value = last alert timestamp
         self._contribution_alert_sent: dict[str, float] = {}
+        
+        # HTTP listener tracking: key = "user_id:train_id", value = last poll timestamp
+        # Listeners are counted if they polled within the last 60 seconds
+        self._http_listeners: dict[str, float] = {}
 
     def set_user_avatar(self, user_id: str, avatar_url: str) -> None:
         """Store user avatar for later use when contributor joins WS."""
@@ -162,6 +166,35 @@ class TrackingManager:
     def set_user_captain(self, user_id: str, is_captain: bool) -> None:
         """Store whether user is a train captain."""
         self._user_captains[user_id] = is_captain
+
+    def track_http_listener(self, user_id: str, train_id: str) -> None:
+        """Track a user polling for position via HTTP (listener)."""
+        key = f"{user_id}:{train_id}"
+        self._http_listeners[key] = time.time()
+
+    def _count_active_listeners(self, train_id: str) -> int:
+        """Count unique listeners who polled within the last 60 seconds for a specific train."""
+        now = time.time()
+        _LISTENER_TIMEOUT_S = 60.0  # Consider a listener active if they polled in last 60s
+        
+        # Count unique user_ids for this train who polled recently
+        active_users = set()
+        stale_keys = []
+        
+        for key, last_poll in self._http_listeners.items():
+            if now - last_poll > _LISTENER_TIMEOUT_S:
+                stale_keys.append(key)
+                continue
+            # Key format is "user_id:train_id"
+            if key.endswith(f":{train_id}"):
+                user_id = key.rsplit(":", 1)[0]
+                active_users.add(user_id)
+        
+        # Clean up stale entries
+        for key in stale_keys:
+            del self._http_listeners[key]
+        
+        return len(active_users)
 
     def _log_event(self, room: TrainRoom, event_type: str, user_id: str, detail: str = "") -> None:
         """Append an event to the room's ring-buffer log."""
@@ -1105,7 +1138,7 @@ class TrackingManager:
                 "start_station": room.start_station,
                 "end_station": room.end_station,
                 "contributors_count": len(room.contributors),
-                "listeners_count": 0,  # HTTP model — listeners not tracked
+                "listeners_count": self._count_active_listeners(tid),
                 "waiting_count": len(room.waiting_list),
                 "max_active_contributors": room.max_active_contributors,
                 "leader_id": room.leader_id,
