@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.admin_auth import require_fulladmin
 from app.core.bundle_store import bundle_store
+from app.core.cache import get_redis
 from app.core.database import get_db
 from app.core.encryption import encrypt_bundle
 from app.core.r2_storage import r2_upload_bundle
@@ -25,6 +26,8 @@ from app.models.station import Station
 from app.models.train import Train
 from app.models.trip import Trip, TripStop
 from app.services.railway_service import railway_graph
+
+BUNDLE_REDIS_VERSION_KEY = "bundle:current_version"
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +242,13 @@ async def rebuild_data_bundle(db: AsyncSession = Depends(get_db)):
         version_bytes = json.dumps(version_info, ensure_ascii=False).encode('utf-8')
         r2_ok = await r2_upload_bundle(gzip_bytes, version_bytes)
 
+        # 3. Signal other workers via Redis
+        try:
+            r = await get_redis()
+            await r.set(BUNDLE_REDIS_VERSION_KEY, version)
+        except Exception:
+            logger.warning("Could not write bundle version to Redis")
+
         logger.info(
             "Bundle rebuilt: %s → %s, size=%.1fKB, R2=%s",
             old_version, version[:8],
@@ -263,12 +273,13 @@ async def rebuild_data_bundle(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/version")
-async def get_data_version():
+async def get_data_version(response: Response):
     """
     Lightweight version check — no encryption, just the version hash.
     
     Data is pre-built at startup and served from process memory.
     """
+    response.headers["Cache-Control"] = "no-store"
     if bundle_store.version_info is not None:
         return bundle_store.version_info
     
@@ -302,7 +313,7 @@ async def get_data_bundle():
             media_type="application/json",
             headers={
                 "Content-Encoding": "gzip",
-                "Cache-Control": "public, max-age=86400",
+                "Cache-Control": "no-store",
             },
         )
     

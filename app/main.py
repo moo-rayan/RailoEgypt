@@ -228,6 +228,45 @@ async def _build_and_store_bundle() -> None:
         logger.error("Failed to build data bundle: %s", exc)
 
 
+async def _bundle_sync_checker():
+    """Background task: detect bundle rebuilds from other workers via Redis.
+
+    When POST /data/rebuild runs on worker A, it writes the new version to
+    Redis.  Workers B..N pick it up here and reload the fresh bundle from R2
+    so that *every* worker serves the latest data within ~10 s.
+    """
+    from app.api.v1.endpoints.data_bundle import BUNDLE_REDIS_VERSION_KEY
+
+    while True:
+        try:
+            await asyncio.sleep(10)
+            r = await get_redis()
+            raw = await r.get(BUNDLE_REDIS_VERSION_KEY)
+            if raw is None:
+                continue
+            redis_version = raw.decode() if isinstance(raw, bytes) else raw
+            local_version = (
+                bundle_store.version_info.get("version", "")
+                if bundle_store.version_info
+                else ""
+            )
+            if redis_version and redis_version != local_version:
+                logger.info(
+                    "Bundle version mismatch (local=%s, redis=%s) — reloading from R2",
+                    local_version[:8] or "none",
+                    redis_version[:8],
+                )
+                ok = await _load_bundle_from_r2()
+                if ok:
+                    logger.info("Bundle reloaded from R2 successfully")
+                else:
+                    logger.warning("Bundle reload from R2 failed")
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("Bundle sync check error: %s", exc)
+
+
 async def _stale_contributor_scheduler():
     """Background task: remove stale contributors (no update for 120s) every 60s."""
     from app.services.tracking_manager import tracking_manager
@@ -362,14 +401,24 @@ async def lifespan(app: FastAPI):
             logger.info("R2 miss, building bundle from scratch...")
             await _build_and_store_bundle()
 
+    # Write current bundle version to Redis so other workers can detect it
+    if bundle_store.version_info:
+        try:
+            from app.api.v1.endpoints.data_bundle import BUNDLE_REDIS_VERSION_KEY
+            r = await get_redis()
+            await r.set(BUNDLE_REDIS_VERSION_KEY, bundle_store.version_info["version"])
+        except Exception:
+            pass
+
     # ── 5. Start background tasks ────────────────────────────────────────────
     deletion_task = asyncio.create_task(_account_deletion_scheduler())
     stale_task = asyncio.create_task(_stale_contributor_scheduler())
+    bundle_sync_task = asyncio.create_task(_bundle_sync_checker())
 
     yield
 
     # Cleanup: cancel background tasks
-    for task in (deletion_task, stale_task):
+    for task in (deletion_task, stale_task, bundle_sync_task):
         task.cancel()
         try:
             await task
