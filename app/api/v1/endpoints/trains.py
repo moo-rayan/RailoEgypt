@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
-from app.core.cache import cache_get, cache_set, cache_delete_pattern
 from app.core.database import get_db
 from app.crud.trains import train_crud
 from app.schemas.train import (
@@ -15,9 +14,6 @@ from app.schemas.train import (
 
 router = APIRouter(prefix="/trains", tags=["trains"])
 
-_LIST_TTL = 1800     # 30 min
-_DETAIL_TTL = 3600   # 1 hour
-
 
 @router.get("", response_model=TrainListResponse, dependencies=[Depends(get_admin_or_legacy_key)])
 async def list_trains(
@@ -27,16 +23,9 @@ async def list_trains(
     active_only: bool = Query(True),
     db: AsyncSession = Depends(get_db),
 ):
-    ck = f"trains:l:{page}:{page_size}:{train_type or ''}:{active_only}"
-    cached = await cache_get(ck)
-    if cached is not None:
-        return cached
-
     params = TrainSearchParams(train_type=train_type, is_active=True if active_only else None)
     total, items = await train_crud.search(db, params=params, page=page, page_size=page_size)
-    result = TrainListResponse(total=total, page=page, page_size=page_size, items=items).model_dump(mode="json")
-    await cache_set(ck, result, ttl=_LIST_TTL)
-    return result
+    return TrainListResponse(total=total, page=page, page_size=page_size, items=items).model_dump(mode="json")
 
 
 @router.get("/search", response_model=TrainListResponse, dependencies=[Depends(get_admin_or_legacy_key)])
@@ -48,20 +37,13 @@ async def search_trains(
     page_size: int = Query(20, ge=1, le=2000),
     db: AsyncSession = Depends(get_db),
 ):
-    ck = f"trains:s:{from_station or ''}:{to_station or ''}:{train_type or ''}:{page}:{page_size}"
-    cached = await cache_get(ck)
-    if cached is not None:
-        return cached
-
     params = TrainSearchParams(
         from_station=from_station,
         to_station=to_station,
         train_type=train_type,
     )
     total, items = await train_crud.search(db, params=params, page=page, page_size=page_size)
-    result = TrainListResponse(total=total, page=page, page_size=page_size, items=items).model_dump(mode="json")
-    await cache_set(ck, result, ttl=_LIST_TTL)
-    return result
+    return TrainListResponse(total=total, page=page, page_size=page_size, items=items).model_dump(mode="json")
 
 
 @router.get("/{train_number}", response_model=TrainRead, dependencies=[Depends(get_admin_or_legacy_key)])
@@ -69,17 +51,10 @@ async def get_train(
     train_number: str,
     db: AsyncSession = Depends(get_db),
 ):
-    ck = f"trains:d:{train_number}"
-    cached = await cache_get(ck)
-    if cached is not None:
-        return cached
-
     train = await train_crud.get_by_train_id(db, train_number)
     if not train:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Train not found")
-    result = TrainRead.model_validate(train).model_dump(mode="json")
-    await cache_set(ck, result, ttl=_DETAIL_TTL)
-    return result
+    return TrainRead.model_validate(train).model_dump(mode="json")
 
 
 @router.post("", response_model=TrainRead, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_fulladmin)])
