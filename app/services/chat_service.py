@@ -21,7 +21,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+import re
 from typing import Any
 
 from openai import AsyncOpenAI, APIStatusError, RateLimitError
@@ -246,6 +247,52 @@ _SYSTEM_PROMPT_GENERAL = (
 )
 
 
+def _parse_duration_to_minutes(duration_str: str) -> int:
+    """
+    Parse Arabic duration format to minutes.
+    Examples:
+        "11 س و 30 د" -> 690 minutes
+        "12 س و 40 د" -> 760 minutes
+        "14 س و 25 د" -> 865 minutes
+    """
+    if not duration_str:
+        return float('inf')
+
+    # Match pattern: "X س و Y د" or "X س" or "Y د"
+    hours_match = re.search(r'(\d+)\s*س', duration_str)
+    minutes_match = re.search(r'(\d+)\s*د', duration_str)
+
+    hours = int(hours_match.group(1)) if hours_match else 0
+    minutes = int(minutes_match.group(1)) if minutes_match else 0
+
+    return (hours * 60) + minutes
+
+
+def _calculate_fastest_train(items: list[dict]) -> dict | None:
+    """
+    Find the fastest train from the list based on duration.
+    Returns the fastest train item or None if no valid items.
+    """
+    if not items:
+        return None
+
+    fastest = None
+    fastest_minutes = float('inf')
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        duration_str = item.get('full_duration', '')
+        minutes = _parse_duration_to_minutes(duration_str)
+
+        if minutes < fastest_minutes:
+            fastest_minutes = minutes
+            fastest = item
+
+    return fastest
+
+
 # ---------------------------------------------------------------------------
 # Chat with local results (offline bundle from Flutter)
 # ---------------------------------------------------------------------------
@@ -260,17 +307,25 @@ async def _chat_with_local_results(
     """
     manager = _get_manager()
 
+    # Calculate fastest train for context
+    items = local_results.get("items", [])
+    fastest_train = _calculate_fastest_train(items)
+    fastest_info = ""
+    if fastest_train:
+        train_num = fastest_train.get('train', 'unknown')
+        duration = fastest_train.get('full_duration', 'unknown')
+        fastest_info = f"\n=== معلومة محسوبة مسبقاً ===\nالقطار الأسرع هو رقم {train_num} (مدة: {duration})\n===\n"
+
     results_json = json.dumps(local_results, ensure_ascii=False)
     context_note = (
         "=== البيانات المتاحة فقط ===\n"
         f"{results_json}\n"
-        "=== نهاية البيانات ===\n\n"
+        "=== نهاية البيانات ===\n"
+        f"{fastest_info}\n"
         "تعليمات صارمة:\n"
         "1. يجب أن تقتصر إجابتك 100٪ على البيانات أعلاه فقط\n"
-        "2. عند مقارنة الأزمنة (أسرع رحلة):\n"
-        "   - إذا كان الوقت بالصيغة XhYm (مثل 11h30m)، حول لدقائق: (11 × 60) + 30 = 690 دقيقة\n"
-        "   - اقارن جميع الأزمنة بالدقائق واختر الأقل (الأقل = الأسرع)\n"
-        "3. إذا كان السؤال عن 'أول قطار' أو 'آخر قطار': رتب حسب الوقت واختر المناسب\n"
+        "2. عند السؤال عن 'أسرع رحلة': اذكر القطار رقم " + (fastest_train.get('train', '[غير متوفر]') if fastest_train else '[غير متوفر]') + " كالأسرع\n"
+        "3. عند السؤال عن 'أول قطار' أو 'آخر قطار': رتب حسب الوقت واختر المناسب\n"
         "4. اذكر أرقام القطارات والأوقات بالضبط كما وردت في البيانات\n"
         "5. إذا لم تجد إجابة في البيانات، قل: 'لا توجد بيانات متاحة عن هذا السؤال'\n"
         "6. لا تضف أي معلومات من خارج البيانات المرفقة\n\n"
