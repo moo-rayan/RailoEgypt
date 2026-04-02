@@ -17,8 +17,8 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
     history: list[dict[str, str]] = Field(
         default=[],
-        max_items=5,
-        description="آخر 5 رسائل من المحادثة [{role, content}]",
+        max_items=10,
+        description="آخر 10 رسائل من المحادثة [{role, content}]",
     )
     local_results: dict | None = Field(
         default=None,

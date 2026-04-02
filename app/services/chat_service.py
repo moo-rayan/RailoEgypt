@@ -211,21 +211,34 @@ def _get_manager() -> ProviderManager:
 # ---------------------------------------------------------------------------
 # System prompt – kept short to save tokens
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_DATA = (
     "أنت المساعد الذكي لسكك حديد مصر. مهمتك مساعدة المسافرين بإجابات دقيقة ومفيدة.\n\n"
-    "قدراتك عند استلام بيانات رحلات:\n"
-    "- حلل البيانات بنفسك واستخرج الإجابة المناسبة للسؤال\n"
-    "- boarding_time هو وقت القطار في محطة ركوب المسافر، alighting_time وقت وصوله لمحطة النزول\n"
-    "- لحساب زمن الرحلة الفعلي بين محطتين، احسب الفرق بين وقتي المحطتين من البيانات\n"
-    "- قائمة stops تحتوي كل محطات التوقف بمواعيدها، استخدمها للحسابات الدقيقة\n"
-    "- عند السؤال عن أسرع أو أبطأ أو أنسب قطار، قارن الأزمنة المحسوبة واعرض النتيجة\n"
-    "- إذا وجدت بيانات أسعار fares اذكرها عند الحاجة\n\n"
-    "أسلوب الرد:\n"
-    "- تفاعلي ومتنوع، لا تكرر نفس الصياغة أو القالب في كل مرة\n"
-    "- بطول متوسط يناسب السؤال، لا طويل ممل ولا قصير مخل\n"
-    "- نص عادي فقط بدون أي تنسيق markdown (لا نجوم * ولا شرطات - ولا عناوين # ولا أقواس)\n"
-    "- لا تخترع بيانات غير موجودة أبداً\n"
+    "تعليمات صارمة جداً عند استلام بيانات القطارات:\n"
+    "- يجب أن تعتمد 100٪ على البيانات المُرفقة فقط — لا تستخدم أي معلومات أخرى\n"
+    "- إذا كان السؤال عن موعد محدد، اذكر رقم القطار والوقت بالضبط من البيانات\n"
+    "- boarding_time = وقت القطار في محطة الركوب، alighting_time = وقت الوصول لمحطة النزول\n"
+    "- لحساب زمن الرحلة: احسب الفرق بين وقتي المحطتين من قائمة stops\n"
+    "- عند السؤال عن 'أسرع رحلة': قارن أزمنة الرحلات المتاحة واختر الأقصر فعلياً\n"
+    "- عند السؤال عن 'أول قطار' أو 'آخر قطار': رتب حسب الوقت واختر المناسب\n"
+    "- إذا لم تجد إجابة في البيانات، قل بوضوح: 'لا توجد بيانات متاحة عن هذا السؤال'\n"
+    "- لا تخمن ولا تفترض — استخدم الأرقام الفعلية فقط من البيانات\n\n"
+    "قواعد الرد:\n"
+    "- رد مباشر وواضح يعتمد على البيانات المرفقة\n"
+    "- اذكر أرقام القطارات وأوقاتها بشكل محدد\n"
+    "- نص عادي فقط بدون أي تنسيق markdown\n"
     "- ارفض بأدب أي سؤال خارج سياق السكة الحديد المصرية\n"
+    "- الرد بالعربية دائماً"
+)
+
+_SYSTEM_PROMPT_GENERAL = (
+    "أنت المساعد الذكي لسكك حديد مصر. مهمتك مساعدة المسافرين بإجابات دقيقة ومفيدة.\n\n"
+    "تعليمات:\n"
+    "- أجب بناءً على معرفتك العامة عن سكك حديد مصر فقط\n"
+    "- إذا لم تكن متأكداً من الإجابة، قل: 'عذراً، لا أملك معلومات كافية عن هذا السؤال'\n"
+    "- لا تخترع بيانات عن مواعيد قطارات أو أسعار — اطلب من المستخدم البحث في التطبيق\n\n"
+    "أسلوب الرد:\n"
+    "- تفاعلي ومفيد\n"
+    "- نص عادي فقط بدون أي تنسيق markdown\n"
     "- الرد بالعربية دائماً"
 )
 
@@ -246,20 +259,68 @@ async def _chat_with_local_results(
 
     results_json = json.dumps(local_results, ensure_ascii=False)
     context_note = (
-        "البيانات المتاحة من قاعدة بيانات القطارات:\n"
-        f"{results_json}\n\n"
-        "حلل هذه البيانات وأجب على سؤال المستخدم بشكل مباشر ومفيد. "
-        "إذا احتجت حساب الزمن بين محطتين، استخدم مواعيد التوقف المتاحة."
+        "=== البيانات المتاحة فقط ===\n"
+        f"{results_json}\n"
+        "=== نهاية البيانات ===\n\n"
+        "تعليمات صارمة:\n"
+        "1. يجب أن تقتصر إجابتك 100٪ على البيانات أعلاه فقط\n"
+        "2. إذا كان السؤال عن 'أسرع رحلة': قارن أزمنة الرحلات من البيانات واختر الأقصر\n"
+        "3. إذا كان السؤال عن 'أول قطار' أو 'آخر قطار': رتب حسب الوقت من البيانات\n"
+        "4. اذكر أرقام القطارات والأوقات بالضبط كما وردت في البيانات\n"
+        "5. إذا لم تجد إجابة في البيانات، قل: 'لا توجد بيانات متاحة عن هذا السؤال'\n"
+        "6. لا تضف أي معلومات من خارج البيانات المرفقة\n\n"
+        "سؤال المستخدم:\n"
+        f"{user_message}"
     )
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT_DATA}]
     if conversation_history:
-        messages.extend(conversation_history[-5:])
+        messages.extend(conversation_history[-10:])
     messages.append({"role": "user", "content": f"{user_message}\n\n{context_note}"})
 
     try:
         response, provider_name = await manager.chat_completion(messages=messages)
         reply = response.choices[0].message.content or ""
+
+        # Validation: Check if response references actual train numbers from data
+        items = local_results.get("items", [])
+        if items:
+            # Extract train numbers from data
+            train_numbers = set()
+            for item in items:
+                if isinstance(item, dict):
+                    # Try different field names for train number
+                    for key in ["train_number", "train_id", "train_number", "id"]:
+                        if key in item:
+                            val = str(item[key])
+                            if val:
+                                train_numbers.add(val)
+                                break
+
+            # Check if any train number from data appears in the reply
+            if train_numbers:
+                has_data_reference = any(
+                    str(tn) in reply for tn in train_numbers
+                )
+                if not has_data_reference:
+                    # AI didn't reference specific trains from data - likely hallucinating
+                    logger.warning(
+                        "[HALLUCINATION_DETECTED] Provider %s response doesn't reference any train numbers from data. "
+                        "Available: %s",
+                        provider_name,
+                        list(train_numbers)[:5]
+                    )
+                    # Re-prompt with stronger instructions
+                    retry_messages = messages + [
+                        {"role": "assistant", "content": reply},
+                        {"role": "user", "content": (
+                            "أجب مرة أخرى بناءً على البيانات فقط. "
+                            f"اذكر أرقام القطارات المتاحة: {', '.join(list(train_numbers)[:3])}. "
+                            "لا تضف معلومات من خارج البيانات."
+                        )}
+                    ]
+                    retry_response, retry_provider = await manager.chat_completion(messages=retry_messages)
+                    reply = retry_response.choices[0].message.content or reply
 
         tool_used = local_results.get("tool_used", "search_trips")
         tool_data = local_results
@@ -311,10 +372,10 @@ async def chat(
     # No local data — AI responds from general knowledge only
     manager = _get_manager()
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT_GENERAL}]
 
     if conversation_history:
-        history_slice = conversation_history[-5:]
+        history_slice = conversation_history[-10:]
         messages.extend(history_slice)
 
     messages.append({"role": "user", "content": user_message})
