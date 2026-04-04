@@ -25,6 +25,7 @@ from fastapi import WebSocket
 
 from app.core.cache import get_redis
 from app.services.chat_report_service import check_user_banned
+from app.services import fcm_service
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +348,21 @@ class TrainChatManager:
 
         # Broadcast to all in room (including sender for confirmation)
         await self.broadcast(train_id, message)
+
+        # Send FCM push to topic subscribers (background/terminated users)
+        try:
+            await fcm_service.send_to_topic(
+                topic=f"train_chat_{train_id}",
+                data={
+                    "type": "chat_message",
+                    "sender_id": user_id,
+                    "train_id": train_id,
+                    "sender_name": sanitize_message(user_name)[:30],
+                    "text": clean_text[:100],
+                },
+            )
+        except Exception as exc:
+            logger.warning("FCM topic push failed for %s: %s", train_id, exc)
 
         return {"ok": True, "message": message}
 

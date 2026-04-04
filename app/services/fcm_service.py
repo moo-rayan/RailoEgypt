@@ -87,6 +87,32 @@ async def send_to_token(
         return False
 
 
+async def send_to_topic(
+    topic: str,
+    data: dict,
+) -> bool:
+    """Send a data-only message to an FCM topic. Returns True on success."""
+    app = get_firebase_app()
+    if app is None:
+        return False
+
+    # FCM data values must be strings
+    str_data = {k: str(v) for k, v in data.items()}
+
+    message = messaging.Message(
+        data=str_data,
+        topic=topic,
+        android=messaging.AndroidConfig(priority="high"),
+    )
+
+    try:
+        messaging.send(message, app=app)
+        return True
+    except Exception as e:
+        logger.error("❌ FCM topic send error (%s): %s", topic, e)
+        return False
+
+
 async def send_to_tokens(
     tokens: list[str],
     title: str,
