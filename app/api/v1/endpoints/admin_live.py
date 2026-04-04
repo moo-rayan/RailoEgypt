@@ -46,6 +46,18 @@ class SetMaxContributorsRequest(BaseModel):
     max_active: int  # new limit (1-50)
 
 
+class SuspendRequest(BaseModel):
+    train_id: str
+    user_id: str
+    reason: str = ""
+    duration_minutes: int = 0  # 0 = permanent until manually unsuspended
+
+
+class UnsuspendRequest(BaseModel):
+    train_id: str
+    user_id: str
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.post("/ban", dependencies=[Depends(require_fulladmin)])
@@ -204,3 +216,49 @@ async def check_ban_endpoint(user_id: str):
     if ban_info is None:
         return {"banned": False, "user_id": user_id}
     return {"banned": True, "user_id": user_id, "ban_info": ban_info}
+
+
+@router.post("/suspend", dependencies=[Depends(require_fulladmin)])
+async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
+    """
+    Suspend a contributor from updating positions (keeps them in room but rejects updates).
+    duration_minutes=0 means permanent until manually unsuspended.
+    """
+    success = await tracking_manager.suspend_contributor(
+        train_id=body.train_id,
+        user_id=body.user_id,
+        duration_minutes=body.duration_minutes,
+        reason=body.reason,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contributor not found in the specified room",
+        )
+    duration_text = f"{body.duration_minutes} minutes" if body.duration_minutes > 0 else "permanent"
+    audit.log_admin_action(
+        request,
+        action=f"suspend_contributor ({duration_text})",
+        metadata={"train_id": body.train_id, "target_user": body.user_id, "reason": body.reason, "duration": body.duration_minutes},
+    )
+    return {"ok": True, "message": f"User {body.user_id[:8]}... suspended ({duration_text})"}
+
+
+@router.post("/unsuspend", dependencies=[Depends(require_fulladmin)])
+async def unsuspend_contributor_endpoint(body: UnsuspendRequest, request: Request):
+    """Remove suspension from a contributor."""
+    success = await tracking_manager.unsuspend_contributor(
+        train_id=body.train_id,
+        user_id=body.user_id,
+    )
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active suspension found for this user in the specified room",
+        )
+    audit.log_admin_action(
+        request,
+        action="unsuspend_contributor",
+        metadata={"train_id": body.train_id, "target_user": body.user_id},
+    )
+    return {"ok": True, "message": f"User {body.user_id[:8]}... unsuspended"}

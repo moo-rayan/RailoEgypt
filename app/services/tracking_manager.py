@@ -108,6 +108,8 @@ class TrainRoom:
     max_active_contributors: int = field(default_factory=lambda: settings.max_active_contributors)
     # Temporary kick block: user_id → timestamp until which they cannot rejoin
     kicked_until: dict[str, float] = field(default_factory=dict)
+    # Temporary suspend block: user_id → timestamp until which their updates are rejected
+    suspended_until: dict[str, float] = field(default_factory=dict)
 
     # Event log (ring buffer, last 200 events)
     event_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
@@ -306,6 +308,11 @@ class TrackingManager:
         if time.time() < kick_expiry:
             return {"status": "kicked", "message_ar": "تم طردك من الغرفة مؤقتاً"}
 
+        # Check temporary suspend block
+        suspend_expiry = room.suspended_until.get(user_id, 0)
+        if time.time() < suspend_expiry:
+            return {"status": "suspended", "message_ar": "تم إيقاف مساهمتك مؤقتاً"}
+
         avatar = self._user_avatars.get(user_id, "")
         name = self._user_display_names.get(user_id, "")
         is_captain = self._user_captains.get(user_id, False)
@@ -499,6 +506,36 @@ class TrackingManager:
 
     _KICK_BLOCK_SECONDS = 300  # 5 minutes block after kick
 
+    async def suspend_contributor(self, train_id: str, user_id: str, duration_minutes: int = 0, reason: str = "") -> bool:
+        """Suspend a contributor from updating positions (keeps them in room but rejects updates).
+        duration_minutes=0 means permanent until manually unsuspended.
+        """
+        room = self._rooms.get(train_id)
+        if not room or user_id not in room.contributors:
+            return False
+        if duration_minutes > 0:
+            room.suspended_until[user_id] = time.time() + (duration_minutes * 60)
+        else:
+            # Permanent suspension (set to far future)
+            room.suspended_until[user_id] = float("inf")
+        self._log_event(room, "suspend", user_id, reason or f"معلق لـ {duration_minutes} دقيقة" if duration_minutes > 0 else "معلق بشكل دائم")
+        logger.info("🚫 [%s] Contributor %s suspended (duration=%s min): %s",
+                    train_id, user_id[:8], duration_minutes if duration_minutes > 0 else "∞", reason)
+        return True
+
+    async def unsuspend_contributor(self, train_id: str, user_id: str) -> bool:
+        """Remove suspension from a contributor."""
+        room = self._rooms.get(train_id)
+        if not room:
+            return False
+        if user_id not in room.suspended_until:
+            return False
+        del room.suspended_until[user_id]
+        if user_id in room.contributors:
+            self._log_event(room, "unsuspend", user_id, "تم إلغاء الإيقاف")
+            logger.info("✅ [%s] Contributor %s unsuspended", train_id, user_id[:8])
+        return True
+
     async def kick_contributor(self, train_id: str, user_id: str, reason: str = "") -> bool:
         """Remove a contributor and block them from re-joining for 5 minutes."""
         room = self._rooms.get(train_id)
@@ -593,6 +630,16 @@ class TrackingManager:
                         "message_en": f"You are in waiting list (#{i + 1} of {len(room.waiting_list)}). You will be promoted automatically.",
                     }
             return {"ok": False, "error": "not_a_contributor"}
+
+        # Check if contributor is suspended
+        suspend_expiry = room.suspended_until.get(user_id, 0)
+        if time.time() < suspend_expiry:
+            return {
+                "ok": False,
+                "error": "suspended",
+                "message_ar": "تم إيقاف مساهمتك مؤقتاً من قبل الإدارة",
+                "message_en": "Your contribution is temporarily suspended by admin",
+            }
 
         # Rate limiting
         now = time.time()
@@ -1100,6 +1147,8 @@ class TrackingManager:
         for tid, room in self._rooms.items():
             contributors = []
             for uid, c in room.contributors.items():
+                # Check if contributor is suspended
+                is_suspended = time.time() < room.suspended_until.get(uid, 0)
                 contributors.append({
                     "user_id": uid,
                     "display_name": c.display_name,
@@ -1111,6 +1160,7 @@ class TrackingManager:
                     "is_stale": c.last_update > 0 and (now - c.last_update) > _STALE_TIMEOUT_S,
                     "is_leader": uid == room.leader_id,
                     "is_captain": c.is_captain,
+                    "is_suspended": is_suspended,
                     "from_station": c.from_station_name,
                     "to_station": c.to_station_name,
                     "trip_distance_km": round(c.trip_distance_km, 1),
