@@ -121,11 +121,17 @@ async def post_contributor_location(
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
 
-    # Ban check
+    # Ban check — return 200 with error so Flutter BG service can parse it
     from app.services.ban_service import is_banned
     ban_info = await is_banned(user_id)
     if ban_info:
-        raise HTTPException(status_code=403, detail="You are banned from contributing")
+        return {
+            "ok": False,
+            "status": "banned",
+            "error": "banned",
+            "message_ar": "تم حظرك من المساهمة",
+            "position_data": None,
+        }
 
     # Store user metadata
     user_meta = user.get("user_metadata", {}) or {}
@@ -183,10 +189,22 @@ async def post_contributor_location(
         join_status = join_result.get("status", "active")
 
         if join_status == "kicked":
-            raise HTTPException(
-                status_code=403,
-                detail=join_result.get("message_ar", "You are temporarily blocked"),
-            )
+            return {
+                "ok": False,
+                "status": "kicked",
+                "error": "kicked",
+                "message_ar": join_result.get("message_ar", "تم طردك من الغرفة مؤقتاً"),
+                "position_data": None,
+            }
+
+        if join_status == "suspended":
+            return {
+                "ok": False,
+                "status": "suspended",
+                "error": "suspended",
+                "message_ar": join_result.get("message_ar", "تم إيقاف مساهمتك مؤقتاً"),
+                "position_data": None,
+            }
 
         logger.info(
             "👤+ [%s] New contributor %s joined (%s)",

@@ -541,7 +541,8 @@ class TrackingManager:
         else:
             # Permanent suspension (set to far future)
             room.suspended_until[user_id] = float("inf")
-        self._log_event(room, "suspend", user_id, reason or f"معلق لـ {duration_minutes} دقيقة" if duration_minutes > 0 else "معلق بشكل دائم")
+        detail = reason or (f"معلق لـ {duration_minutes} دقيقة" if duration_minutes > 0 else "معلق بشكل دائم")
+        self._log_event(room, "suspend", user_id, detail)
         logger.info("🚫 [%s] Contributor %s suspended (duration=%s min): %s",
                     train_id, user_id[:8], duration_minutes if duration_minutes > 0 else "∞", reason)
         return True
@@ -657,6 +658,8 @@ class TrackingManager:
         # Check if contributor is suspended
         suspend_expiry = room.suspended_until.get(user_id, 0)
         if time.time() < suspend_expiry:
+            # Keep last_update fresh so stale cleanup doesn't remove suspended contributors
+            contributor.last_update = time.time()
             return {
                 "ok": False,
                 "error": "suspended",
