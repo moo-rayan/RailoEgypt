@@ -150,8 +150,8 @@ async def remove_leader_endpoint(body: RemoveLeaderRequest, request: Request):
 
 @router.get("/logs/{train_id}", dependencies=[Depends(get_admin_or_legacy_key)])
 async def get_room_logs(train_id: str):
-    """Get event log for a tracking room."""
-    logs = tracking_manager.get_room_logs(train_id)
+    """Get event log for a tracking room (falls back to Redis if room destroyed)."""
+    logs = await tracking_manager.get_room_logs(train_id)
     return {"train_id": train_id, "total": len(logs), "logs": logs}
 
 

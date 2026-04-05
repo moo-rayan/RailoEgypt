@@ -15,6 +15,7 @@ Design goals:
 
 import asyncio
 import collections
+import json
 import logging
 import math
 import time
@@ -609,20 +610,24 @@ class TrackingManager:
         logger.info("👑 [%s] Leader removed (was %s)", train_id, old_leader)
         return True
 
-    def get_room_logs(self, train_id: str) -> list[dict]:
-        """Get event log for a room."""
+    async def get_room_logs(self, train_id: str) -> list[dict]:
+        """Get event log for a room. Falls back to Redis cache if room not in memory."""
         room = self._rooms.get(train_id)
-        if not room:
-            return []
-        return [
-            {
-                "timestamp": e.timestamp,
-                "event_type": e.event_type,
-                "user_id": e.user_id,
-                "detail": e.detail,
-            }
-            for e in room.event_log
-        ]
+        if room:
+            return [
+                {
+                    "timestamp": e.timestamp,
+                    "event_type": e.event_type,
+                    "user_id": e.user_id,
+                    "detail": e.detail,
+                }
+                for e in room.event_log
+            ]
+        # Fallback: try Redis cached logs
+        cached = await cache_get(f"room_logs:{train_id}")
+        if cached and isinstance(cached, list):
+            return cached
+        return []
 
     def get_room_feed(self, train_id: str) -> list[dict]:
         """Get live GPS update feed for a room (last 100 updates)."""
@@ -1266,7 +1271,7 @@ class TrackingManager:
         return results
 
     async def _save_room_history(self, room: "TrainRoom") -> None:
-        """Save a compact room summary to Redis so the dashboard can show it for 12 hours."""
+        """Save a compact room summary + event logs to Redis so the dashboard can show them for 12 hours."""
         summary = {
             "train_id": room.train_id,
             "trip_id": room.trip_id,
@@ -1280,7 +1285,20 @@ class TrackingManager:
             "saved_at": time.time(),
         }
         await cache_set(f"room_history:{room.train_id}", summary, ttl=_ROOM_HISTORY_TTL)
-        logger.debug("📋 [%s] Room history saved to Redis (TTL=%ds)", room.train_id, _ROOM_HISTORY_TTL)
+
+        # Save event logs separately (they can be large)
+        logs = [
+            {
+                "timestamp": e.timestamp,
+                "event_type": e.event_type,
+                "user_id": e.user_id,
+                "detail": e.detail,
+            }
+            for e in room.event_log
+        ]
+        if logs:
+            await cache_set(f"room_logs:{room.train_id}", logs, ttl=_ROOM_HISTORY_TTL)
+        logger.debug("📋 [%s] Room history + logs saved to Redis (TTL=%ds)", room.train_id, _ROOM_HISTORY_TTL)
 
     async def get_recent_rooms(self) -> list[dict]:
         """Return room history entries from Redis that are NOT currently active in-memory.
@@ -1296,7 +1314,6 @@ class TrackingManager:
                 return []
 
             results = []
-            import json
             for key in keys:
                 raw = await r.get(key)
                 if not raw:
