@@ -264,7 +264,7 @@ class TrainChatManager:
             room.admin_observers.pop(oid, None)
 
     async def broadcast_system(self, train_id: str, text: str) -> None:
-        """Broadcast a system message to all users."""
+        """Broadcast a system message to all users AND admin observers."""
         msg = {
             "type": "system",
             "data": {
@@ -286,6 +286,16 @@ class TrainChatManager:
                 disconnected.append(uid)
         for uid in disconnected:
             room.connections.pop(uid, None)
+
+        # Also send to admin observers
+        dead_admins: list[str] = []
+        for oid, ws in room.admin_observers.items():
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                dead_admins.append(oid)
+        for oid in dead_admins:
+            room.admin_observers.pop(oid, None)
 
     # ── Process incoming message ──────────────────────────────────────────
 
@@ -440,6 +450,39 @@ class TrainChatManager:
         except Exception:
             pass
         return True
+
+    async def process_admin_message(
+        self,
+        train_id: str,
+        text: str,
+        admin_name: str = "المشرف",
+    ) -> dict:
+        """
+        Send a message from admin. No rate-limit, no ban check.
+        Stored, broadcast, and marked with is_admin=True.
+        """
+        if not text or not text.strip():
+            return {"ok": False, "error": "empty_message"}
+
+        clean_text = sanitize_message(text)
+        if not clean_text:
+            return {"ok": False, "error": "empty_after_sanitize"}
+
+        message = {
+            "id": str(uuid.uuid4()),
+            "user_id": "admin",
+            "user_name": admin_name,
+            "user_avatar": "",
+            "text": clean_text,
+            "type": "admin",
+            "is_admin": True,
+            "pinned": False,
+            "timestamp": _iso_now(),
+        }
+
+        await self.store_message(train_id, message)
+        await self.broadcast(train_id, message)
+        return {"ok": True, "message": message}
 
     def get_room_user_count(self, train_id: str) -> int:
         """Get the number of connected users in a chat room."""

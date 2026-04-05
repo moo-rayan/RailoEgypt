@@ -105,13 +105,22 @@ async def admin_chat_ws(
             },
         })
 
-        # Keep alive — respond to pings
+        # Listen for pings and admin messages
         while True:
             raw = await ws.receive_text()
             try:
                 data = json.loads(raw)
                 if data.get("type") == "ping":
                     await ws.send_json({"type": "pong"})
+                elif data.get("type") == "admin_message":
+                    msg_text = data.get("text", "")
+                    result = await train_chat_manager.process_admin_message(
+                        train_id=train_id,
+                        text=msg_text,
+                        admin_name=data.get("admin_name", "المشرف"),
+                    )
+                    if not result.get("ok"):
+                        await ws.send_json({"type": "error", "data": result})
             except json.JSONDecodeError:
                 pass
 
@@ -121,6 +130,26 @@ async def admin_chat_ws(
         logger.error("🔭 Admin chat observer error: %s: %s", observer_id, exc)
     finally:
         await train_chat_manager.remove_admin_observer(train_id, observer_id)
+
+
+# ── Admin send message (REST) ────────────────────────────────────────────────
+
+class AdminMessageRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=300)
+    admin_name: str = Field("المشرف", max_length=30)
+
+
+@router.post("/{train_id}/send", dependencies=[Depends(require_fulladmin)])
+async def admin_send_message(train_id: str, body: AdminMessageRequest):
+    """Send a message as admin to the train chat."""
+    result = await train_chat_manager.process_admin_message(
+        train_id=train_id,
+        text=body.text,
+        admin_name=body.admin_name,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "unknown"))
+    return result
 
 
 # ── Toggle chat (enable/disable) ─────────────────────────────────────────────
