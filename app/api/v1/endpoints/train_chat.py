@@ -213,7 +213,7 @@ async def chat_websocket(
     except Exception as exc:
         logger.error("💬 [%s] Chat WS error: user=%s: %s", train_id, user_id[:8], exc)
     finally:
-        await train_chat_manager.leave(train_id, user_id)
+        await train_chat_manager.leave(train_id, user_id, ws)
 
 
 # ── REST: Get messages ────────────────────────────────────────────────────────

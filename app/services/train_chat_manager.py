@@ -98,22 +98,39 @@ class TrainChatManager:
     async def join(self, train_id: str, user_id: str, ws: WebSocket) -> None:
         """Add a user to the chat room."""
         room = self._get_or_create_room(train_id)
+        old_ws = room.connections.get(user_id)
+        if old_ws is not None and old_ws is not ws:
+            logger.info(
+                "💬♻ [%s] User %s reconnected (replacing old WS)",
+                train_id, user_id[:8],
+            )
         room.connections[user_id] = ws
         logger.info(
             "💬+ [%s] User %s joined chat (total: %d)",
             train_id, user_id[:8], len(room.connections),
         )
 
-    async def leave(self, train_id: str, user_id: str) -> None:
-        """Remove a user from the chat room."""
+    async def leave(self, train_id: str, user_id: str, ws: WebSocket) -> None:
+        """Remove a user from the chat room.
+        Only removes if the stored WebSocket is the same instance,
+        preventing a stale handler from removing a newer connection."""
         room = self._rooms.get(train_id)
         if room:
+            current_ws = room.connections.get(user_id)
+            if current_ws is None:
+                return
+            if current_ws is not ws:
+                logger.info(
+                    "💬⚠ [%s] User %s leave skipped (stale WS, newer connection active)",
+                    train_id, user_id[:8],
+                )
+                return
             room.connections.pop(user_id, None)
             logger.info(
                 "💬- [%s] User %s left chat (total: %d)",
                 train_id, user_id[:8], len(room.connections),
             )
-            if not room.connections:
+            if not room.connections and not room.admin_observers:
                 del self._rooms[train_id]
 
     # ── Rate limiting ─────────────────────────────────────────────────────
