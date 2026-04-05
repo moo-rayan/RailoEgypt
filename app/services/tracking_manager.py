@@ -35,6 +35,7 @@ _STALE_TIMEOUT_S     = 240.0   # remove contributor after 240 s silence
 _MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
 _TRAIN_POS_TTL       = 60      # Redis TTL for cached train position (60 seconds)
 _ROOM_GRACE_S        = 600.0   # keep empty room alive for 10 min before destroying
+_ROOM_HISTORY_TTL    = 43200   # Redis TTL for room history (12 hours)
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -493,6 +494,8 @@ class TrackingManager:
 
             # If no contributors left, reset all tracked state
             if not room.contributors:
+                # Save room history before resetting (12h dashboard visibility)
+                await self._save_room_history(room)
                 room.status = "waiting"
                 room.lat = 0.0
                 room.lng = 0.0
@@ -1159,6 +1162,8 @@ class TrackingManager:
                     room.max_lat = 0.0
                     room.max_lng = 0.0
                     await cache_delete(f"train_pos:{train_id}")
+                    # Save room history for dashboard (12h)
+                    await self._save_room_history(room)
                 self._cleanup_room(train_id)
 
         # Phase 2: destroy rooms whose grace period has expired
@@ -1172,6 +1177,8 @@ class TrackingManager:
                 and not room.waiting_list
                 and (now - room.empty_since) > _ROOM_GRACE_S
             ):
+                # Ensure history is saved before destroying
+                await self._save_room_history(room)
                 del self._rooms[train_id]
                 logger.info("🗑️  [%s] Room destroyed (empty for %.0fs)", train_id, now - room.empty_since)
 
@@ -1257,6 +1264,73 @@ class TrackingManager:
                 "empty_since": room.empty_since if room.empty_since > 0 else None,
             })
         return results
+
+    async def _save_room_history(self, room: "TrainRoom") -> None:
+        """Save a compact room summary to Redis so the dashboard can show it for 12 hours."""
+        summary = {
+            "train_id": room.train_id,
+            "trip_id": room.trip_id,
+            "start_station": room.start_station,
+            "end_station": room.end_station,
+            "lat": round(room.lat, 6),
+            "lng": round(room.lng, 6),
+            "speed": round(room.speed, 1),
+            "direction": room.direction,
+            "status": room.status,
+            "saved_at": time.time(),
+        }
+        await cache_set(f"room_history:{room.train_id}", summary, ttl=_ROOM_HISTORY_TTL)
+        logger.debug("📋 [%s] Room history saved to Redis (TTL=%ds)", room.train_id, _ROOM_HISTORY_TTL)
+
+    async def get_recent_rooms(self) -> list[dict]:
+        """Return room history entries from Redis that are NOT currently active in-memory.
+
+        These are rooms whose tracking ended but should still appear in the
+        dashboard for up to 12 hours.
+        """
+        from app.core.cache import get_redis
+        try:
+            r = await get_redis()
+            keys = await r.keys("room_history:*")
+            if not keys:
+                return []
+
+            results = []
+            import json
+            for key in keys:
+                raw = await r.get(key)
+                if not raw:
+                    continue
+                data = json.loads(raw) if isinstance(raw, str) else raw
+                train_id = data.get("train_id", "")
+                # Skip if this room is currently active in-memory
+                if train_id in self._rooms:
+                    continue
+                # Return as a "historical" room entry
+                results.append({
+                    "train_id": train_id,
+                    "trip_id": data.get("trip_id"),
+                    "status": "ended",
+                    "lat": data.get("lat", 0.0),
+                    "lng": data.get("lng", 0.0),
+                    "speed": 0.0,
+                    "direction": data.get("direction", ""),
+                    "start_station": data.get("start_station", ""),
+                    "end_station": data.get("end_station", ""),
+                    "contributors_count": 0,
+                    "listeners_count": 0,
+                    "waiting_count": 0,
+                    "max_active_contributors": 0,
+                    "leader_id": None,
+                    "contributors": [],
+                    "waiting_list": [],
+                    "empty_since": data.get("saved_at"),
+                    "is_historical": True,
+                })
+            return results
+        except Exception as exc:
+            logger.warning("Failed to fetch recent rooms from Redis: %s", exc)
+            return []
 
     async def clear_train_position(self, train_id: str) -> bool:
         """Clear cached position for a train from both in-memory room and Redis.

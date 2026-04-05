@@ -157,15 +157,20 @@ async def get_room_logs(train_id: str):
 
 @router.get("/rooms", dependencies=[Depends(get_admin_or_legacy_key)])
 async def get_admin_rooms():
-    """List all active rooms with full details (for admin dashboard)."""
-    rooms = tracking_manager.all_rooms_info()
-    total_contributors = sum(r["contributors_count"] for r in rooms)
-    total_waiting = sum(r.get("waiting_count", 0) for r in rooms)
+    """List all active rooms + recently-tracked rooms (12h history) for admin dashboard."""
+    active_rooms = tracking_manager.all_rooms_info()
+    historical_rooms = await tracking_manager.get_recent_rooms()
+
+    # Merge: active rooms first, then historical (no duplicates)
+    all_rooms = active_rooms + historical_rooms
+
+    total_contributors = sum(r["contributors_count"] for r in all_rooms)
+    total_waiting = sum(r.get("waiting_count", 0) for r in all_rooms)
     return {
-        "total_rooms": len(rooms),
+        "total_rooms": len(all_rooms),
         "total_contributors": total_contributors,
         "total_waiting": total_waiting,
-        "rooms": rooms,
+        "rooms": all_rooms,
     }
 
 
