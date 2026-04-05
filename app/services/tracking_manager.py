@@ -1258,6 +1258,33 @@ class TrackingManager:
             })
         return results
 
+    async def clear_train_position(self, train_id: str) -> bool:
+        """Clear cached position for a train from both in-memory room and Redis.
+
+        Returns True if anything was cleared.
+        """
+        cleared = False
+
+        # Clear Redis cache
+        await cache_delete(f"train_pos:{train_id}")
+        cleared = True
+        logger.info("🗑️ [%s] Redis train_pos cleared by admin", train_id)
+
+        # Reset in-memory room position if exists
+        room = self._rooms.get(train_id)
+        if room:
+            room.lat = 0.0
+            room.lng = 0.0
+            room.speed = 0.0
+            room.max_progress = 0.0
+            room.max_lat = 0.0
+            room.max_lng = 0.0
+            room.status = "waiting"
+            room.direction = ""
+            logger.info("🗑️ [%s] In-memory room position reset by admin", train_id)
+
+        return cleared
+
     def room_info(self, train_id: str) -> Optional[dict]:
         room = self._rooms.get(train_id)
         if not room:

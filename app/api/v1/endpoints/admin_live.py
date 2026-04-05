@@ -218,6 +218,23 @@ async def check_ban_endpoint(user_id: str):
     return {"banned": True, "user_id": user_id, "ban_info": ban_info}
 
 
+@router.delete("/clear-position/{train_id}", dependencies=[Depends(require_fulladmin)])
+async def clear_train_position_endpoint(train_id: str, request: Request):
+    """Clear cached position data for a train from Redis and in-memory."""
+    cleared = await tracking_manager.clear_train_position(train_id)
+    if not cleared:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No position data found for this train",
+        )
+    audit.log_admin_action(
+        request,
+        action="clear_train_position",
+        metadata={"train_id": train_id},
+    )
+    return {"ok": True, "message": f"Position data cleared for train {train_id}"}
+
+
 @router.post("/suspend", dependencies=[Depends(require_fulladmin)])
 async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
     """
