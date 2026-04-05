@@ -152,6 +152,28 @@ async def admin_send_message(train_id: str, body: AdminMessageRequest):
     return result
 
 
+# ── Delete a message ─────────────────────────────────────────────────────────
+
+@router.delete("/{train_id}/messages/{message_id}", dependencies=[Depends(require_fulladmin)])
+async def delete_chat_message(train_id: str, message_id: str):
+    """Delete a specific message from the train chat."""
+    result = await train_chat_manager.delete_message(train_id, message_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("error", "unknown"))
+    return result
+
+
+# ── Clear all chat data ──────────────────────────────────────────────────────
+
+@router.delete("/{train_id}/clear", dependencies=[Depends(require_fulladmin)])
+async def clear_chat_data(train_id: str):
+    """Delete ALL chat data (messages, pinned, counter) for a train from Redis."""
+    result = await train_chat_manager.clear_chat(train_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result.get("error", "unknown"))
+    return result
+
+
 # ── Toggle chat (enable/disable) ─────────────────────────────────────────────
 
 class ToggleChatRequest(BaseModel):

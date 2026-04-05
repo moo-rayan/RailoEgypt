@@ -484,6 +484,101 @@ class TrainChatManager:
         await self.broadcast(train_id, message)
         return {"ok": True, "message": message}
 
+    async def delete_message(self, train_id: str, message_id: str) -> dict:
+        """Delete a specific message from Redis by its ID."""
+        try:
+            r = await get_redis()
+            msg_key = _MSG_KEY.format(train_id=train_id)
+            raw_list = await r.lrange(msg_key, 0, -1)
+
+            found = False
+            for raw in raw_list:
+                msg = json.loads(raw)
+                if msg.get("id") == message_id:
+                    await r.lrem(msg_key, 1, raw)
+                    found = True
+                    break
+
+            if not found:
+                return {"ok": False, "error": "message_not_found"}
+
+            # Also remove from pinned if present
+            pin_key = _PIN_KEY.format(train_id=train_id)
+            pin_list = await r.lrange(pin_key, 0, -1)
+            for raw in pin_list:
+                msg = json.loads(raw)
+                if msg.get("id") == message_id:
+                    await r.lrem(pin_key, 1, raw)
+                    break
+
+            # Broadcast deletion to all connected clients
+            await self._broadcast_message_deleted(train_id, message_id)
+            return {"ok": True, "message_id": message_id}
+
+        except Exception as exc:
+            logger.error("Failed to delete message: %s", exc)
+            return {"ok": False, "error": "internal_error"}
+
+    async def clear_chat(self, train_id: str) -> dict:
+        """Delete ALL chat data for a train from Redis."""
+        try:
+            r = await get_redis()
+            keys = [
+                _MSG_KEY.format(train_id=train_id),
+                _PIN_KEY.format(train_id=train_id),
+                _COUNT_KEY.format(train_id=train_id),
+            ]
+            await r.delete(*keys)
+
+            # Broadcast clear to all connected clients
+            await self._broadcast_chat_cleared(train_id)
+            logger.info("🗑️ Chat cleared for train %s", train_id)
+            return {"ok": True, "train_id": train_id}
+
+        except Exception as exc:
+            logger.error("Failed to clear chat: %s", exc)
+            return {"ok": False, "error": "internal_error"}
+
+    async def _broadcast_message_deleted(self, train_id: str, message_id: str) -> None:
+        """Notify all clients that a message was deleted."""
+        room = self._rooms.get(train_id)
+        if not room:
+            return
+        payload = json.dumps(
+            {"type": "message_deleted", "data": {"message_id": message_id}},
+            ensure_ascii=False,
+        )
+        for ws in list(room.connections.values()):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                pass
+        for ws in list(room.admin_observers.values()):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                pass
+
+    async def _broadcast_chat_cleared(self, train_id: str) -> None:
+        """Notify all clients that chat was cleared."""
+        room = self._rooms.get(train_id)
+        if not room:
+            return
+        payload = json.dumps(
+            {"type": "chat_cleared", "data": {"train_id": train_id}},
+            ensure_ascii=False,
+        )
+        for ws in list(room.connections.values()):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                pass
+        for ws in list(room.admin_observers.values()):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                pass
+
     def get_room_user_count(self, train_id: str) -> int:
         """Get the number of connected users in a chat room."""
         room = self._rooms.get(train_id)
