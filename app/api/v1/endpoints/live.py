@@ -165,7 +165,22 @@ async def post_contributor_location(
         if not room or not room.stations:
             await _load_trip_info(train_id, body.trip_id)
 
+    # Pre-fetch captain status BEFORE the is_new_contributor check
+    # to avoid an asyncio race condition (the await yields control,
+    # allowing a concurrent request to also pass the new-contributor check).
+    if user_id not in tracking_manager._user_captains:
+        try:
+            profile = (await db.execute(
+                select(Profile.is_captain).where(
+                    Profile.id == cast(user_id, PG_UUID)
+                )
+            )).scalar()
+            tracking_manager.set_user_captain(user_id, bool(profile))
+        except Exception as exc:
+            logger.warning("⚠️ [%s] Captain check failed for %s: %s", train_id, user_id[:8], exc)
+
     # Register contributor if not already in the room
+    # NOTE: no await between this check and add_contributor to prevent race conditions
     room = tracking_manager.get_room(train_id)
     is_new_contributor = not room or (
         user_id not in (room.contributors if room else {})
@@ -173,18 +188,6 @@ async def post_contributor_location(
     )
 
     if is_new_contributor:
-        # Check captain status from DB (only on first join)
-        if user_id not in tracking_manager._user_captains:
-            try:
-                profile = (await db.execute(
-                    select(Profile.is_captain).where(
-                        Profile.id == cast(user_id, PG_UUID)
-                    )
-                )).scalar()
-                tracking_manager.set_user_captain(user_id, bool(profile))
-            except Exception as exc:
-                logger.warning("⚠️ [%s] Captain check failed for %s: %s", train_id, user_id[:8], exc)
-
         join_result = await tracking_manager.add_contributor(train_id, user_id)
         join_status = join_result.get("status", "active")
 

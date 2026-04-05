@@ -322,6 +322,16 @@ class TrackingManager:
         """
         room = self.get_or_create_room(train_id)
 
+        # Guard: if already an active contributor, return immediately
+        # (prevents duplicate "join" events from asyncio race conditions)
+        if user_id in room.contributors:
+            return {"status": "active"}
+
+        # Guard: if already in waiting list, return waiting status
+        for i, w in enumerate(room.waiting_list):
+            if w.user_id == user_id:
+                return {"status": "waiting", "position": i + 1, "total": len(room.waiting_list)}
+
         # Check temporary kick block
         kick_expiry = room.kicked_until.get(user_id, 0)
         if time.time() < kick_expiry:
@@ -530,7 +540,7 @@ class TrackingManager:
     _KICK_BLOCK_SECONDS = 300  # 5 minutes block after kick
 
     async def suspend_contributor(self, train_id: str, user_id: str, duration_minutes: int = 0, reason: str = "") -> bool:
-        """Suspend a contributor from updating positions (keeps them in room but rejects updates).
+        """Suspend a contributor: remove from room + block re-joining for the duration.
         duration_minutes=0 means permanent until manually unsuspended.
         """
         room = self._rooms.get(train_id)
@@ -543,7 +553,9 @@ class TrackingManager:
             room.suspended_until[user_id] = float("inf")
         detail = reason or (f"معلق لـ {duration_minutes} دقيقة" if duration_minutes > 0 else "معلق بشكل دائم")
         self._log_event(room, "suspend", user_id, detail)
-        logger.info("🚫 [%s] Contributor %s suspended (duration=%s min): %s",
+        # Remove from room immediately (like kick) so dashboard sees the change instantly
+        await self.remove_participant(train_id, user_id)
+        logger.info("🚫 [%s] Contributor %s suspended & removed (duration=%s min): %s",
                     train_id, user_id[:8], duration_minutes if duration_minutes > 0 else "∞", reason)
         return True
 
@@ -655,16 +667,14 @@ class TrackingManager:
                     }
             return {"ok": False, "error": "not_a_contributor"}
 
-        # Check if contributor is suspended
+        # Check if contributor is suspended (safety net — normally suspended
+        # users are removed from the room, but check in case of race condition)
         suspend_expiry = room.suspended_until.get(user_id, 0)
         if time.time() < suspend_expiry:
-            # Keep last_update fresh so stale cleanup doesn't remove suspended contributors
-            contributor.last_update = time.time()
             return {
                 "ok": False,
                 "error": "suspended",
                 "message_ar": "تم إيقاف مساهمتك مؤقتاً من قبل الإدارة",
-                "message_en": "Your contribution is temporarily suspended by admin",
             }
 
         # Rate limiting
