@@ -44,6 +44,7 @@ class LocationUpdateRequest(BaseModel):
     trip_id: int | None = None
     from_station_name: str | None = None
     to_station_name: str | None = None
+    silent: bool = False
 
 
 async def _load_trip_info(train_id: str, trip_id: int) -> None:
@@ -147,6 +148,10 @@ async def post_contributor_location(
             from_station_name=body.from_station_name or "",
             to_station_name=body.to_station_name or "",
         )
+
+    # Store silent flag (alert-based contribution)
+    if body.silent:
+        tracking_manager.set_user_silent(user_id, True)
 
     # Load trip stations from DB if needed
     if body.trip_id:

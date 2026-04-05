@@ -75,6 +75,7 @@ class Contributor:
     to_station_name: str = ""
     trip_distance_km: float = 0.0
     is_captain: bool = False
+    is_silent: bool = False
 
 
 @dataclass
@@ -139,6 +140,7 @@ class TrackingManager:
         self._user_display_names: dict[str, str] = {}  # user_id → display_name
         self._user_trip_info: dict[str, dict] = {}  # user_id → {from_station_name, to_station_name}
         self._user_captains: dict[str, bool] = {}  # user_id → is_captain
+        self._user_silent: dict[str, bool] = {}  # user_id → is_silent (alert-based contribution)
         self._last_positions: dict[str, tuple] = {}  # user_id → (lat, lng, speed)
         # Deduplication: one contribution alert per user per train per hour
         # key = "{user_id}:{train_id}", value = last alert timestamp
@@ -168,6 +170,10 @@ class TrackingManager:
     def set_user_captain(self, user_id: str, is_captain: bool) -> None:
         """Store whether user is a train captain."""
         self._user_captains[user_id] = is_captain
+
+    def set_user_silent(self, user_id: str, is_silent: bool) -> None:
+        """Store whether this contribution is silent (alert-based)."""
+        self._user_silent[user_id] = is_silent
 
     def track_http_listener(self, user_id: str, train_id: str) -> None:
         """Track a user polling for position via HTTP (listener)."""
@@ -316,6 +322,7 @@ class TrackingManager:
         avatar = self._user_avatars.get(user_id, "")
         name = self._user_display_names.get(user_id, "")
         is_captain = self._user_captains.get(user_id, False)
+        is_silent = self._user_silent.get(user_id, False)
         trip_info = self._user_trip_info.get(user_id, {})
         from_name = trip_info.get("from_station_name", "")
         to_name = trip_info.get("to_station_name", "")
@@ -372,6 +379,7 @@ class TrackingManager:
                 user_id=user_id, display_name=name, avatar_url=avatar,
                 from_station_name=from_name, to_station_name=to_name,
                 trip_distance_km=distance_km, is_captain=is_captain,
+                is_silent=is_silent,
             )
             # Restore last known position so contributor is in active list immediately
             last = self._last_positions.get(user_id)
@@ -1078,6 +1086,8 @@ class TrackingManager:
             entry: dict = {"uid": c.user_id[:8]}
             if c.is_captain:
                 entry["cap"] = True
+            if c.is_silent:
+                entry["sil"] = True
             infos.append(entry)
             if len(infos) >= limit:
                 break
@@ -1160,6 +1170,7 @@ class TrackingManager:
                     "is_stale": c.last_update > 0 and (now - c.last_update) > _STALE_TIMEOUT_S,
                     "is_leader": uid == room.leader_id,
                     "is_captain": c.is_captain,
+                    "is_silent": c.is_silent,
                     "is_suspended": is_suspended,
                     "from_station": c.from_station_name,
                     "to_station": c.to_station_name,
