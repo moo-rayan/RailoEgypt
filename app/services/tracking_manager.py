@@ -34,6 +34,7 @@ _UPDATE_COOLDOWN_S   = 25.0    # min seconds between contributor updates
 _STALE_TIMEOUT_S     = 240.0   # remove contributor after 240 s silence
 _MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
 _TRAIN_POS_TTL       = 60      # Redis TTL for cached train position (60 seconds)
+_ROOM_GRACE_S        = 600.0   # keep empty room alive for 10 min before destroying
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -76,6 +77,7 @@ class Contributor:
     trip_distance_km: float = 0.0
     is_captain: bool = False
     is_silent: bool = False
+    far_from_train_logged: bool = False  # prevent repeated silent_disconnect log
 
 
 @dataclass
@@ -116,6 +118,9 @@ class TrainRoom:
     event_log: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
     # Live update feed (ring buffer, last 100 GPS updates for admin monitoring)
     update_feed: collections.deque = field(default_factory=lambda: collections.deque(maxlen=100))
+
+    # Room lifecycle
+    empty_since: float = 0.0  # timestamp when room became empty (0 = has contributors)
 
     # Aggregated state
     lat: float = 0.0
@@ -225,10 +230,18 @@ class TrackingManager:
         return self._rooms.get(train_id)
 
     def _cleanup_room(self, train_id: str) -> None:
+        """Mark empty rooms for deferred cleanup instead of immediate deletion."""
         room = self._rooms.get(train_id)
-        if room and not room.contributors and not room.waiting_list:
-            del self._rooms[train_id]
-            logger.info("🗑️  [%s] Room destroyed (empty)", train_id)
+        if not room:
+            return
+        if room.contributors or room.waiting_list:
+            # Room has participants — clear any empty timer
+            room.empty_since = 0.0
+            return
+        # Room is empty — start grace timer if not already started
+        if room.empty_since == 0.0:
+            room.empty_since = time.time()
+            logger.info("⏳ [%s] Room empty — grace period started (%.0fs)", train_id, _ROOM_GRACE_S)
 
     # ── Set trip metadata (stations) ──────────────────────────────────────
 
@@ -374,7 +387,9 @@ class TrackingManager:
 
         # Check if there's room for an active contributor
         if has_slot:
-            captain_label = " �Captain" if is_captain else ""
+            captain_label = " 🚂Captain" if is_captain else ""
+            # Clear grace-period timer — room is active again
+            room.empty_since = 0.0
             room.contributors[user_id] = Contributor(
                 user_id=user_id, display_name=name, avatar_url=avatar,
                 from_station_name=from_name, to_station_name=to_name,
@@ -694,11 +709,13 @@ class TrackingManager:
                 )
                 # After 3 consecutive far updates → silent disconnect
                 if contributor.far_from_rail_count >= _MAX_FAR_WARNINGS:
-                    self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن السكة {_MAX_FAR_WARNINGS} مرات متتالية ({dist_str})")
-                    logger.info(
-                        "🚫 [%s] User %s exceeded %d far updates → silent disconnect",
-                        train_id, user_id, _MAX_FAR_WARNINGS,
-                    )
+                    # Only log the event once (at exact threshold) to prevent log spam
+                    if contributor.far_from_rail_count == _MAX_FAR_WARNINGS:
+                        self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن السكة {_MAX_FAR_WARNINGS} مرات متتالية ({dist_str})")
+                        logger.info(
+                            "🚫 [%s] User %s exceeded %d far updates → silent disconnect",
+                            train_id, user_id, _MAX_FAR_WARNINGS,
+                        )
                     return {
                         "ok": False,
                         "error": "silent_disconnect",
@@ -741,7 +758,10 @@ class TrackingManager:
             if train_lat != 0.0 or train_lng != 0.0:
                 dist_to_train = _haversine(lng, lat, train_lng, train_lat)
                 if dist_to_train > _MAX_TRAIN_DISTANCE_M:
-                    self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن القطار {dist_to_train:.0f}م")
+                    # Log only once per far-from-train episode
+                    if not contributor.far_from_train_logged:
+                        self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن القطار {dist_to_train:.0f}م")
+                        contributor.far_from_train_logged = True
                     logger.warning(
                         "🚫 [%s] User %s too far from train: %.0fm → silent disconnect",
                         train_id, user_id, dist_to_train,
@@ -759,6 +779,7 @@ class TrackingManager:
         contributor.speed = speed
         contributor.bearing = bearing
         contributor.dist_to_rail = distance if distance is not None else 0.0
+        contributor.far_from_train_logged = False  # reset: update accepted, contributor is near train
         # Persist last known position (survives room deletion/recreation)
         self._last_positions[user_id] = (lat, lng, speed)
 
@@ -1126,6 +1147,21 @@ class TrackingManager:
                     room.max_lng = 0.0
                     await cache_delete(f"train_pos:{train_id}")
                 self._cleanup_room(train_id)
+
+        # Phase 2: destroy rooms whose grace period has expired
+        for train_id in list(self._rooms.keys()):
+            room = self._rooms.get(train_id)
+            if not room:
+                continue
+            if (
+                room.empty_since > 0
+                and not room.contributors
+                and not room.waiting_list
+                and (now - room.empty_since) > _ROOM_GRACE_S
+            ):
+                del self._rooms[train_id]
+                logger.info("🗑️  [%s] Room destroyed (empty for %.0fs)", train_id, now - room.empty_since)
+
         return removed_count
 
     # ── Stats ───────────────────────────────────────────────────────────────────
@@ -1205,6 +1241,7 @@ class TrackingManager:
                 "leader_id": room.leader_id,
                 "contributors": contributors,
                 "waiting_list": waiting,
+                "empty_since": room.empty_since if room.empty_since > 0 else None,
             })
         return results
 
