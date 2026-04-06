@@ -52,81 +52,87 @@ class UserToggleCaptainRequest(BaseModel):
 async def get_user_stats():
     """Get user registration statistics: total, weekly, monthly, and daily breakdown."""
     from datetime import timedelta, date
+    from sqlalchemy import Date
 
-    async with AsyncSessionFactory() as session:
-        now = func.now()
+    try:
+        created_date = cast(Profile.created_at, Date)
 
-        # Total users
-        total_result = await session.execute(
-            select(func.count()).select_from(Profile).where(Profile.is_active == True)
-        )
-        total_users = total_result.scalar() or 0
-
-        # New users this week (last 7 days)
-        week_ago = date.today() - timedelta(days=7)
-        weekly_result = await session.execute(
-            select(func.count()).select_from(Profile)
-            .where(Profile.is_active == True)
-            .where(func.date(Profile.created_at) >= week_ago)
-        )
-        weekly_new = weekly_result.scalar() or 0
-
-        # New users this month (last 30 days)
-        month_ago = date.today() - timedelta(days=30)
-        monthly_result = await session.execute(
-            select(func.count()).select_from(Profile)
-            .where(Profile.is_active == True)
-            .where(func.date(Profile.created_at) >= month_ago)
-        )
-        monthly_new = monthly_result.scalar() or 0
-
-        # Daily breakdown for the last 30 days
-        daily_result = await session.execute(
-            select(
-                func.date(Profile.created_at).label("day"),
-                func.count().label("count"),
+        async with AsyncSessionFactory() as session:
+            # Total users
+            total_result = await session.execute(
+                select(func.count()).select_from(Profile).where(Profile.is_active == True)
             )
-            .where(Profile.is_active == True)
-            .where(func.date(Profile.created_at) >= month_ago)
-            .group_by(func.date(Profile.created_at))
-            .order_by(func.date(Profile.created_at).asc())
-        )
-        daily_rows = daily_result.all()
+            total_users = total_result.scalar() or 0
 
-        # Fill missing days with 0
-        daily_data = []
-        current = month_ago
-        daily_map = {str(row.day): row.count for row in daily_rows}
-        while current <= date.today():
-            day_str = str(current)
-            daily_data.append({"date": day_str, "count": daily_map.get(day_str, 0)})
-            current += timedelta(days=1)
-
-        # Weekly breakdown for the last 12 weeks
-        twelve_weeks_ago = date.today() - timedelta(weeks=12)
-        weekly_breakdown_result = await session.execute(
-            select(
-                func.date_trunc('week', Profile.created_at).label("week"),
-                func.count().label("count"),
+            # New users this week (last 7 days)
+            week_ago = date.today() - timedelta(days=7)
+            weekly_result = await session.execute(
+                select(func.count()).select_from(Profile)
+                .where(Profile.is_active == True)
+                .where(created_date >= week_ago)
             )
-            .where(Profile.is_active == True)
-            .where(func.date(Profile.created_at) >= twelve_weeks_ago)
-            .group_by(func.date_trunc('week', Profile.created_at))
-            .order_by(func.date_trunc('week', Profile.created_at).asc())
-        )
-        weekly_rows = weekly_breakdown_result.all()
-        weekly_data = [
-            {"week": row.week.strftime("%Y-%m-%d"), "count": row.count}
-            for row in weekly_rows
-        ]
+            weekly_new = weekly_result.scalar() or 0
 
-        return {
-            "total_users": total_users,
-            "weekly_new": weekly_new,
-            "monthly_new": monthly_new,
-            "daily": daily_data,
-            "weekly": weekly_data,
-        }
+            # New users this month (last 30 days)
+            month_ago = date.today() - timedelta(days=30)
+            monthly_result = await session.execute(
+                select(func.count()).select_from(Profile)
+                .where(Profile.is_active == True)
+                .where(created_date >= month_ago)
+            )
+            monthly_new = monthly_result.scalar() or 0
+
+            # Daily breakdown for the last 30 days
+            daily_result = await session.execute(
+                select(
+                    created_date.label("day"),
+                    func.count().label("count"),
+                )
+                .where(Profile.is_active == True)
+                .where(created_date >= month_ago)
+                .group_by(created_date)
+                .order_by(created_date.asc())
+            )
+            daily_rows = daily_result.all()
+
+            # Fill missing days with 0
+            daily_data = []
+            current = month_ago
+            daily_map = {str(row.day): row.count for row in daily_rows}
+            while current <= date.today():
+                day_str = str(current)
+                daily_data.append({"date": day_str, "count": daily_map.get(day_str, 0)})
+                current += timedelta(days=1)
+
+            # Weekly breakdown for the last 12 weeks
+            twelve_weeks_ago = date.today() - timedelta(weeks=12)
+            week_trunc = func.date_trunc('week', Profile.created_at)
+            weekly_breakdown_result = await session.execute(
+                select(
+                    week_trunc.label("week"),
+                    func.count().label("count"),
+                )
+                .where(Profile.is_active == True)
+                .where(created_date >= twelve_weeks_ago)
+                .group_by(week_trunc)
+                .order_by(week_trunc.asc())
+            )
+            weekly_rows = weekly_breakdown_result.all()
+            weekly_data = [
+                {"week": row.week.strftime("%Y-%m-%d"), "count": row.count}
+                for row in weekly_rows
+            ]
+
+            return {
+                "total_users": total_users,
+                "weekly_new": weekly_new,
+                "monthly_new": monthly_new,
+                "daily": daily_data,
+                "weekly": weekly_data,
+            }
+    except Exception as e:
+        logger.exception("Error fetching user stats")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("", dependencies=[Depends(get_admin_or_legacy_key)])
