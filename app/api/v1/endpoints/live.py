@@ -28,6 +28,7 @@ from app.models.profile import Profile
 from app.models.station import Station
 from app.models.trip import TripStop
 from app.services.tracking_manager import tracking_manager
+from app.services.train_chat_manager import train_chat_manager
 
 logger = logging.getLogger(__name__)
 
@@ -304,13 +305,16 @@ async def get_active_trains(
     for room in tracking_manager.all_rooms_info():
         if room["contributors_count"] == 0:
             continue
+        tid = room["train_id"]
+        chat_count = await train_chat_manager.get_message_count(tid)
         trains.append({
-            "train_id": room["train_id"],
+            "train_id": tid,
             "start_station": room.get("start_station", ""),
             "end_station": room.get("end_station", ""),
             "speed": room["speed"],
             "status": room["status"],
             "contributors_count": room["contributors_count"],
+            "chat_message_count": chat_count,
         })
     return {"trains": trains, "total": len(trains)}
 

@@ -48,6 +48,87 @@ class UserToggleCaptainRequest(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
+@router.get("/stats", dependencies=[Depends(get_admin_or_legacy_key)])
+async def get_user_stats():
+    """Get user registration statistics: total, weekly, monthly, and daily breakdown."""
+    from datetime import timedelta, date
+
+    async with AsyncSessionFactory() as session:
+        now = func.now()
+
+        # Total users
+        total_result = await session.execute(
+            select(func.count()).select_from(Profile).where(Profile.is_active == True)
+        )
+        total_users = total_result.scalar() or 0
+
+        # New users this week (last 7 days)
+        week_ago = date.today() - timedelta(days=7)
+        weekly_result = await session.execute(
+            select(func.count()).select_from(Profile)
+            .where(Profile.is_active == True)
+            .where(func.date(Profile.created_at) >= week_ago)
+        )
+        weekly_new = weekly_result.scalar() or 0
+
+        # New users this month (last 30 days)
+        month_ago = date.today() - timedelta(days=30)
+        monthly_result = await session.execute(
+            select(func.count()).select_from(Profile)
+            .where(Profile.is_active == True)
+            .where(func.date(Profile.created_at) >= month_ago)
+        )
+        monthly_new = monthly_result.scalar() or 0
+
+        # Daily breakdown for the last 30 days
+        daily_result = await session.execute(
+            select(
+                func.date(Profile.created_at).label("day"),
+                func.count().label("count"),
+            )
+            .where(Profile.is_active == True)
+            .where(func.date(Profile.created_at) >= month_ago)
+            .group_by(func.date(Profile.created_at))
+            .order_by(func.date(Profile.created_at).asc())
+        )
+        daily_rows = daily_result.all()
+
+        # Fill missing days with 0
+        daily_data = []
+        current = month_ago
+        daily_map = {str(row.day): row.count for row in daily_rows}
+        while current <= date.today():
+            day_str = str(current)
+            daily_data.append({"date": day_str, "count": daily_map.get(day_str, 0)})
+            current += timedelta(days=1)
+
+        # Weekly breakdown for the last 12 weeks
+        twelve_weeks_ago = date.today() - timedelta(weeks=12)
+        weekly_breakdown_result = await session.execute(
+            select(
+                func.date_trunc('week', Profile.created_at).label("week"),
+                func.count().label("count"),
+            )
+            .where(Profile.is_active == True)
+            .where(func.date(Profile.created_at) >= twelve_weeks_ago)
+            .group_by(func.date_trunc('week', Profile.created_at))
+            .order_by(func.date_trunc('week', Profile.created_at).asc())
+        )
+        weekly_rows = weekly_breakdown_result.all()
+        weekly_data = [
+            {"week": row.week.strftime("%Y-%m-%d"), "count": row.count}
+            for row in weekly_rows
+        ]
+
+        return {
+            "total_users": total_users,
+            "weekly_new": weekly_new,
+            "monthly_new": monthly_new,
+            "daily": daily_data,
+            "weekly": weekly_data,
+        }
+
+
 @router.get("", dependencies=[Depends(get_admin_or_legacy_key)])
 async def list_users(
     page: int = Query(1, ge=1),
