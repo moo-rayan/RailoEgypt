@@ -410,6 +410,81 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
     }
 
 
+# ── Crowd Report ─────────────────────────────────────────────────────────────
+
+_CROWD_TTL = 6 * 3600        # 6 hours — covers most train journeys
+_CROWD_COOLDOWN = 3 * 3600   # 3 hours — per-user cooldown
+
+class CrowdReportRequest(BaseModel):
+    level: str  # "crowded" or "not_crowded"
+
+
+@router.post("/{train_id}/crowd-report")
+async def submit_crowd_report(
+    train_id: str,
+    body: CrowdReportRequest,
+    authorization: str = Header(...),
+):
+    """Submit a crowd level vote for a train. One vote per user every 3 hours."""
+    user = await require_authenticated_user(authorization)
+    user_id = user["sub"]
+
+    if body.level not in ("crowded", "not_crowded"):
+        raise HTTPException(status_code=400, detail="level must be 'crowded' or 'not_crowded'")
+
+    from app.core.cache import get_redis
+    r = await get_redis()
+
+    # Check per-user cooldown
+    cooldown_key = f"crowd:{train_id}:user:{user_id}"
+    if await r.exists(cooldown_key):
+        ttl_remaining = await r.ttl(cooldown_key)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Already reported. Try again in {ttl_remaining // 60} minutes.",
+        )
+
+    # Increment vote count
+    vote_key = f"crowd:{train_id}"
+    await r.hincrby(vote_key, body.level, 1)
+
+    # Set TTL on the vote key only if it doesn't have one yet
+    current_ttl = await r.ttl(vote_key)
+    if current_ttl < 0:
+        await r.expire(vote_key, _CROWD_TTL)
+
+    # Set per-user cooldown
+    await r.setex(cooldown_key, _CROWD_COOLDOWN, "1")
+
+    return {"ok": True, "level": body.level}
+
+
+@router.get("/{train_id}/crowd-report")
+async def get_crowd_report(
+    train_id: str,
+    authorization: str = Header(...),
+):
+    """Get current crowd report for a train."""
+    await require_authenticated_user(authorization)
+
+    from app.core.cache import get_redis
+    r = await get_redis()
+
+    vote_key = f"crowd:{train_id}"
+    data = await r.hgetall(vote_key)
+
+    crowded = int(data.get("crowded", 0))
+    not_crowded = int(data.get("not_crowded", 0))
+    total = crowded + not_crowded
+
+    return {
+        "train_id": train_id,
+        "crowded": crowded,
+        "not_crowded": not_crowded,
+        "total": total,
+    }
+
+
 @router.get("/dashboard/rooms", dependencies=[Depends(get_admin_or_legacy_key)])
 async def get_dashboard_rooms():
     """List all active tracking rooms with contributor details (for dashboard)."""
