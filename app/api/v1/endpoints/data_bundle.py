@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.admin_auth import require_fulladmin
+from app.core.admin_auth import require_admin
 from app.core.bundle_store import bundle_store
 from app.core.cache import get_redis
 from app.core.database import get_db
@@ -208,7 +208,7 @@ def _compute_version(raw: dict) -> str:
 
 @router.post(
     "/rebuild",
-    dependencies=[Depends(require_fulladmin)],
+    dependencies=[Depends(require_admin)],
 )
 async def rebuild_data_bundle(db: AsyncSession = Depends(get_db)):
     """

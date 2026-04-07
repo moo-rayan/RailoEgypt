@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
+from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.cache import cache_delete_pattern
 from app.core.database import get_db
 from app.crud.trains import train_crud
@@ -58,7 +58,7 @@ async def get_train(
     return TrainRead.model_validate(train).model_dump(mode="json")
 
 
-@router.post("", response_model=TrainRead, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_fulladmin)])
+@router.post("", response_model=TrainRead, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
 async def create_train(
     payload: TrainCreate,
     db: AsyncSession = Depends(get_db),
@@ -74,7 +74,7 @@ async def create_train(
     return result
 
 
-@router.patch("/{train_number}", response_model=TrainRead, dependencies=[Depends(require_fulladmin)])
+@router.patch("/{train_number}", response_model=TrainRead, dependencies=[Depends(require_admin)])
 async def update_train(
     train_number: str,
     payload: TrainUpdate,
@@ -88,7 +88,7 @@ async def update_train(
     return result
 
 
-@router.delete("/{train_number}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_fulladmin)])
+@router.delete("/{train_number}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_admin)])
 async def delete_train(
     train_number: str,
     db: AsyncSession = Depends(get_db),

@@ -7,7 +7,8 @@ proper user-based authentication.
 
 Admin Levels:
   - fulladmin: Full access to all endpoints and actions
-  - monitor:   Read-only access to stations, trains, live tracking
+  - monitor:   Full access to trains, stations, trips, live tracking.
+               No access to: notifications, app config, user bans, admin management.
 """
 
 import logging
@@ -133,11 +134,22 @@ async def get_admin_user(
     )
 
 
+async def require_admin(
+    admin: AdminUser = Depends(get_admin_user),
+) -> AdminUser:
+    """
+    Require any admin level (fulladmin or monitor).
+    Use this for operations that both roles should access (e.g. trains, stations, trips).
+    """
+    return admin
+
+
 async def require_fulladmin(
     admin: AdminUser = Depends(get_admin_user),
 ) -> AdminUser:
     """
-    Require fulladmin level. Use this for write/modify operations.
+    Require fulladmin level. Use this for sensitive operations
+    (e.g. notifications, app config, user bans, admin management).
     Monitor users will get 403.
     """
     if not admin.is_fulladmin:

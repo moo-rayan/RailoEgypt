@@ -4,7 +4,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
+from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.cache import cache_delete_pattern, cache_get, cache_set
 from app.core.database import get_db
 from app.crud.trips import trip_crud
@@ -86,7 +86,7 @@ class AddStopRequest(BaseModel):
     "/{trip_id}/stops",
     response_model=TripStopOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_fulladmin)],
+    dependencies=[Depends(require_admin)],
 )
 async def add_trip_stop(
     trip_id: int,
@@ -151,7 +151,7 @@ class UpdateStopRequest(BaseModel):
 @router.patch(
     "/{trip_id}/stops/{stop_id}",
     response_model=TripStopOut,
-    dependencies=[Depends(require_fulladmin)],
+    dependencies=[Depends(require_admin)],
 )
 async def update_trip_stop(
     trip_id: int,
@@ -183,7 +183,7 @@ async def update_trip_stop(
 @router.delete(
     "/{trip_id}/stops/{stop_id}",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(require_fulladmin)],
+    dependencies=[Depends(require_admin)],
 )
 async def remove_trip_stop(
     trip_id: int,
@@ -237,7 +237,7 @@ class CreateTripRequest(BaseModel):
     "",
     response_model=TripOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_fulladmin)],
+    dependencies=[Depends(require_admin)],
 )
 async def create_trip(
     body: CreateTripRequest,

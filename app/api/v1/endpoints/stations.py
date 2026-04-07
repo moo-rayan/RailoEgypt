@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
+from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.database import get_db
 from app.crud.stations import station_crud
 from app.schemas.station import StationCreate, StationListResponse, StationRead, StationUpdate
@@ -46,7 +46,7 @@ async def get_station(
     return StationRead.model_validate(station).model_dump(mode="json")
 
 
-@router.post("", response_model=StationRead, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_fulladmin)])
+@router.post("", response_model=StationRead, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
 async def create_station(
     payload: StationCreate,
     db: AsyncSession = Depends(get_db),
@@ -54,7 +54,7 @@ async def create_station(
     return await station_crud.create_from_schema(db, obj_in=payload)
 
 
-@router.patch("/{station_id}", response_model=StationRead, dependencies=[Depends(require_fulladmin)])
+@router.patch("/{station_id}", response_model=StationRead, dependencies=[Depends(require_admin)])
 async def update_station(
     station_id: int,
     payload: StationUpdate,
@@ -66,7 +66,7 @@ async def update_station(
     return await station_crud.update_from_schema(db, db_obj=station, obj_in=payload)
 
 
-@router.delete("/{station_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_fulladmin)])
+@router.delete("/{station_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_admin)])
 async def delete_station(
     station_id: int,
     db: AsyncSession = Depends(get_db),
