@@ -143,6 +143,43 @@ async def add_trip_stop(
     return TripStopOut.model_validate(fresh)
 
 
+class UpdateStopRequest(BaseModel):
+    time_ar: str | None = None
+    time_en: str | None = None
+
+
+@router.patch(
+    "/{trip_id}/stops/{stop_id}",
+    response_model=TripStopOut,
+    dependencies=[Depends(require_fulladmin)],
+)
+async def update_trip_stop(
+    trip_id: int,
+    stop_id: int,
+    body: UpdateStopRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update a stop's time."""
+    result = await db.execute(
+        select(TripStop)
+        .options(selectinload(TripStop.station))
+        .where(TripStop.id == stop_id, TripStop.trip_id == trip_id)
+    )
+    stop = result.scalar_one_or_none()
+    if not stop:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stop not found")
+
+    if body.time_ar is not None:
+        stop.time_ar = body.time_ar
+    if body.time_en is not None:
+        stop.time_en = body.time_en
+
+    await db.commit()
+    await db.refresh(stop)
+    await cache_delete_pattern("trips:*")
+    return TripStopOut.model_validate(stop)
+
+
 @router.delete(
     "/{trip_id}/stops/{stop_id}",
     status_code=status.HTTP_200_OK,
