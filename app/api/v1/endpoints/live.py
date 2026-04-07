@@ -437,8 +437,7 @@ async def submit_crowd_report(
     authorization: str = Header(...),
 ):
     """Submit a crowd level vote for a train. One vote per user every 3 hours."""
-    user = await require_authenticated_user(authorization)
-    user_id = user["sub"]
+    user_id = await require_authenticated_user(authorization)
 
     if body.level not in ("crowded", "not_crowded"):
         raise HTTPException(status_code=400, detail="level must be 'crowded' or 'not_crowded'")
