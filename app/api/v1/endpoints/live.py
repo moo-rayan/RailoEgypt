@@ -301,12 +301,21 @@ async def get_active_trains(
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+    from app.core.cache import get_redis
+    r = await get_redis()
+
     trains = []
     for room in tracking_manager.all_rooms_info():
         if room["contributors_count"] == 0:
             continue
         tid = room["train_id"]
         chat_count = await train_chat_manager.get_message_count(tid)
+
+        # Fetch crowd report from Redis
+        crowd_data = await r.hgetall(f"crowd:{tid}")
+        crowded = int(crowd_data.get("crowded", 0))
+        not_crowded = int(crowd_data.get("not_crowded", 0))
+
         trains.append({
             "train_id": tid,
             "start_station": room.get("start_station", ""),
@@ -315,6 +324,8 @@ async def get_active_trains(
             "status": room["status"],
             "contributors_count": room["contributors_count"],
             "chat_message_count": chat_count,
+            "crowd_crowded": crowded,
+            "crowd_not_crowded": not_crowded,
         })
     return {"trains": trains, "total": len(trains)}
 
