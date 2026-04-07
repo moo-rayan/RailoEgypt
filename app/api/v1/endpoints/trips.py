@@ -184,6 +184,72 @@ async def remove_trip_stop(
     return {"ok": True}
 
 
+class CreateTripRequest(BaseModel):
+    train_number: str
+    from_station_id: int | None = None
+    to_station_id: int | None = None
+    departure_ar: str = ""
+    departure_en: str = ""
+    arrival_ar: str = ""
+    arrival_en: str = ""
+    duration_ar: str = ""
+    duration_en: str = ""
+
+
+@router.post(
+    "",
+    response_model=TripOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_fulladmin)],
+)
+async def create_trip(
+    body: CreateTripRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new trip for a train."""
+    from app.models.station import Station
+
+    # Verify train exists
+    from app.crud.trains import train_crud
+    train = await train_crud.get_by_train_id(db, body.train_number)
+    if not train:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Train not found")
+
+    # Resolve station names
+    from_ar, from_en, to_ar, to_en = "", "", "", ""
+    if body.from_station_id:
+        st = await db.get(Station, body.from_station_id)
+        if st:
+            from_ar, from_en = st.name_ar, st.name_en
+    if body.to_station_id:
+        st = await db.get(Station, body.to_station_id)
+        if st:
+            to_ar, to_en = st.name_ar, st.name_en
+
+    new_trip = Trip(
+        train_number=body.train_number,
+        from_station_id=body.from_station_id,
+        to_station_id=body.to_station_id,
+        departure_ar=body.departure_ar,
+        departure_en=body.departure_en,
+        arrival_ar=body.arrival_ar,
+        arrival_en=body.arrival_en,
+        duration_ar=body.duration_ar,
+        duration_en=body.duration_en,
+        stops_count=0,
+        has_fares=False,
+    )
+    db.add(new_trip)
+    await db.flush()
+    trip_id = new_trip.id
+    await db.commit()
+
+    # Re-query with relationships
+    trip = await trip_crud.get_by_id(db, trip_id)
+    await cache_delete_pattern("trips:*")
+    return TripOut.model_validate(trip).model_dump(mode="json")
+
+
 @router.get("/by-train/{train_number}", response_model=list[TripOut], dependencies=[Depends(get_admin_or_legacy_key)])
 async def get_trips_by_train(
     train_number: str,
@@ -196,7 +262,7 @@ async def get_trips_by_train(
 
     trips = await trip_crud.get_by_train_number(db, train_number)
     if not trips:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No trips found for this train")
+        return []
     result = [TripOut.model_validate(t).model_dump(mode="json") for t in trips]
     await cache_set(ck, result, ttl=_DETAIL_TTL)
     return result
