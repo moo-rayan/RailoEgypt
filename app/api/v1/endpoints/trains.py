@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.cache import cache_delete_pattern
 from app.core.database import get_db
 from app.crud.trains import train_crud
+from app.crud.stations import station_crud
+from app.models.trip import Trip
 from app.schemas.train import (
     TrainCreate,
     TrainListResponse,
@@ -70,7 +73,26 @@ async def create_train(
             detail=f"Train {payload.train_id} already exists",
         )
     result = await train_crud.create_from_schema(db, obj_in=payload)
+
+    # Auto-create a default trip linked to this train
+    from_station = await station_crud.get_by_name_ar(db, payload.start_station_ar) if payload.start_station_ar else None
+    to_station = await station_crud.get_by_name_ar(db, payload.end_station_ar) if payload.end_station_ar else None
+    trip = Trip(
+        train_number=payload.train_id,
+        from_station_id=from_station.id if from_station else None,
+        to_station_id=to_station.id if to_station else None,
+        departure_ar=payload.departure_ar,
+        departure_en=payload.departure_en,
+        arrival_ar=payload.arrival_ar,
+        arrival_en=payload.arrival_en,
+        stops_count=payload.stops_count,
+        has_fares=False,
+    )
+    db.add(trip)
+    await db.commit()
+
     await cache_delete_pattern("trains:*")
+    await cache_delete_pattern("trips:*")
     return result
 
 
@@ -84,7 +106,33 @@ async def update_train(
     if not train:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Train not found")
     result = await train_crud.update_from_schema(db, db_obj=train, obj_in=payload)
+
+    # Sync the primary trip (first trip) with updated train data
+    trip_result = await db.execute(
+        select(Trip).where(Trip.train_number == train_number).order_by(Trip.id).limit(1)
+    )
+    trip = trip_result.scalar_one_or_none()
+    if trip:
+        if payload.departure_ar is not None:
+            trip.departure_ar = payload.departure_ar
+        if payload.departure_en is not None:
+            trip.departure_en = payload.departure_en
+        if payload.arrival_ar is not None:
+            trip.arrival_ar = payload.arrival_ar
+        if payload.arrival_en is not None:
+            trip.arrival_en = payload.arrival_en
+        if payload.stops_count is not None:
+            trip.stops_count = payload.stops_count
+        if payload.start_station_ar is not None:
+            from_station = await station_crud.get_by_name_ar(db, payload.start_station_ar) if payload.start_station_ar else None
+            trip.from_station_id = from_station.id if from_station else None
+        if payload.end_station_ar is not None:
+            to_station = await station_crud.get_by_name_ar(db, payload.end_station_ar) if payload.end_station_ar else None
+            trip.to_station_id = to_station.id if to_station else None
+        await db.commit()
+
     await cache_delete_pattern("trains:*")
+    await cache_delete_pattern("trips:*")
     return result
 
 
