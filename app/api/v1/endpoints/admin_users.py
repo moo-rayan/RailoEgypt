@@ -331,3 +331,57 @@ async def toggle_captain_endpoint(body: UserToggleCaptainRequest, request: Reque
         metadata={"target_user": body.user_id, "is_captain": body.is_captain},
     )
     return {"ok": True, "is_captain": body.is_captain}
+
+
+@router.post("/toggle-admin")
+async def toggle_admin_endpoint(
+    body: UserToggleAdminRequest,
+    request: Request,
+    admin: "AdminUser" = Depends(require_fulladmin),
+):
+    """Toggle admin status and set admin level for a user. Fulladmin only."""
+    from app.core.admin_auth import AdminUser
+
+    # Prevent removing your own admin status
+    if body.user_id == admin.user_id and not body.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="لا يمكنك إزالة صلاحيات الأدمن من نفسك",
+        )
+
+    # Validate admin_level
+    if body.is_admin:
+        if body.admin_level not in ("fulladmin", "monitor"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="مستوى الأدمن يجب أن يكون fulladmin أو monitor",
+            )
+    else:
+        body.admin_level = None
+
+    async with AsyncSessionFactory() as session:
+        result = await session.execute(
+            select(Profile).where(Profile.id == body.user_id)
+        )
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        from sqlalchemy import update
+        await session.execute(
+            update(Profile)
+            .where(Profile.id == body.user_id)
+            .values(is_admin=body.is_admin, admin_level=body.admin_level)
+        )
+        await session.commit()
+
+    audit.log_admin_action(
+        request,
+        action="toggle_admin",
+        metadata={
+            "target_user": body.user_id,
+            "is_admin": body.is_admin,
+            "admin_level": body.admin_level,
+        },
+    )
+    return {"ok": True, "is_admin": body.is_admin, "admin_level": body.admin_level}
