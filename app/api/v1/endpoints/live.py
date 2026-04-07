@@ -423,11 +423,13 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
 
 # ── Crowd Report ─────────────────────────────────────────────────────────────
 
-_CROWD_TTL = 6 * 3600        # 6 hours — covers most train journeys
-_CROWD_COOLDOWN = 3 * 3600   # 3 hours — per-user cooldown
+_CROWD_TTL_DEFAULT = 6 * 3600   # fallback if client doesn't send ttl
+_CROWD_TTL_MAX = 14 * 3600     # safety cap: 14 hours max
+_CROWD_COOLDOWN = 3 * 3600     # 3 hours — per-user cooldown
 
 class CrowdReportRequest(BaseModel):
     level: str  # "crowded" or "not_crowded"
+    ttl_seconds: int | None = None  # remaining trip duration from client
 
 
 @router.post("/{train_id}/crowd-report")
@@ -461,7 +463,10 @@ async def submit_crowd_report(
     # Set TTL on the vote key only if it doesn't have one yet
     current_ttl = await r.ttl(vote_key)
     if current_ttl < 0:
-        await r.expire(vote_key, _CROWD_TTL)
+        ttl = _CROWD_TTL_DEFAULT
+        if body.ttl_seconds and 60 < body.ttl_seconds <= _CROWD_TTL_MAX:
+            ttl = body.ttl_seconds
+        await r.expire(vote_key, ttl)
 
     # Set per-user cooldown
     await r.setex(cooldown_key, _CROWD_COOLDOWN, "1")
