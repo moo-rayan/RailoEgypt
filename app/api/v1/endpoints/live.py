@@ -425,7 +425,6 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
 
 _CROWD_TTL_DEFAULT = 6 * 3600   # fallback if client doesn't send ttl
 _CROWD_TTL_MAX = 14 * 3600     # safety cap: 14 hours max
-_CROWD_COOLDOWN = 3 * 3600     # 3 hours — per-user cooldown
 
 class CrowdReportRequest(BaseModel):
     level: str  # "crowded" or "not_crowded"
@@ -438,7 +437,7 @@ async def submit_crowd_report(
     body: CrowdReportRequest,
     authorization: str = Header(...),
 ):
-    """Submit a crowd level vote for a train. One vote per user every 3 hours."""
+    """Submit or update a crowd level vote for a train. One updatable vote per user."""
     user_id = await require_authenticated_user(authorization)
 
     if body.level not in ("crowded", "not_crowded"):
@@ -447,17 +446,29 @@ async def submit_crowd_report(
     from app.core.cache import get_redis
     r = await get_redis()
 
-    # Check global per-user cooldown (one train every 3 hours)
-    cooldown_key = f"crowd:user:{user_id}"
-    if await r.exists(cooldown_key):
-        ttl_remaining = await r.ttl(cooldown_key)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Already reported. Try again in {ttl_remaining // 60} minutes.",
-        )
-
-    # Increment vote count
     vote_key = f"crowd:{train_id}"
+    user_vote_key = f"crowd:{train_id}:vote:{user_id}"
+
+    # Check if user already voted on this train
+    old_vote = await r.get(user_vote_key)
+    if old_vote:
+        old_vote = old_vote if isinstance(old_vote, str) else old_vote.decode()
+
+    if old_vote == body.level:
+        # Same vote — no change needed
+        return {"ok": True, "level": body.level, "changed": False}
+
+    if old_vote:
+        # Decrement old vote
+        await r.hincrby(vote_key, old_vote, -1)
+        # Prevent negative counts
+        current = await r.hget(vote_key, old_vote)
+        if current is not None:
+            val = int(current)
+            if val < 0:
+                await r.hset(vote_key, old_vote, 0)
+
+    # Increment new vote
     await r.hincrby(vote_key, body.level, 1)
 
     # Set TTL on the vote key only if it doesn't have one yet
@@ -468,10 +479,17 @@ async def submit_crowd_report(
             ttl = body.ttl_seconds
         await r.expire(vote_key, ttl)
 
-    # Set per-user cooldown
-    await r.setex(cooldown_key, _CROWD_COOLDOWN, "1")
+    # Store user's vote with same TTL as the vote key
+    vote_ttl = await r.ttl(vote_key)
+    if vote_ttl > 0:
+        await r.setex(user_vote_key, vote_ttl, body.level)
+    else:
+        ttl = _CROWD_TTL_DEFAULT
+        if body.ttl_seconds and 60 < body.ttl_seconds <= _CROWD_TTL_MAX:
+            ttl = body.ttl_seconds
+        await r.setex(user_vote_key, ttl, body.level)
 
-    return {"ok": True, "level": body.level}
+    return {"ok": True, "level": body.level, "changed": old_vote is not None}
 
 
 @router.get("/{train_id}/crowd-report")
@@ -479,14 +497,19 @@ async def get_crowd_report(
     train_id: str,
     authorization: str = Header(...),
 ):
-    """Get current crowd report for a train."""
-    await require_authenticated_user(authorization)
+    """Get current crowd report for a train, including user's own vote."""
+    user_id = await require_authenticated_user(authorization)
 
     from app.core.cache import get_redis
     r = await get_redis()
 
     vote_key = f"crowd:{train_id}"
+    user_vote_key = f"crowd:{train_id}:vote:{user_id}"
+
     data = await r.hgetall(vote_key)
+    user_vote = await r.get(user_vote_key)
+    if user_vote and not isinstance(user_vote, str):
+        user_vote = user_vote.decode()
 
     crowded = int(data.get("crowded", 0))
     not_crowded = int(data.get("not_crowded", 0))
@@ -497,6 +520,7 @@ async def get_crowd_report(
         "crowded": crowded,
         "not_crowded": not_crowded,
         "total": total,
+        "my_vote": user_vote,
     }
 
 
