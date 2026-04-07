@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
+from app.core.cache import cache_delete_pattern
 from app.core.database import get_db
 from app.crud.trains import train_crud
 from app.schemas.train import (

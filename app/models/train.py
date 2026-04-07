@@ -35,4 +35,4 @@ class Train(Base):
         nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
-    trips: Mapped[list["Trip"]] = relationship("Trip", back_populates="train")
+    trips: Mapped[list["Trip"]] = relationship("Trip", back_populates="train", passive_deletes=True)
