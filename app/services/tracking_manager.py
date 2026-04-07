@@ -149,8 +149,8 @@ class TrackingManager:
         self._user_captains: dict[str, bool] = {}  # user_id → is_captain
         self._user_silent: dict[str, bool] = {}  # user_id → is_silent (alert-based contribution)
         self._last_positions: dict[str, tuple] = {}  # user_id → (lat, lng, speed)
-        # Deduplication: one contribution alert per user per train per hour
-        # key = "{user_id}:{train_id}", value = last alert timestamp
+        # Deduplication: one contribution alert per user per train per 4 hours
+        # key = "{user_id}:{train_id}", value = last alert monotonic timestamp
         self._contribution_alert_sent: dict[str, float] = {}
         
         # HTTP listener tracking: key = "user_id:train_id", value = last poll timestamp
@@ -1394,12 +1394,17 @@ class TrackingManager:
         from_station: str, to_station: str,
     ) -> None:
         """Fire-and-forget: create a dashboard alert for a new contribution.
-        Deduplication: at most one alert per contributor per train per hour.
+        Deduplication: at most one alert per contributor per train per 4 hours.
+        Two layers:
+          1. In-memory dict (fast, but lost on restart)
+          2. DB-level check in create_alert (persistent)
         """
+        _DEDUP_WINDOW_S = 14400  # 4 hours
+
         dedup_key = f"{user_id}:{train_id}"
         now = time.monotonic()
         last_sent = self._contribution_alert_sent.get(dedup_key, 0.0)
-        if now - last_sent < 3600:  # 1 hour window
+        if now - last_sent < _DEDUP_WINDOW_S:
             logger.debug(
                 "⏭️ Skipping duplicate contribution alert for %s on train %s (%.0fs ago)",
                 user_id[:8], train_id, now - last_sent,
@@ -1423,6 +1428,7 @@ class TrackingManager:
                     "to_station": to_station,
                 },
                 navigate_to=f"/admin/contributors?train={train_id}",
+                dedup_hours=4,
             )
         except Exception as exc:
             logger.error("Failed to create contribution alert: %s", exc)
