@@ -445,8 +445,8 @@ async def submit_crowd_report(
     from app.core.cache import get_redis
     r = await get_redis()
 
-    # Check per-user cooldown
-    cooldown_key = f"crowd:{train_id}:user:{user_id}"
+    # Check global per-user cooldown (one train every 3 hours)
+    cooldown_key = f"crowd:user:{user_id}"
     if await r.exists(cooldown_key):
         ttl_remaining = await r.ttl(cooldown_key)
         raise HTTPException(
