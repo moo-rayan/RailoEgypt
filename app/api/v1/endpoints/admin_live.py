@@ -164,6 +164,14 @@ async def get_admin_rooms():
     # Merge: active rooms first, then historical (no duplicates)
     all_rooms = active_rooms + historical_rooms
 
+    # Enrich with wrong-location reports from Redis
+    from app.core.cache import get_redis
+    redis = await get_redis()
+    for room in all_rooms:
+        tid = room.get("train_id", "")
+        count = await redis.hget(f"wrong_loc:{tid}", "count") if tid else None
+        room["wrong_location_reports"] = int(count) if count else 0
+
     total_contributors = sum(r["contributors_count"] for r in all_rooms)
     total_waiting = sum(r.get("waiting_count", 0) for r in all_rooms)
     return {

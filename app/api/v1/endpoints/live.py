@@ -316,6 +316,9 @@ async def get_active_trains(
         crowded = int(crowd_data.get("crowded", 0))
         not_crowded = int(crowd_data.get("not_crowded", 0))
 
+        # Fetch wrong-location reports from Redis
+        wrong_loc_count = int(await r.hget(f"wrong_loc:{tid}", "count") or 0)
+
         trains.append({
             "train_id": tid,
             "start_station": room.get("start_station", ""),
@@ -326,6 +329,7 @@ async def get_active_trains(
             "chat_message_count": chat_count,
             "crowd_crowded": crowded,
             "crowd_not_crowded": not_crowded,
+            "wrong_location_reports": wrong_loc_count,
         })
     return {"trains": trains, "total": len(trains)}
 
@@ -521,6 +525,89 @@ async def get_crowd_report(
         "not_crowded": not_crowded,
         "total": total,
         "my_vote": user_vote,
+    }
+
+
+# ── Wrong Location Report ─────────────────────────────────────────────────────
+
+_WRONG_LOC_COOLDOWN_S = 15 * 60   # 15 minutes between reports per user per train
+_WRONG_LOC_TTL = 6 * 3600         # reports expire after 6 hours (same as crowd)
+
+
+@router.post("/{train_id}/wrong-location-report")
+async def submit_wrong_location_report(
+    train_id: str,
+    authorization: str = Header(...),
+):
+    """Report that a train's displayed location is wrong. 15-min cooldown per user."""
+    user_id = await require_authenticated_user(authorization)
+
+    from app.core.cache import get_redis
+    r = await get_redis()
+
+    user_cooldown_key = f"wrong_loc:{train_id}:cd:{user_id}"
+    report_key = f"wrong_loc:{train_id}"
+
+    # Check cooldown
+    existing = await r.get(user_cooldown_key)
+    if existing:
+        ttl = await r.ttl(user_cooldown_key)
+        remaining_min = max(1, (ttl + 59) // 60)
+        return {
+            "ok": False,
+            "error": "cooldown",
+            "remaining_seconds": ttl if ttl > 0 else 0,
+            "message_ar": f"يمكنك الإبلاغ مجدداً بعد {remaining_min} دقيقة",
+        }
+
+    # Increment report count
+    await r.hincrby(report_key, "count", 1)
+
+    # Record reporter
+    import time as _time
+    await r.hset(report_key, f"user:{user_id}", str(int(_time.time())))
+
+    # Set TTL on report key only if not already set
+    current_ttl = await r.ttl(report_key)
+    if current_ttl < 0:
+        await r.expire(report_key, _WRONG_LOC_TTL)
+
+    # Set user cooldown
+    await r.setex(user_cooldown_key, _WRONG_LOC_COOLDOWN_S, "1")
+
+    # Get updated count
+    count = int(await r.hget(report_key, "count") or 0)
+
+    logger.info("⚠️ [%s] Wrong location report from %s (total: %d)", train_id, user_id[:8], count)
+
+    return {"ok": True, "total_reports": count}
+
+
+@router.get("/{train_id}/wrong-location-report")
+async def get_wrong_location_report(
+    train_id: str,
+    authorization: str = Header(...),
+):
+    """Get wrong-location report count for a train."""
+    user_id = await require_authenticated_user(authorization)
+
+    from app.core.cache import get_redis
+    r = await get_redis()
+
+    report_key = f"wrong_loc:{train_id}"
+    user_cooldown_key = f"wrong_loc:{train_id}:cd:{user_id}"
+
+    count = int(await r.hget(report_key, "count") or 0)
+
+    # Check if user can report
+    cooldown_ttl = await r.ttl(user_cooldown_key)
+    can_report = cooldown_ttl <= 0
+
+    return {
+        "train_id": train_id,
+        "total_reports": count,
+        "can_report": can_report,
+        "cooldown_remaining": max(0, cooldown_ttl) if not can_report else 0,
     }
 
 
