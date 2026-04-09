@@ -36,6 +36,7 @@ class AppConfigResponse(BaseModel):
     update_message_en: str
     store_url_android: str
     store_url_ios: str
+    station_schedule_check_enabled: bool
 
 
 class AppConfigUpdateRequest(BaseModel):
@@ -49,6 +50,7 @@ class AppConfigUpdateRequest(BaseModel):
     update_message_en: Optional[str] = None
     store_url_android: Optional[str] = None
     store_url_ios: Optional[str] = None
+    station_schedule_check_enabled: Optional[bool] = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -76,6 +78,7 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
             update_message_en="A new version is available. Please update to continue.",
             store_url_android="",
             store_url_ios="",
+            station_schedule_check_enabled=True,
         )
 
     return AppConfigResponse(
@@ -89,6 +92,7 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
         update_message_en=config.update_message_en,
         store_url_android=config.store_url_android,
         store_url_ios=config.store_url_ios,
+        station_schedule_check_enabled=config.station_schedule_check_enabled,
     )
 
 
@@ -132,4 +136,5 @@ async def update_app_config(
         update_message_en=config.update_message_en,
         store_url_android=config.store_url_android,
         store_url_ios=config.store_url_ios,
+        station_schedule_check_enabled=config.station_schedule_check_enabled,
     )

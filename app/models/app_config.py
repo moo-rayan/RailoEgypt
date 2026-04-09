@@ -27,4 +27,5 @@ class AppConfig(Base):
     update_message_en: Mapped[str] = mapped_column(Text, nullable=False, default="A new version is available. Please update to continue.")
     store_url_android: Mapped[str] = mapped_column(Text, nullable=False, default="")
     store_url_ios: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    station_schedule_check_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     updated_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now(), onupdate=func.now())
