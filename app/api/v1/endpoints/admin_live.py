@@ -248,6 +248,22 @@ async def clear_train_position_endpoint(train_id: str, request: Request):
     return {"ok": True, "message": f"Position data cleared for train {train_id}"}
 
 
+@router.delete("/clear-wrong-location/{train_id}", dependencies=[Depends(require_fulladmin)])
+async def clear_wrong_location_reports(train_id: str, request: Request):
+    """Clear wrong-location reports for a train from Redis."""
+    from app.core.cache import get_redis
+    redis = await get_redis()
+    key = f"wrong_loc:{train_id}"
+    deleted = await redis.delete(key)
+    audit.log_admin_action(
+        request,
+        action="clear_wrong_location_reports",
+        metadata={"train_id": train_id},
+    )
+    logger.info("🗑️ Admin cleared wrong-location reports for train %s (existed=%s)", train_id, bool(deleted))
+    return {"ok": True, "message": f"Wrong-location reports cleared for train {train_id}"}
+
+
 @router.post("/suspend", dependencies=[Depends(require_fulladmin)])
 async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
     """
