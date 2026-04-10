@@ -264,6 +264,27 @@ async def clear_wrong_location_reports(train_id: str, request: Request):
     return {"ok": True, "message": f"Wrong-location reports cleared for train {train_id}"}
 
 
+@router.get("/suspensions/{train_id}", dependencies=[Depends(get_admin_or_legacy_key)])
+async def list_suspensions(train_id: str):
+    """List all currently suspended contributors for a specific train (from Redis)."""
+    from app.core.cache import get_redis
+    r = await get_redis()
+    prefix = f"suspended:{train_id}:"
+    suspensions = []
+    async for key in r.scan_iter(match=f"{prefix}*"):
+        key_str = key if isinstance(key, str) else key.decode()
+        user_id = key_str[len(prefix):]
+        reason = await r.get(key)
+        ttl = await r.ttl(key)
+        suspensions.append({
+            "user_id": user_id,
+            "train_id": train_id,
+            "reason": (reason.decode() if isinstance(reason, bytes) else reason) if reason else "",
+            "ttl_seconds": max(0, ttl) if ttl > 0 else None,  # None = no expiry / permanent
+        })
+    return {"total": len(suspensions), "suspensions": suspensions}
+
+
 @router.post("/suspend", dependencies=[Depends(require_fulladmin)])
 async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
     """
