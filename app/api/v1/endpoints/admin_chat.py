@@ -139,7 +139,7 @@ class AdminMessageRequest(BaseModel):
     admin_name: str = Field("المشرف", max_length=30)
 
 
-@router.post("/{train_id}/send", dependencies=[Depends(require_fulladmin)])
+@router.post("/{train_id}/send", dependencies=[Depends(get_admin_or_legacy_key)])
 async def admin_send_message(train_id: str, body: AdminMessageRequest):
     """Send a message as admin to the train chat."""
     result = await train_chat_manager.process_admin_message(
