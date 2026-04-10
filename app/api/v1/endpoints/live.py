@@ -134,6 +134,16 @@ async def post_contributor_location(
             "position_data": None,
         }
 
+    # Suspension check (Redis-persisted — survives room destruction / server restart)
+    if await tracking_manager.is_suspended_in_redis(train_id, user_id):
+        return {
+            "ok": False,
+            "status": "suspended",
+            "error": "suspended",
+            "message_ar": "تم إيقاف مساهمتك مؤقتاً من قبل الإدارة",
+            "position_data": None,
+        }
+
     # Store user metadata
     user_meta = user.get("user_metadata", {}) or {}
     avatar_url = user_meta.get("avatar_url", "") or user_meta.get("picture", "") or ""

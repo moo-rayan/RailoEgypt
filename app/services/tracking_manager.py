@@ -245,6 +245,25 @@ class TrackingManager:
             room.empty_since = time.time()
             logger.info("⏳ [%s] Room empty — grace period started (%.0fs)", train_id, _ROOM_GRACE_S)
 
+    async def _clear_wrong_location_reports(self, train_id: str) -> None:
+        """Delete wrong-location reports + user cooldowns for a train from Redis.
+
+        Called when all contributors leave so stale reports don't linger
+        on the dashboard and users can re-report on the next contribution.
+        """
+        try:
+            from app.core.cache import get_redis
+            r = await get_redis()
+            report_key = f"wrong_loc:{train_id}"
+            # Collect user cooldown keys for this train
+            cd_keys = [k async for k in r.scan_iter(match=f"wrong_loc:{train_id}:cd:*")]
+            to_delete = [report_key] + cd_keys
+            if to_delete:
+                await r.delete(*to_delete)
+            logger.info("🧹 [%s] Cleared wrong-location reports (%d keys)", train_id, len(to_delete))
+        except Exception as exc:
+            logger.warning("⚠️ [%s] Failed to clear wrong-loc reports: %s", train_id, exc)
+
     # ── Set trip metadata (stations) ──────────────────────────────────────
 
     def set_trip_info(
@@ -505,6 +524,7 @@ class TrackingManager:
                 room.max_lng = 0.0
                 room.last_best_user_id = None
                 await cache_delete(f"train_pos:{train_id}")
+                await self._clear_wrong_location_reports(train_id)
                 logger.info(
                     "⏸️  [%s] No contributors — all state reset, Redis cache cleared",
                     train_id,
@@ -543,9 +563,12 @@ class TrackingManager:
 
     _KICK_BLOCK_SECONDS = 300  # 5 minutes block after kick
 
+    _SUSPEND_DEFAULT_TTL = 86400  # 24h default for "permanent" suspensions in Redis
+
     async def suspend_contributor(self, train_id: str, user_id: str, duration_minutes: int = 0, reason: str = "") -> bool:
         """Suspend a contributor: remove from room + block re-joining for the duration.
         duration_minutes=0 means permanent until manually unsuspended.
+        Persists to Redis so it survives room destruction and server restart.
         """
         room = self._rooms.get(train_id)
         if not room or user_id not in room.contributors:
@@ -557,6 +580,15 @@ class TrackingManager:
             room.suspended_until[user_id] = float("inf")
         detail = reason or (f"معلق لـ {duration_minutes} دقيقة" if duration_minutes > 0 else "معلق بشكل دائم")
         self._log_event(room, "suspend", user_id, detail)
+        # Persist suspension in Redis (survives room destruction / server restart)
+        try:
+            from app.core.cache import get_redis
+            r = await get_redis()
+            redis_key = f"suspended:{train_id}:{user_id}"
+            ttl = duration_minutes * 60 if duration_minutes > 0 else self._SUSPEND_DEFAULT_TTL
+            await r.setex(redis_key, ttl, reason or "admin")
+        except Exception as exc:
+            logger.warning("⚠️ [%s] Failed to persist suspension to Redis: %s", train_id, exc)
         # Remove from room immediately (like kick) so dashboard sees the change instantly
         await self.remove_participant(train_id, user_id)
         logger.info("🚫 [%s] Contributor %s suspended & removed (duration=%s min): %s",
@@ -564,17 +596,36 @@ class TrackingManager:
         return True
 
     async def unsuspend_contributor(self, train_id: str, user_id: str) -> bool:
-        """Remove suspension from a contributor."""
+        """Remove suspension from a contributor (in-memory + Redis)."""
+        found = False
         room = self._rooms.get(train_id)
-        if not room:
-            return False
-        if user_id not in room.suspended_until:
-            return False
-        del room.suspended_until[user_id]
-        if user_id in room.contributors:
-            self._log_event(room, "unsuspend", user_id, "تم إلغاء الإيقاف")
+        if room and user_id in room.suspended_until:
+            del room.suspended_until[user_id]
+            if user_id in room.contributors:
+                self._log_event(room, "unsuspend", user_id, "تم إلغاء الإيقاف")
+            found = True
+        # Always try to delete from Redis too
+        try:
+            from app.core.cache import get_redis
+            r = await get_redis()
+            deleted = await r.delete(f"suspended:{train_id}:{user_id}")
+            if deleted:
+                found = True
+        except Exception as exc:
+            logger.warning("⚠️ [%s] Failed to delete suspension from Redis: %s", train_id, exc)
+        if found:
             logger.info("✅ [%s] Contributor %s unsuspended", train_id, user_id[:8])
-        return True
+        return found
+
+    @staticmethod
+    async def is_suspended_in_redis(train_id: str, user_id: str) -> bool:
+        """Check if a user is suspended for a specific train (Redis-persisted)."""
+        try:
+            from app.core.cache import get_redis
+            r = await get_redis()
+            return await r.exists(f"suspended:{train_id}:{user_id}") > 0
+        except Exception:
+            return False
 
     async def kick_contributor(self, train_id: str, user_id: str, reason: str = "") -> bool:
         """Remove a contributor and block them from re-joining for 5 minutes."""
@@ -1167,6 +1218,7 @@ class TrackingManager:
                     room.max_lat = 0.0
                     room.max_lng = 0.0
                     await cache_delete(f"train_pos:{train_id}")
+                    await self._clear_wrong_location_reports(train_id)
                     # Save room history for dashboard (12h)
                     await self._save_room_history(room)
                 self._cleanup_room(train_id)
