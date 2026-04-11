@@ -779,19 +779,18 @@ class TrackingManager:
                     train_id, user_id, dist_str,
                     contributor.far_from_rail_count, _MAX_FAR_WARNINGS,
                 )
-                # After 3 consecutive far updates → silent disconnect
+                # After 3 consecutive far updates → suspend (stops background service)
                 if contributor.far_from_rail_count >= _MAX_FAR_WARNINGS:
-                    # Only log the event once (at exact threshold) to prevent log spam
-                    if contributor.far_from_rail_count == _MAX_FAR_WARNINGS:
-                        self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن السكة {_MAX_FAR_WARNINGS} مرات متتالية ({dist_str})")
-                        logger.info(
-                            "🚫 [%s] User %s exceeded %d far updates → silent disconnect",
-                            train_id, user_id, _MAX_FAR_WARNINGS,
-                        )
+                    await self.suspend_contributor(
+                        train_id, user_id,
+                        duration_minutes=30,
+                        reason=f"فصل تلقائي — بعيد عن السكة {_MAX_FAR_WARNINGS} مرات متتالية ({dist_str})",
+                    )
                     return {
                         "ok": False,
-                        "error": "silent_disconnect",
+                        "error": "suspended",
                         "distance_m": distance,
+                        "message_ar": f"تم إيقاف مساهمتك تلقائياً — بعيد عن السكة ({dist_str})",
                     }
                 self._log_event(room, "far_warning", user_id, f"بعيد عن السكة {dist_str} ({contributor.far_from_rail_count}/{_MAX_FAR_WARNINGS})")
                 room.update_feed.append({
