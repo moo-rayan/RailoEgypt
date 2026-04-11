@@ -164,13 +164,23 @@ async def get_admin_rooms():
     # Merge: active rooms first, then historical (no duplicates)
     all_rooms = active_rooms + historical_rooms
 
-    # Enrich with wrong-location reports from Redis
+    # Enrich with wrong-location reports and crowd reports from Redis
     from app.core.cache import get_redis
     redis = await get_redis()
     for room in all_rooms:
         tid = room.get("train_id", "")
-        count = await redis.hget(f"wrong_loc:{tid}", "count") if tid else None
-        room["wrong_location_reports"] = int(count) if count else 0
+        if tid:
+            # Wrong location reports
+            count = await redis.hget(f"wrong_loc:{tid}", "count")
+            room["wrong_location_reports"] = int(count) if count else 0
+            # Crowd reports
+            crowd_data = await redis.hgetall(f"crowd:{tid}")
+            room["crowd_crowded"] = int(crowd_data.get("crowded", 0) if isinstance(crowd_data.get("crowded"), (str, int)) else (crowd_data.get(b"crowded", 0)))
+            room["crowd_not_crowded"] = int(crowd_data.get("not_crowded", 0) if isinstance(crowd_data.get("not_crowded"), (str, int)) else (crowd_data.get(b"not_crowded", 0)))
+        else:
+            room["wrong_location_reports"] = 0
+            room["crowd_crowded"] = 0
+            room["crowd_not_crowded"] = 0
 
     total_contributors = sum(r["contributors_count"] for r in all_rooms)
     total_waiting = sum(r.get("waiting_count", 0) for r in all_rooms)
