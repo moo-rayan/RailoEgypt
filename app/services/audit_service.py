@@ -241,9 +241,17 @@ def _is_bot_ua(ua: str) -> bool:
     return any(sig in ua_lower for sig in _BOT_SIGNATURES)
 
 
+# Legitimate app paths that would otherwise match suspicious patterns
+_WHITELISTED_PATHS = (
+    "/api/v1/app/config",
+)
+
+
 def _is_suspicious_path(path: str) -> bool:
     """Check if the request path matches known scanner probes."""
     path_lower = path.lower()
+    if any(path_lower.startswith(w) for w in _WHITELISTED_PATHS):
+        return False
     return any(p in path_lower for p in _SUSPICIOUS_PATHS)
 
 
