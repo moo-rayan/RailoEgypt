@@ -311,92 +311,6 @@ async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
     return {"ok": True, "message": f"User {body.user_id[:8]}... suspended ({duration_text})"}
 
 
-@router.get("/crowd-reports", dependencies=[Depends(get_admin_or_legacy_key)])
-async def get_crowd_reports():
-    """
-    List all trains that have at least one crowd report (crowded / not_crowded),
-    along with the individual voters and their display names.
-    """
-    from app.core.cache import get_redis
-    from app.core.database import async_session_maker
-    from app.models.profile import Profile
-    from sqlalchemy import select
-
-    r = await get_redis()
-
-    # 1. Scan Redis for all crowd:{train_id} hashes (skip vote keys)
-    train_crowd: dict[str, dict] = {}
-    async for key in r.scan_iter(match="crowd:*"):
-        key_str = key if isinstance(key, str) else key.decode()
-        # Skip individual vote keys like crowd:123:vote:user_abc
-        if ":vote:" in key_str:
-            continue
-        train_id = key_str.split(":", 1)[1]
-        data = await r.hgetall(key_str)
-        crowded = int(data.get("crowded", data.get(b"crowded", 0)))
-        not_crowded = int(data.get("not_crowded", data.get(b"not_crowded", 0)))
-        if crowded + not_crowded == 0:
-            continue
-        train_crowd[train_id] = {"crowded": crowded, "not_crowded": not_crowded}
-
-    if not train_crowd:
-        return {"total": 0, "trains": []}
-
-    # 2. For each train, collect voter user_ids and their votes
-    all_user_ids: set[str] = set()
-    train_voters: dict[str, list[dict]] = {}
-    for train_id in train_crowd:
-        voters = []
-        async for vkey in r.scan_iter(match=f"crowd:{train_id}:vote:*"):
-            vkey_str = vkey if isinstance(vkey, str) else vkey.decode()
-            user_id = vkey_str.split(":vote:", 1)[1]
-            vote = await r.get(vkey)
-            if vote:
-                vote = vote if isinstance(vote, str) else vote.decode()
-            voters.append({"user_id": user_id, "vote": vote or "unknown"})
-            all_user_ids.add(user_id)
-        train_voters[train_id] = voters
-
-    # 3. Batch-fetch display names from DB
-    user_info: dict[str, dict] = {}
-    if all_user_ids:
-        async with async_session_maker() as session:
-            result = await session.execute(
-                select(Profile.id, Profile.display_name, Profile.avatar_url)
-                .where(Profile.id.in_(list(all_user_ids)))
-            )
-            for row in result.all():
-                user_info[str(row[0])] = {
-                    "display_name": row[1] or "مجهول",
-                    "avatar_url": row[2] or "",
-                }
-
-    # 4. Build response
-    trains = []
-    for train_id, counts in train_crowd.items():
-        voters = []
-        for v in train_voters.get(train_id, []):
-            uid = v["user_id"]
-            info = user_info.get(uid, {"display_name": "مجهول", "avatar_url": ""})
-            voters.append({
-                "user_id": uid,
-                "display_name": info["display_name"],
-                "avatar_url": info["avatar_url"],
-                "vote": v["vote"],
-            })
-        trains.append({
-            "train_id": train_id,
-            "crowded": counts["crowded"],
-            "not_crowded": counts["not_crowded"],
-            "total_votes": counts["crowded"] + counts["not_crowded"],
-            "voters": voters,
-        })
-
-    # Sort by total votes descending
-    trains.sort(key=lambda t: t["total_votes"], reverse=True)
-    return {"total": len(trains), "trains": trains}
-
-
 @router.post("/unsuspend", dependencies=[Depends(require_fulladmin)])
 async def unsuspend_contributor_endpoint(body: UnsuspendRequest, request: Request):
     """Remove suspension from a contributor."""
@@ -415,3 +329,62 @@ async def unsuspend_contributor_endpoint(body: UnsuspendRequest, request: Reques
         metadata={"train_id": body.train_id, "target_user": body.user_id},
     )
     return {"ok": True, "message": f"User {body.user_id[:8]}... unsuspended"}
+
+
+@router.get("/crowd-reports/{train_id}", dependencies=[Depends(get_admin_or_legacy_key)])
+async def get_crowd_reports(train_id: str):
+    """Get detailed crowd reports for a train, including voter names."""
+    from app.core.cache import get_redis
+    from app.core.database import AsyncSessionFactory
+    from sqlalchemy import text
+
+    r = await get_redis()
+
+    # Get aggregate counts
+    vote_key = f"crowd:{train_id}"
+    data = await r.hgetall(vote_key)
+    crowded = int(data.get("crowded", 0) if isinstance(data.get("crowded"), (str, int)) else (data.get(b"crowded", 0)))
+    not_crowded = int(data.get("not_crowded", 0) if isinstance(data.get("not_crowded"), (str, int)) else (data.get(b"not_crowded", 0)))
+
+    # Scan for individual votes: crowd:{train_id}:vote:{user_id}
+    prefix = f"crowd:{train_id}:vote:"
+    voters = []
+    user_ids = []
+
+    async for key in r.scan_iter(match=f"{prefix}*"):
+        key_str = key if isinstance(key, str) else key.decode()
+        user_id = key_str[len(prefix):]
+        vote = await r.get(key)
+        vote_str = (vote if isinstance(vote, str) else vote.decode()) if vote else "unknown"
+        ttl = await r.ttl(key)
+        voters.append({
+            "user_id": user_id,
+            "vote": vote_str,
+            "ttl_seconds": max(0, ttl) if ttl > 0 else None,
+            "display_name": None,
+        })
+        user_ids.append(user_id)
+
+    # Look up display names from profiles
+    if user_ids:
+        try:
+            async with AsyncSessionFactory() as session:
+                # Build safe parameterized query
+                placeholders = ", ".join(f"'{uid}'" for uid in user_ids if len(uid) == 36)
+                if placeholders:
+                    result = await session.execute(
+                        text(f'SELECT id, display_name FROM "EgRailway".profiles WHERE id IN ({placeholders})')
+                    )
+                    name_map = {str(row[0]): row[1] for row in result.fetchall()}
+                    for v in voters:
+                        v["display_name"] = name_map.get(v["user_id"])
+        except Exception as e:
+            logger.warning("Failed to fetch voter names: %s", e)
+
+    return {
+        "train_id": train_id,
+        "crowded": crowded,
+        "not_crowded": not_crowded,
+        "total": crowded + not_crowded,
+        "voters": voters,
+    }
