@@ -172,7 +172,8 @@ async def create_fare(
     from app.models.train import Train
 
     # Validate train exists
-    train = await db.get(Train, payload.train_number)
+    result = await db.execute(select(Train).where(Train.train_id == payload.train_number))
+    train = result.scalar_one_or_none()
     if not train:
         raise HTTPException(status_code=400, detail=f"Train {payload.train_number} not found")
 
@@ -253,12 +254,12 @@ async def search_trains_for_fare(
     """Search trains by train_id for the create form."""
     from app.models.train import Train
     result = await db.execute(
-        select(Train.train_id, Train.train_type_ar, Train.train_type_en)
+        select(Train.train_id, Train.type_ar, Train.type_en)
         .where(Train.train_id.ilike(f"%{q}%"))
         .order_by(Train.train_id)
         .limit(15)
     )
-    return [{"train_id": r.train_id, "type_ar": r.train_type_ar, "type_en": r.train_type_en} for r in result.all()]
+    return [{"train_id": r.train_id, "type_ar": r.type_ar, "type_en": r.type_en} for r in result.all()]
 
 
 @router.get("/classes", dependencies=[Depends(require_admin)])
