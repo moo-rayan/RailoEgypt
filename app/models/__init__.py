@@ -9,6 +9,7 @@ from app.models.railway_graph import RailwayGraphData
 from app.models.station import Station
 from app.models.train import Train
 from app.models.trip import Trip, TripStop
+from app.models.trip_fare import TripFare
 
 __all__ = [
     "AccountDeletionRequest",
@@ -22,5 +23,6 @@ __all__ = [
     "Station",
     "Train",
     "Trip",
+    "TripFare",
     "TripStop",
 ]
