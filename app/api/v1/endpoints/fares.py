@@ -36,6 +36,15 @@ class FareListResponse(BaseModel):
     items: list[FareItem]
 
 
+class FareCreate(BaseModel):
+    train_number: str
+    from_station_id: int
+    to_station_id: int
+    class_name_ar: str
+    class_name_en: str
+    price: int
+
+
 class FareUpdate(BaseModel):
     class_name_ar: str | None = None
     class_name_en: str | None = None
@@ -153,6 +162,103 @@ async def list_fares(
     ]
 
     return FareListResponse(total=total, page=page, page_size=page_size, items=items)
+
+
+@router.post("", response_model=FareItem, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)])
+async def create_fare(
+    payload: FareCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    from app.models.train import Train
+
+    # Validate train exists
+    train = await db.get(Train, payload.train_number)
+    if not train:
+        raise HTTPException(status_code=400, detail=f"Train {payload.train_number} not found")
+
+    # Validate stations exist
+    from_station = await db.get(Station, payload.from_station_id)
+    if not from_station:
+        raise HTTPException(status_code=400, detail="From station not found")
+    to_station = await db.get(Station, payload.to_station_id)
+    if not to_station:
+        raise HTTPException(status_code=400, detail="To station not found")
+
+    # Check duplicate
+    existing = await db.execute(
+        select(TripFare).where(
+            TripFare.train_number == payload.train_number,
+            TripFare.from_station_id == payload.from_station_id,
+            TripFare.to_station_id == payload.to_station_id,
+            TripFare.class_name_en == payload.class_name_en,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="Fare already exists for this route/class")
+
+    fare = TripFare(
+        train_number=payload.train_number,
+        from_station_id=payload.from_station_id,
+        to_station_id=payload.to_station_id,
+        class_name_ar=payload.class_name_ar,
+        class_name_en=payload.class_name_en,
+        price=payload.price,
+    )
+    db.add(fare)
+    await db.commit()
+    await db.refresh(fare)
+
+    return FareItem(
+        id=fare.id,
+        train_number=fare.train_number,
+        from_station_id=fare.from_station_id,
+        from_station_ar=from_station.name_ar,
+        from_station_en=from_station.name_en,
+        to_station_id=fare.to_station_id,
+        to_station_ar=to_station.name_ar,
+        to_station_en=to_station.name_en,
+        class_name_ar=fare.class_name_ar,
+        class_name_en=fare.class_name_en,
+        price=fare.price,
+    )
+
+
+@router.get("/search-stations", dependencies=[Depends(require_admin)])
+async def search_stations_for_fare(
+    q: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search stations by name (Arabic or English) for the create form."""
+    from sqlalchemy import or_
+    result = await db.execute(
+        select(Station.id, Station.name_ar, Station.name_en)
+        .where(
+            Station.is_active.is_(True),
+            or_(
+                Station.name_ar.ilike(f"%{q}%"),
+                Station.name_en.ilike(f"%{q}%"),
+            ),
+        )
+        .order_by(Station.name_ar)
+        .limit(15)
+    )
+    return [{"id": r.id, "name_ar": r.name_ar, "name_en": r.name_en} for r in result.all()]
+
+
+@router.get("/search-trains", dependencies=[Depends(require_admin)])
+async def search_trains_for_fare(
+    q: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Search trains by train_id for the create form."""
+    from app.models.train import Train
+    result = await db.execute(
+        select(Train.train_id, Train.train_type_ar, Train.train_type_en)
+        .where(Train.train_id.ilike(f"%{q}%"))
+        .order_by(Train.train_id)
+        .limit(15)
+    )
+    return [{"train_id": r.train_id, "type_ar": r.train_type_ar, "type_en": r.train_type_en} for r in result.all()]
 
 
 @router.get("/classes", dependencies=[Depends(require_admin)])
