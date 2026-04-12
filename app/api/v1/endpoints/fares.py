@@ -71,12 +71,19 @@ def _base_query():
 def _apply_filters(query, count_query, from_st, to_st, *,
                     from_station, to_station, train_number, fare_class):
     """Apply search/filter conditions to both query and count query."""
+    from sqlalchemy import or_
     if from_station:
-        cond = from_st.c.name_en.ilike(f"%{from_station}%")
+        cond = or_(
+            from_st.c.name_ar.ilike(f"%{from_station}%"),
+            from_st.c.name_en.ilike(f"%{from_station}%"),
+        )
         query = query.where(cond)
         count_query = count_query.where(cond)
     if to_station:
-        cond = to_st.c.name_en.ilike(f"%{to_station}%")
+        cond = or_(
+            to_st.c.name_ar.ilike(f"%{to_station}%"),
+            to_st.c.name_en.ilike(f"%{to_station}%"),
+        )
         query = query.where(cond)
         count_query = count_query.where(cond)
     if train_number:
