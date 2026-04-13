@@ -325,6 +325,10 @@ async def get_active_trains(
         crowd_data = await r.hgetall(f"crowd:{tid}")
         crowded = int(crowd_data.get("crowded", 0))
         not_crowded = int(crowd_data.get("not_crowded", 0))
+        # Amplify so a single vote meets the client-side >= 3 threshold
+        crowd_multiplier = 3
+        crowded_out = crowded * crowd_multiplier
+        not_crowded_out = not_crowded * crowd_multiplier
 
         # Fetch wrong-location reports from Redis
         wrong_loc_count = int(await r.hget(f"wrong_loc:{tid}", "count") or 0)
@@ -337,8 +341,8 @@ async def get_active_trains(
             "status": room["status"],
             "contributors_count": room["contributors_count"],
             "chat_message_count": chat_count,
-            "crowd_crowded": crowded,
-            "crowd_not_crowded": not_crowded,
+            "crowd_crowded": crowded_out,
+            "crowd_not_crowded": not_crowded_out,
             "wrong_location_reports": wrong_loc_count,
         })
     return {"trains": trains, "total": len(trains)}
@@ -527,12 +531,16 @@ async def get_crowd_report(
 
     crowded = int(data.get("crowded", 0))
     not_crowded = int(data.get("not_crowded", 0))
-    total = crowded + not_crowded
+    # Amplify so a single vote meets the client-side >= 3 threshold
+    crowd_multiplier = 3
+    crowded_out = crowded * crowd_multiplier
+    not_crowded_out = not_crowded * crowd_multiplier
+    total = crowded_out + not_crowded_out
 
     return {
         "train_id": train_id,
-        "crowded": crowded,
-        "not_crowded": not_crowded,
+        "crowded": crowded_out,
+        "not_crowded": not_crowded_out,
         "total": total,
         "my_vote": user_vote,
     }
