@@ -10,7 +10,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
-from app.core.admin_auth import AdminUser, get_admin_or_legacy_key, require_fulladmin
+from app.core.admin_auth import AdminUser, get_admin_or_legacy_key, require_admin, require_fulladmin
 from app.services.audit_service import audit
 from app.services.ban_service import ban_contributor, is_banned, list_bans, unban_contributor
 from app.services.tracking_manager import tracking_manager
@@ -60,7 +60,7 @@ class UnsuspendRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/ban", dependencies=[Depends(require_fulladmin)])
+@router.post("/ban", dependencies=[Depends(require_admin)])
 async def ban_contributor_endpoint(body: BanRequest, request: Request):
     """
     Ban a contributor from contributing.
@@ -99,7 +99,7 @@ async def ban_contributor_endpoint(body: BanRequest, request: Request):
     return {"ok": True, "message": f"User {body.user_id[:8]}... banned ({duration_text})"}
 
 
-@router.post("/unban", dependencies=[Depends(require_fulladmin)])
+@router.post("/unban", dependencies=[Depends(require_admin)])
 async def unban_contributor_endpoint(body: UnbanRequest, request: Request):
     """Remove a contributor's ban."""
     removed = await unban_contributor(body.user_id)
@@ -295,7 +295,7 @@ async def list_suspensions(train_id: str):
     return {"total": len(suspensions), "suspensions": suspensions}
 
 
-@router.post("/suspend", dependencies=[Depends(require_fulladmin)])
+@router.post("/suspend", dependencies=[Depends(require_admin)])
 async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
     """
     Suspend a contributor from updating positions (keeps them in room but rejects updates).
@@ -321,7 +321,7 @@ async def suspend_contributor_endpoint(body: SuspendRequest, request: Request):
     return {"ok": True, "message": f"User {body.user_id[:8]}... suspended ({duration_text})"}
 
 
-@router.post("/unsuspend", dependencies=[Depends(require_fulladmin)])
+@router.post("/unsuspend", dependencies=[Depends(require_admin)])
 async def unsuspend_contributor_endpoint(body: UnsuspendRequest, request: Request):
     """Remove suspension from a contributor."""
     success = await tracking_manager.unsuspend_contributor(
