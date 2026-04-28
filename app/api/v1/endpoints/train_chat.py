@@ -41,6 +41,10 @@ class ChatTicketRequest(BaseModel):
     anonymous: bool | None = None  # None = use stored preference
 
 
+class ChatPreferencesRequest(BaseModel):
+    anonymous: bool = Field(..., description="True=anonymous alias, False=real name")
+
+
 @router.post("/ticket/{train_id}")
 async def get_chat_ticket(
     train_id: str,
@@ -119,6 +123,55 @@ async def get_chat_ticket(
         "user_avatar": display_avatar,
         "chat_alias": chat_alias,
         "chat_anonymous": is_anonymous,
+    }
+
+
+@router.post("/preferences")
+async def set_chat_preferences(
+    body: ChatPreferencesRequest,
+    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
+):
+    """Persist chat identity preference (anonymous vs real) to user profile."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization[7:]
+
+    user = await verify_supabase_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user_id = user.get("id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found")
+
+    async with AsyncSessionFactory() as session:
+        row = await session.execute(
+            select(Profile.chat_alias, Profile.chat_anonymous).where(Profile.id == cast(user_id, UUID))
+        )
+        profile = row.first()
+        if profile is None:
+            raise HTTPException(status_code=404, detail="Profile not found")
+
+        chat_alias = profile.chat_alias
+        updates = {}
+
+        if not chat_alias:
+            chat_alias = f"مسافر {random.randint(1000, 9999)}"
+            updates["chat_alias"] = chat_alias
+
+        if body.anonymous != profile.chat_anonymous:
+            updates["chat_anonymous"] = body.anonymous
+
+        if updates:
+            await session.execute(
+                sa_update(Profile).where(Profile.id == cast(user_id, UUID)).values(**updates)
+            )
+            await session.commit()
+
+    return {
+        "ok": True,
+        "chat_alias": chat_alias,
+        "chat_anonymous": body.anonymous,
     }
 
 
