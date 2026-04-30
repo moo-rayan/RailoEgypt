@@ -162,12 +162,25 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
             ],
         })
 
-    # Trains
+    # Trains — with deduplicated notes lookup table
     trains_result = await db.execute(
         select(Train).where(Train.is_active.is_(True)).order_by(Train.id)
     )
-    trains = [
-        {
+    all_trains = trains_result.scalars().all()
+
+    # Build unique notes lookup: list of {"a": note_ar, "e": note_en}
+    notes_map: dict[tuple[str, str], int] = {}  # (note_ar, note_en) -> index
+    train_notes: list[dict] = []
+    for tr in all_trains:
+        if tr.note_ar or tr.note_en:
+            key = (tr.note_ar.strip(), tr.note_en.strip())
+            if key not in notes_map:
+                notes_map[key] = len(train_notes)
+                train_notes.append({"a": key[0], "e": key[1]})
+
+    trains = []
+    for tr in all_trains:
+        item: dict = {
             "id": tr.id,
             "tid": tr.train_id,
             "ta": tr.type_ar,
@@ -177,11 +190,11 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
             "esa": tr.end_station_ar,
             "ese": tr.end_station_en,
             "sc": tr.stops_count,
-            "na": tr.note_ar,
-            "ne": tr.note_en,
         }
-        for tr in trains_result.scalars().all()
-    ]
+        if tr.note_ar or tr.note_en:
+            key = (tr.note_ar.strip(), tr.note_en.strip())
+            item["ni"] = notes_map[key]  # note index into train_notes
+        trains.append(item)
 
     # Trip paths (A* railway routing for all trips)
     trip_paths = await _build_all_trip_paths(db)
@@ -193,6 +206,7 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
         "stations": stations,
         "trips": trips,
         "trains": trains,
+        "train_notes": train_notes,
         "trip_paths": trip_paths,
         "railway_lines": railway_lines,
     }
