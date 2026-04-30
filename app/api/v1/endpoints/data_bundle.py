@@ -25,6 +25,7 @@ from app.core.r2_storage import r2_upload_bundle
 from app.models.station import Station
 from app.models.train import Train
 from app.models.trip import Trip, TripStop
+from app.models.trip_fare import TripFare
 from app.services.railway_service import railway_graph
 
 BUNDLE_REDIS_VERSION_KEY = "bundle:current_version"
@@ -196,6 +197,30 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
             item["ni"] = notes_map[key]  # note index into train_notes
         trains.append(item)
 
+    # ── Fares — deduplicated class lookup + compact fare dict ──────────────
+    fares_result = await db.execute(
+        select(TripFare).order_by(TripFare.train_number, TripFare.from_station_id)
+    )
+    all_fares = fares_result.scalars().all()
+
+    # Build unique fare classes lookup: [{"a": class_ar, "e": class_en}, ...]
+    class_map: dict[tuple[str, str], int] = {}  # (class_ar, class_en) -> index
+    fare_classes: list[dict] = []
+    for f in all_fares:
+        key = (f.class_name_ar, f.class_name_en)
+        if key not in class_map:
+            class_map[key] = len(fare_classes)
+            fare_classes.append({"a": key[0], "e": key[1]})
+
+    # Build fares dict: {train_number: {"from_id:to_id": [[class_idx, price], ...]}}
+    fares_dict: dict[str, dict[str, list]] = {}
+    for f in all_fares:
+        train_fares = fares_dict.setdefault(f.train_number, {})
+        route_key = f"{f.from_station_id}:{f.to_station_id}"
+        route_fares = train_fares.setdefault(route_key, [])
+        ci = class_map[(f.class_name_ar, f.class_name_en)]
+        route_fares.append([ci, f.price])
+
     # Trip paths (A* railway routing for all trips)
     trip_paths = await _build_all_trip_paths(db)
 
@@ -207,6 +232,8 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
         "trips": trips,
         "trains": trains,
         "train_notes": train_notes,
+        "fare_classes": fare_classes,
+        "fares": fares_dict,
         "trip_paths": trip_paths,
         "railway_lines": railway_lines,
     }
