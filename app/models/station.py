@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Double, Index, Text, func
+from sqlalchemy import Boolean, Double, Index, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -20,6 +20,7 @@ class Station(Base):
     latitude: Mapped[float | None] = mapped_column(Double, nullable=True)
     longitude: Mapped[float | None] = mapped_column(Double, nullable=True)
     place_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_id: Mapped[str] = mapped_column(String(10), nullable=False, unique=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()

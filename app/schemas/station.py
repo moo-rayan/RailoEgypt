@@ -12,7 +12,7 @@ class StationBase(BaseModel):
 
 
 class StationCreate(StationBase):
-    pass
+    audio_id: str
 
 
 class StationUpdate(BaseModel):
@@ -21,6 +21,7 @@ class StationUpdate(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     place_id: str | None = None
+    audio_id: str | None = None
     is_active: bool | None = None
 
 
@@ -28,6 +29,7 @@ class StationRead(StationBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    audio_id: str
     is_active: bool
     created_at: datetime
     updated_at: datetime

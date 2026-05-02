@@ -119,6 +119,7 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
             "name_en": s.name_en,
             "lat": s.latitude,
             "lng": s.longitude,
+            "aid": s.audio_id,
         }
         for s in stations_result.scalars().all()
     ]
