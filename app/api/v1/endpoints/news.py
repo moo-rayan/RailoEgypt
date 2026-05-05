@@ -209,18 +209,20 @@ async def upload_news_image(
     import httpx
 
     storage_url = f"{settings.supabase_url}/storage/v1/object/news-images/{path}"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             storage_url,
             headers={
                 "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                "apikey": settings.supabase_service_role_key,
                 "Content-Type": file.content_type or "image/jpeg",
+                "x-upsert": "true",
             },
             content=content,
         )
         if resp.status_code not in (200, 201):
             logger.error("Storage upload failed: %s %s", resp.status_code, resp.text)
-            raise HTTPException(status_code=500, detail="Image upload failed")
+            raise HTTPException(status_code=500, detail=f"Image upload failed: {resp.text}")
 
     public_url = f"{settings.supabase_url}/storage/v1/object/public/news-images/{path}"
     return {"url": public_url}
