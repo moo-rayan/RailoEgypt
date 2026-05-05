@@ -194,10 +194,22 @@ async def upload_news_image(
     admin=Depends(require_fulladmin),
 ):
     """Upload an image to Supabase Storage and return its public URL."""
+    import httpx
+
+    # Validate service role key is configured
+    if not settings.supabase_service_role_key:
+        logger.error("SUPABASE_SERVICE_ROLE_KEY is not configured")
+        raise HTTPException(status_code=500, detail="Storage not configured (missing service role key)")
+
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
-    content = await file.read()
+    try:
+        content = await file.read()
+    except Exception as e:
+        logger.error("Failed to read uploaded file: %s", e)
+        raise HTTPException(status_code=400, detail="Failed to read file")
+
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Image must be under 5MB")
 
@@ -206,23 +218,32 @@ async def upload_news_image(
     path = f"news/{filename}"
 
     # Upload via Supabase Storage REST API
-    import httpx
-
     storage_url = f"{settings.supabase_url}/storage/v1/object/news-images/{path}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            storage_url,
-            headers={
-                "Authorization": f"Bearer {settings.supabase_service_role_key}",
-                "apikey": settings.supabase_service_role_key,
-                "Content-Type": file.content_type or "image/jpeg",
-                "x-upsert": "true",
-            },
-            content=content,
-        )
-        if resp.status_code not in (200, 201):
-            logger.error("Storage upload failed: %s %s", resp.status_code, resp.text)
-            raise HTTPException(status_code=500, detail=f"Image upload failed: {resp.text}")
+    logger.info("Uploading to: %s (file size: %d bytes)", storage_url, len(content))
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                storage_url,
+                headers={
+                    "Authorization": f"Bearer {settings.supabase_service_role_key}",
+                    "apikey": settings.supabase_service_role_key,
+                    "Content-Type": file.content_type or "image/jpeg",
+                    "x-upsert": "true",
+                },
+                content=content,
+            )
+    except httpx.TimeoutException:
+        logger.error("Storage upload timed out")
+        raise HTTPException(status_code=504, detail="Upload timed out")
+    except Exception as e:
+        logger.error("Storage upload exception: %s", e)
+        raise HTTPException(status_code=500, detail=f"Upload connection error: {str(e)}")
+
+    if resp.status_code not in (200, 201):
+        logger.error("Storage upload failed: %s %s", resp.status_code, resp.text)
+        raise HTTPException(status_code=500, detail=f"Image upload failed ({resp.status_code}): {resp.text}")
 
     public_url = f"{settings.supabase_url}/storage/v1/object/public/news-images/{path}"
+    logger.info("Upload success: %s", public_url)
     return {"url": public_url}
