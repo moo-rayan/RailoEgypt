@@ -18,6 +18,7 @@ from app.services.admin_alert_service import create_alert
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/support", tags=["Support"])
+_REPORTS_PER_HOUR_LIMIT = 6
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -137,42 +138,55 @@ async def submit_contact(
 
 
 async def _check_report_rate_limit(user_id: str, db: AsyncSession) -> None:
-    """Check if user has sent a report in the last hour."""
+    """Check if user exceeded the hourly report limit."""
     logger.info(f"Checking report rate limit for user: {user_id[:8]}")
-    
+
+    window_start = datetime.now(timezone.utc) - timedelta(hours=1)
     result = await db.execute(
         text("""
-            SELECT created_at
+            SELECT COUNT(*) AS report_count,
+                   MIN(created_at) AS oldest_report_time
             FROM "EgRailway".problem_reports
             WHERE user_id = CAST(:user_id AS UUID)
-            ORDER BY created_at DESC
-            LIMIT 1
+              AND created_at >= :window_start
         """),
-        {"user_id": user_id}
+        {"user_id": user_id, "window_start": window_start}
     )
     row = result.mappings().first()
-    
-    if row:
-        last_report_time = row["created_at"]
-        
-        # Convert both times to UTC for comparison
-        if last_report_time.tzinfo is not None:
-            last_report_time = last_report_time.astimezone(timezone.utc)
-        
+
+    report_count = int(row["report_count"]) if row and row["report_count"] is not None else 0
+    oldest_report_time = row["oldest_report_time"] if row else None
+
+    if report_count >= _REPORTS_PER_HOUR_LIMIT:
+        if oldest_report_time is not None and oldest_report_time.tzinfo is not None:
+            oldest_report_time = oldest_report_time.astimezone(timezone.utc)
+
         now = datetime.now(timezone.utc)
-        time_since_last = now - last_report_time
-        
-        logger.info(f"Now (UTC): {now}, Last (UTC): {last_report_time}, Diff: {time_since_last}, Minutes: {time_since_last.total_seconds() / 60}")
-        
-        if time_since_last < timedelta(hours=1):
-            minutes_remaining = int(60 - time_since_last.total_seconds() / 60)
-            logger.warning(f"Report rate limit hit! User {user_id[:8]} must wait {minutes_remaining} minutes")
-            raise HTTPException(
-                status_code=429,
-                detail=f"يمكنك إرسال بلاغ واحد فقط كل ساعة. يرجى الانتظار {minutes_remaining} دقيقة أخرى."
+        minutes_remaining = 60
+        if oldest_report_time is not None:
+            elapsed = now - oldest_report_time
+            minutes_remaining = max(1, int(60 - elapsed.total_seconds() / 60))
+
+        logger.warning(
+            "Report rate limit hit! User %s reached %s reports/hour and must wait %s minutes",
+            user_id[:8],
+            _REPORTS_PER_HOUR_LIMIT,
+            minutes_remaining,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"يمكنك إرسال {_REPORTS_PER_HOUR_LIMIT} بلاغات فقط كل ساعة. "
+                f"يرجى الانتظار {minutes_remaining} دقيقة أخرى."
             )
-    else:
-        logger.info(f"No previous report found for user: {user_id[:8]}")
+        )
+
+    logger.info(
+        "User %s has %s/%s reports in the last hour",
+        user_id[:8],
+        report_count,
+        _REPORTS_PER_HOUR_LIMIT,
+    )
 
 @router.post("/report", status_code=201)
 async def submit_report(
@@ -182,7 +196,7 @@ async def submit_report(
 ):
     user_id = user["id"]
     
-    # Check rate limit - one report per hour
+    # Check rate limit - up to 6 reports per hour
     await _check_report_rate_limit(user_id, db)
     
     email = user.get("email", "")

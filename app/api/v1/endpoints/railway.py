@@ -197,6 +197,7 @@ async def get_trip_stations(
             "lon":      station.longitude,
             "time_ar":  stop.time_ar,
             "time_en":  stop.time_en,
+            "audio_id": station.audio_id,
         }
         for stop, station in rows
         if station
