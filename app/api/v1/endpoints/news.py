@@ -9,7 +9,7 @@ Admin:
   POST   /news/admin       — create news article
   PUT    /news/admin/{id}  — update news article
   DELETE /news/admin/{id}  — delete news article
-  POST   /news/admin/upload-image — upload image to Supabase Storage
+  POST   /news/admin/upload-image — upload image to Cloudflare R2
 """
 
 import logging
@@ -193,13 +193,14 @@ async def upload_news_image(
     file: UploadFile = File(...),
     admin=Depends(require_fulladmin),
 ):
-    """Upload an image to Supabase Storage and return its public URL."""
-    import httpx
+    """Upload an image to Cloudflare R2 and return its public URL."""
+    import asyncio
+    from app.core.r2_storage import _get_s3_client
 
-    # Validate service role key is configured
-    if not settings.supabase_service_role_key:
-        logger.error("SUPABASE_SERVICE_ROLE_KEY is not configured")
-        raise HTTPException(status_code=500, detail="Storage not configured (missing service role key)")
+    # Validate R2 is configured
+    if not settings.r2_access_key_id or not settings.r2_public_url:
+        logger.error("R2 storage not configured (missing credentials or public URL)")
+        raise HTTPException(status_code=500, detail="Storage not configured")
 
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
@@ -215,35 +216,24 @@ async def upload_news_image(
 
     ext = file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "jpg"
     filename = f"{uuid.uuid4().hex}.{ext}"
-    path = f"news/{filename}"
-
-    # Upload via Supabase Storage REST API
-    storage_url = f"{settings.supabase_url}/storage/v1/object/news-images/{path}"
-    logger.info("Uploading to: %s (file size: %d bytes)", storage_url, len(content))
+    key = filename
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                storage_url,
-                headers={
-                    "Authorization": f"Bearer {settings.supabase_service_role_key}",
-                    "apikey": settings.supabase_service_role_key,
-                    "Content-Type": file.content_type or "image/jpeg",
-                    "x-upsert": "true",
-                },
-                content=content,
+        s3 = _get_s3_client()
+
+        def _upload():
+            s3.put_object(
+                Bucket="news",
+                Key=key,
+                Body=content,
+                ContentType=file.content_type or "image/jpeg",
             )
-    except httpx.TimeoutException:
-        logger.error("Storage upload timed out")
-        raise HTTPException(status_code=504, detail="Upload timed out")
+
+        await asyncio.to_thread(_upload)
     except Exception as e:
-        logger.error("Storage upload exception: %s", e)
-        raise HTTPException(status_code=500, detail=f"Upload connection error: {str(e)}")
+        logger.error("R2 upload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
 
-    if resp.status_code not in (200, 201):
-        logger.error("Storage upload failed: %s %s", resp.status_code, resp.text)
-        raise HTTPException(status_code=500, detail=f"Image upload failed ({resp.status_code}): {resp.text}")
-
-    public_url = f"{settings.supabase_url}/storage/v1/object/public/news-images/{path}"
-    logger.info("Upload success: %s", public_url)
+    public_url = f"{settings.r2_public_url.rstrip('/')}/{key}"
+    logger.info("News image uploaded to R2: %s", public_url)
     return {"url": public_url}

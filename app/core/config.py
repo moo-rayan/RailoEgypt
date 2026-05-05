@@ -46,11 +46,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     cache_ttl_seconds: int = 300
 
-    # Cloudflare R2 (S3-compatible object storage for bundle)
+    # Cloudflare R2 (S3-compatible object storage)
     r2_access_key_id: str = ""
     r2_secret_access_key: str = ""
     r2_endpoint: str = ""
     r2_bucket: str = "bundle"
+    r2_public_url: str = ""  # Public URL for R2 bucket (e.g. https://pub-xxx.r2.dev or custom domain)
 
     # Data bundle encryption (AES-256 key, base64-encoded 32 bytes)
     bundle_encryption_key: str = ""
