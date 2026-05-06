@@ -215,14 +215,14 @@ async def upload_news_image(
 
     ext = file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "jpg"
     filename = f"{uuid.uuid4().hex}.{ext}"
-    key = f"news/{filename}"
+    key = filename
 
     try:
         s3 = _get_s3_client()
 
         def _upload():
             s3.put_object(
-                Bucket=settings.r2_bucket,
+                Bucket="news",
                 Key=key,
                 Body=content,
                 ContentType=file.content_type or "image/jpeg",
