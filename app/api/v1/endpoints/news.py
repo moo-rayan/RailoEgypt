@@ -14,7 +14,6 @@ Admin:
 
 import logging
 import uuid
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import select, func, desc
@@ -126,7 +125,7 @@ async def create_news(
         body=data.body,
         image_url=data.image_url,
         is_published=data.is_published,
-        published_at=datetime.now(timezone.utc) if data.is_published else None,
+        published_at=func.now() if data.is_published else None,
         created_by=uuid.UUID(admin.user_id),
     )
     db.add(article)
@@ -160,11 +159,11 @@ async def update_news(
         article.is_published = data.is_published
         # Set published_at on first publish
         if data.is_published and not was_published:
-            article.published_at = datetime.now(timezone.utc)
+            article.published_at = func.now()
         elif not data.is_published:
             article.published_at = None
 
-    article.updated_at = datetime.now(timezone.utc)
+    article.updated_at = func.now()
     await db.flush()
     await db.refresh(article)
     logger.info("News updated: id=%s", article.id)
@@ -216,14 +215,14 @@ async def upload_news_image(
 
     ext = file.filename.rsplit(".", 1)[-1] if file.filename and "." in file.filename else "jpg"
     filename = f"{uuid.uuid4().hex}.{ext}"
-    key = filename
+    key = f"news/{filename}"
 
     try:
         s3 = _get_s3_client()
 
         def _upload():
             s3.put_object(
-                Bucket="news",
+                Bucket=settings.r2_bucket,
                 Key=key,
                 Body=content,
                 ContentType=file.content_type or "image/jpeg",
