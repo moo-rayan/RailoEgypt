@@ -327,6 +327,23 @@ def _is_duration_query(user_message: str) -> bool:
     )
 
 
+def _is_price_query(user_message: str) -> bool:
+    normalized = _normalize_arabic(user_message)
+    return (
+        "سعر" in normalized
+        or "الاسعار" in normalized
+        or "الاسعار" in normalized
+        or "ارخص" in normalized
+        or "اقل سعر" in normalized
+        or "اقل الاسعار" in normalized
+    )
+
+
+def _is_followup_price_query(user_message: str) -> bool:
+    normalized = _normalize_arabic(user_message)
+    return "سعره" in normalized or "سعرها" in normalized or "وسعره" in normalized
+
+
 def _sanitize_history_messages(
     conversation_history: list[dict[str, Any]] | None,
 ) -> list[dict[str, str]]:
@@ -360,6 +377,47 @@ def _extract_recent_tool_context(
     return None
 
 
+def _find_cheapest_fare_item(local_results: dict) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    items = local_results.get("items", [])
+    if not isinstance(items, list):
+        return None
+
+    cheapest_item: dict[str, Any] | None = None
+    cheapest_fare: dict[str, Any] | None = None
+    cheapest_price = float("inf")
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        route_fares = item.get("route_fares", [])
+        if not isinstance(route_fares, list):
+            continue
+        for fare in route_fares:
+            if not isinstance(fare, dict):
+                continue
+            price = fare.get("price")
+            if isinstance(price, (int, float)) and price < cheapest_price:
+                cheapest_price = price
+                cheapest_item = item
+                cheapest_fare = fare
+
+    if cheapest_item and cheapest_fare:
+        return cheapest_item, cheapest_fare
+    return None
+
+
+def _find_train_by_number(local_results: dict, train_number: str | None) -> dict[str, Any] | None:
+    if not train_number:
+        return None
+    items = local_results.get("items", [])
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if isinstance(item, dict) and str(item.get("train", "")) == str(train_number):
+            return item
+    return None
+
+
 def _build_fastest_reply(fastest_train: dict, local_results: dict) -> str:
     train_num = str(fastest_train.get("train", ""))
     train_type = fastest_train.get("type", "")
@@ -384,6 +442,65 @@ def _build_fastest_reply(fastest_train: dict, local_results: dict) -> str:
     else:
         parts[0] += "."
     return "".join(parts)
+
+
+def _build_train_price_reply(train_item: dict[str, Any], local_results: dict) -> str:
+    train_num = str(train_item.get("train", ""))
+    route_fares = train_item.get("route_fares", [])
+    from_station = local_results.get("from_station") or train_item.get("from", "")
+    to_station = local_results.get("to_station") or train_item.get("to", "")
+
+    if not isinstance(route_fares, list) or not route_fares:
+        return f"لا توجد بيانات أسعار متاحة للقطار رقم {train_num} من {from_station} إلى {to_station}."
+
+    sorted_fares = sorted(
+        [fare for fare in route_fares if isinstance(fare, dict) and isinstance(fare.get("price"), (int, float))],
+        key=lambda fare: fare["price"],
+    )
+    if not sorted_fares:
+        return f"لا توجد بيانات أسعار متاحة للقطار رقم {train_num} من {from_station} إلى {to_station}."
+
+    cheapest = sorted_fares[0]
+    cheapest_class = cheapest.get("class_ar", "الفئة المتاحة")
+    cheapest_price = int(cheapest["price"])
+    all_fares = "، ".join(
+        f"{fare.get('class_ar', 'فئة')}: {int(fare['price'])} جنيه"
+        for fare in sorted_fares
+    )
+    return (
+        f"سعر القطار رقم {train_num} من {from_station} إلى {to_station} يبدأ من "
+        f"{cheapest_price} جنيه في {cheapest_class}. الأسعار المتاحة: {all_fares}."
+    )
+
+
+def _build_cheapest_reply(local_results: dict) -> str:
+    result = _find_cheapest_fare_item(local_results)
+    if result is None:
+        from_station = local_results.get("from_station", "")
+        to_station = local_results.get("to_station", "")
+        return f"لا توجد بيانات أسعار متاحة من {from_station} إلى {to_station}."
+
+    item, fare = result
+    train_num = str(item.get("train", ""))
+    train_type = item.get("type", "")
+    class_name = fare.get("class_ar", "الفئة المتاحة")
+    price = int(fare.get("price", 0))
+    from_station = local_results.get("from_station") or item.get("from", "")
+    to_station = local_results.get("to_station") or item.get("to", "")
+    reply = f"أقل سعر من {from_station} إلى {to_station} هو {price} جنيه"
+    if class_name:
+        reply += f" في {class_name}"
+    if train_num:
+        reply += f" على القطار رقم {train_num}"
+    if train_type:
+        reply += f" {train_type}"
+    return reply + "."
+
+
+def _build_fastest_and_cheapest_reply(fastest_train: dict, local_results: dict) -> str:
+    fastest_reply = _build_fastest_reply(fastest_train, local_results).rstrip(".")
+    cheapest_reply = _build_cheapest_reply(local_results)
+    return f"{fastest_reply}. {cheapest_reply}"
 
 
 def _build_duration_reply(local_results: dict) -> str:
@@ -447,31 +564,80 @@ async def _chat_with_local_results(
     context and let the AI analyse and respond freely.
     """
     manager = _get_manager()
+    working_results = dict(local_results)
 
     # Calculate fastest train for context
-    items = local_results.get("items", [])
+    items = working_results.get("items", [])
     fastest_train = _calculate_fastest_train(items)
+    asks_fastest = _is_fastest_query(user_message)
+    asks_price = _is_price_query(user_message)
+
     if (
-        local_results.get("tool_used") == "search_trips"
-        and _is_fastest_query(user_message)
+        working_results.get("tool_used") == "search_trips"
+        and asks_fastest
+        and asks_price
         and fastest_train
     ):
+        working_results["focus_train"] = fastest_train.get("train")
         return {
-            "reply": _build_fastest_reply(fastest_train, local_results),
-            "tool_used": local_results.get("tool_used", "search_trips"),
-            "tool_data": local_results,
+            "reply": _build_fastest_and_cheapest_reply(fastest_train, working_results),
+            "tool_used": working_results.get("tool_used", "search_trips"),
+            "tool_data": working_results,
             "provider": "computed",
             "cached": False,
         }
 
     if (
-        local_results.get("tool_used") == "search_trips"
+        working_results.get("tool_used") == "search_trips"
+        and asks_fastest
+        and fastest_train
+    ):
+        working_results["focus_train"] = fastest_train.get("train")
+        return {
+            "reply": _build_fastest_reply(fastest_train, working_results),
+            "tool_used": working_results.get("tool_used", "search_trips"),
+            "tool_data": working_results,
+            "provider": "computed",
+            "cached": False,
+        }
+
+    if (
+        working_results.get("tool_used") == "search_trips"
+        and asks_price
+    ):
+        focused_train = _find_train_by_number(
+            working_results,
+            str(working_results.get("focus_train", "")) or None,
+        )
+        if focused_train is not None and _is_followup_price_query(user_message):
+            return {
+                "reply": _build_train_price_reply(focused_train, working_results),
+                "tool_used": working_results.get("tool_used", "search_trips"),
+                "tool_data": working_results,
+                "provider": "computed",
+                "cached": False,
+            }
+
+        cheapest_result = _find_cheapest_fare_item(working_results)
+        if cheapest_result is not None:
+            cheapest_item, _ = cheapest_result
+            working_results["focus_train"] = cheapest_item.get("train")
+        return {
+            "reply": _build_cheapest_reply(working_results),
+            "tool_used": working_results.get("tool_used", "search_trips"),
+            "tool_data": working_results,
+            "provider": "computed",
+            "cached": False,
+        }
+
+    if (
+        working_results.get("tool_used") == "search_trips"
         and _is_duration_query(user_message)
     ):
         return {
-            "reply": _build_duration_reply(local_results),
-            "tool_used": local_results.get("tool_used", "search_trips"),
-            "tool_data": local_results,
+            "reply": _build_duration_reply(working_results),
+            "tool_used": working_results.get("tool_used", "search_trips"),
+            "tool_data": working_results,
             "provider": "computed",
             "cached": False,
         }
@@ -482,7 +648,7 @@ async def _chat_with_local_results(
         duration = fastest_train.get('segment_duration') or fastest_train.get('full_duration', 'unknown')
         fastest_info = f"\n=== معلومة محسوبة مسبقاً ===\nالقطار الأسرع هو رقم {train_num} (مدة: {duration})\n===\n"
 
-    results_json = json.dumps(local_results, ensure_ascii=False)
+    results_json = json.dumps(working_results, ensure_ascii=False)
     context_note = (
         "=== البيانات المتاحة فقط ===\n"
         f"{results_json}\n"
@@ -492,7 +658,7 @@ async def _chat_with_local_results(
         "1. يجب أن تقتصر إجابتك 100٪ على البيانات أعلاه فقط\n"
         "2. عند السؤال عن 'أسرع رحلة': اذكر القطار رقم " + (fastest_train.get('train', '[غير متوفر]') if fastest_train else '[غير متوفر]') + " كالأسرع\n"
         "3. عند السؤال عن 'أول قطار' أو 'آخر قطار': رتب حسب الوقت واختر المناسب\n"
-        "4. اذكر أرقام القطارات والأوقات بالضبط كما وردت في البيانات\n"
+        "4. اذكر أرقام القطارات والأوقات والأسعار بالضبط كما وردت في البيانات\n"
         "5. إذا لم تجد إجابة في البيانات، قل: 'لا توجد بيانات متاحة عن هذا السؤال'\n"
         "6. لا تضف أي معلومات من خارج البيانات المرفقة\n\n"
         "سؤال المستخدم:\n"
@@ -508,7 +674,7 @@ async def _chat_with_local_results(
         reply = response.choices[0].message.content or ""
 
         # Validation: Check if response references actual train numbers from data
-        items = local_results.get("items", [])
+        items = working_results.get("items", [])
         if items:
             # Extract train numbers from data
             train_numbers = set()
@@ -547,10 +713,10 @@ async def _chat_with_local_results(
                     retry_response, retry_provider = await manager.chat_completion(messages=retry_messages)
                     reply = retry_response.choices[0].message.content or reply
 
-        tool_used = local_results.get("tool_used", "search_trips")
-        tool_data = local_results
+        tool_used = working_results.get("tool_used", "search_trips")
+        tool_data = working_results
 
-        logger.info("[%s] Chat with local results — %d items", provider_name, len(local_results.get("items", [])))
+        logger.info("[%s] Chat with local results — %d items", provider_name, len(working_results.get("items", [])))
 
         return {
             "reply": reply,
