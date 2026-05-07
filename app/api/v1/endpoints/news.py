@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_authenticated_user
-from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
+from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.config import settings
 from app.models.news import News
 from app.schemas.news import NewsCreate, NewsUpdate, NewsRead, NewsList
@@ -116,7 +116,7 @@ async def admin_list_news(
 @router.post("/admin", response_model=NewsRead)
 async def create_news(
     data: NewsCreate,
-    admin=Depends(require_fulladmin),
+    admin=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Create a news article."""
@@ -139,7 +139,7 @@ async def create_news(
 async def update_news(
     news_id: int,
     data: NewsUpdate,
-    admin=Depends(require_fulladmin),
+    admin=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Update a news article."""
@@ -173,7 +173,7 @@ async def update_news(
 @router.delete("/admin/{news_id}")
 async def delete_news(
     news_id: int,
-    admin=Depends(require_fulladmin),
+    admin=Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a news article."""
@@ -190,7 +190,7 @@ async def delete_news(
 @router.post("/admin/upload-image")
 async def upload_news_image(
     file: UploadFile = File(...),
-    admin=Depends(require_fulladmin),
+    admin=Depends(require_admin),
 ):
     """Upload an image to Cloudflare R2 and return its public URL."""
     import asyncio
