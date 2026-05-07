@@ -1,7 +1,7 @@
 """
 AI Chat Service – Multi-provider with automatic fallback.
 
-Provider priority: Groq → Gemini 2.5 Flash → OpenAI GPT-4o-mini
+Provider priority: OpenAI GPT-4o-mini → Gemini 2.5 Flash → Groq
 All providers use OpenAI-compatible API format.
 
 All data comes from the Flutter offline bundle (local_results).
@@ -12,8 +12,8 @@ Security:
   • No raw SQL or DB access from this service.
 
 Cost control:
-  • Free providers (Groq, Gemini) used first.
-  • OpenAI used only as last resort.
+  • OpenAI is used first for the main assistant replies.
+  • Gemini and Groq remain as fallback providers.
 """
 
 from __future__ import annotations
@@ -48,16 +48,16 @@ class ProviderConfig:
 
 def _build_providers() -> list[ProviderConfig]:
     """Build provider list from settings. Skip providers with empty keys.
-    Priority: Groq → Gemini → OpenAI
+    Priority: OpenAI → Gemini → Groq
     """
     providers: list[ProviderConfig] = []
 
-    if settings.groq_api_key:
+    if settings.openai_api_key:
         providers.append(ProviderConfig(
-            name="groq",
-            model="llama-3.3-70b-versatile",
-            api_key=settings.groq_api_key,
-            base_url="https://api.groq.com/openai/v1",
+            name="openai",
+            model="gpt-4o-mini",
+            api_key=settings.openai_api_key,
+            base_url=None,
         ))
 
     if settings.gemini_api_key:
@@ -68,12 +68,12 @@ def _build_providers() -> list[ProviderConfig]:
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         ))
 
-    if settings.openai_api_key:
+    if settings.groq_api_key:
         providers.append(ProviderConfig(
-            name="openai",
-            model="gpt-4o-mini",
-            api_key=settings.openai_api_key,
-            base_url=None,
+            name="groq",
+            model="llama-3.3-70b-versatile",
+            api_key=settings.groq_api_key,
+            base_url="https://api.groq.com/openai/v1",
         ))
 
     return providers
