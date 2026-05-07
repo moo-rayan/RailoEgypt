@@ -291,6 +291,47 @@ def _calculate_fastest_train(items: list[dict]) -> dict | None:
     return fastest
 
 
+def _is_fastest_query(user_message: str) -> bool:
+    normalized = (
+        user_message.lower()
+        .replace("أ", "ا")
+        .replace("إ", "ا")
+        .replace("آ", "ا")
+    )
+    return (
+        "اسرع" in normalized
+        or "الاسرع" in normalized
+        or "اقل مدة" in normalized
+        or "اقل مده" in normalized
+    )
+
+
+def _build_fastest_reply(fastest_train: dict, local_results: dict) -> str:
+    train_num = str(fastest_train.get("train", ""))
+    train_type = fastest_train.get("type", "")
+    from_station = local_results.get("from_station") or fastest_train.get("from", "")
+    to_station = local_results.get("to_station") or fastest_train.get("to", "")
+    departure = fastest_train.get("boarding_time") or fastest_train.get("full_departure", "")
+    arrival = fastest_train.get("alighting_time") or fastest_train.get("full_arrival", "")
+    duration = fastest_train.get("segment_duration") or fastest_train.get("full_duration", "")
+
+    parts = [f"أسرع قطار من {from_station} إلى {to_station} هو رقم {train_num}"]
+    if train_type:
+        parts[0] += f" {train_type}"
+    details: list[str] = []
+    if departure:
+        details.append(f"يقوم {departure}")
+    if arrival:
+        details.append(f"ويصل {arrival}")
+    if duration:
+        details.append(f"ومدة الرحلة {duration}")
+    if details:
+        parts.append("، " + "، ".join(details) + ".")
+    else:
+        parts[0] += "."
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Chat with local results (offline bundle from Flutter)
 # ---------------------------------------------------------------------------
@@ -308,6 +349,19 @@ async def _chat_with_local_results(
     # Calculate fastest train for context
     items = local_results.get("items", [])
     fastest_train = _calculate_fastest_train(items)
+    if (
+        local_results.get("tool_used") == "search_trips"
+        and _is_fastest_query(user_message)
+        and fastest_train
+    ):
+        return {
+            "reply": _build_fastest_reply(fastest_train, local_results),
+            "tool_used": local_results.get("tool_used", "search_trips"),
+            "tool_data": local_results,
+            "provider": "computed",
+            "cached": False,
+        }
+
     fastest_info = ""
     if fastest_train:
         train_num = fastest_train.get('train', 'unknown')
@@ -333,7 +387,7 @@ async def _chat_with_local_results(
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT_DATA}]
     if conversation_history:
-        messages.extend(conversation_history[-10:])
+        messages.extend(conversation_history[-3:])
     messages.append({"role": "user", "content": f"{user_message}\n\n{context_note}"})
 
     try:
@@ -418,7 +472,7 @@ async def chat(
     No database queries are performed by this service.
     No caching — every question gets a fresh, dynamic response.
 
-    Provider priority: Groq → Gemini → OpenAI
+    Provider priority: OpenAI → Gemini → Groq
     Auto-fallback on rate limits.
     """
     # If Flutter sent local offline results, use them as context
@@ -433,7 +487,7 @@ async def chat(
     messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT_GENERAL}]
 
     if conversation_history:
-        history_slice = conversation_history[-10:]
+        history_slice = conversation_history[-3:]
         messages.extend(history_slice)
 
     messages.append({"role": "user", "content": user_message})
