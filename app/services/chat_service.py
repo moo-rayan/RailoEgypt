@@ -266,6 +266,18 @@ def _parse_duration_to_minutes(duration_str: str) -> int:
     return (hours * 60) + minutes
 
 
+def _normalize_arabic(text: str) -> str:
+    return (
+        text.lower()
+        .replace("أ", "ا")
+        .replace("إ", "ا")
+        .replace("آ", "ا")
+        .replace("ٱ", "ا")
+        .replace("ى", "ي")
+        .replace("ة", "ه")
+    )
+
+
 def _calculate_fastest_train(items: list[dict]) -> dict | None:
     """
     Find the fastest train from the list based on duration.
@@ -292,18 +304,60 @@ def _calculate_fastest_train(items: list[dict]) -> dict | None:
 
 
 def _is_fastest_query(user_message: str) -> bool:
-    normalized = (
-        user_message.lower()
-        .replace("أ", "ا")
-        .replace("إ", "ا")
-        .replace("آ", "ا")
-    )
+    normalized = _normalize_arabic(user_message)
     return (
         "اسرع" in normalized
         or "الاسرع" in normalized
         or "اقل مدة" in normalized
         or "اقل مده" in normalized
     )
+
+
+def _is_duration_query(user_message: str) -> bool:
+    normalized = _normalize_arabic(user_message)
+    return (
+        "وقت قد اي" in normalized
+        or "وقت قد ايه" in normalized
+        or "كم ساعه" in normalized
+        or "كام ساعه" in normalized
+        or "المده" in normalized
+        or "المدة" in user_message
+        or "هاخد وقت" in normalized
+        or "تستغرق" in normalized
+    )
+
+
+def _sanitize_history_messages(
+    conversation_history: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    if not conversation_history:
+        return []
+
+    sanitized: list[dict[str, str]] = []
+    for item in conversation_history[-3:]:
+        role = item.get("role")
+        content = item.get("content")
+        if role in {"assistant", "user", "system"} and isinstance(content, str) and content.strip():
+            sanitized.append({"role": role, "content": content})
+    return sanitized
+
+
+def _extract_recent_tool_context(
+    conversation_history: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    if not conversation_history:
+        return None
+
+    for item in reversed(conversation_history):
+        if item.get("role") != "assistant":
+            continue
+        tool_data = item.get("tool_data")
+        if isinstance(tool_data, dict) and tool_data:
+            reused = dict(tool_data)
+            if item.get("tool_used") and "tool_used" not in reused:
+                reused["tool_used"] = item["tool_used"]
+            return reused
+    return None
 
 
 def _build_fastest_reply(fastest_train: dict, local_results: dict) -> str:
@@ -332,12 +386,60 @@ def _build_fastest_reply(fastest_train: dict, local_results: dict) -> str:
     return "".join(parts)
 
 
+def _build_duration_reply(local_results: dict) -> str:
+    items = local_results.get("items", [])
+    if not isinstance(items, list) or not items:
+        return "لا توجد بيانات متاحة عن مدة الرحلة المطلوبة."
+
+    valid_items: list[tuple[int, dict[str, Any]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        duration_text = item.get("segment_duration") or item.get("full_duration", "")
+        duration_minutes = _parse_duration_to_minutes(duration_text)
+        if duration_minutes != float("inf"):
+            valid_items.append((duration_minutes, item))
+
+    if not valid_items:
+        return "لا توجد بيانات متاحة عن مدة الرحلة المطلوبة."
+
+    valid_items.sort(key=lambda x: x[0])
+    min_minutes, fastest_item = valid_items[0]
+    max_minutes, slowest_item = valid_items[-1]
+
+    from_station = local_results.get("from_station") or fastest_item.get("from", "")
+    to_station = local_results.get("to_station") or fastest_item.get("to", "")
+    fastest_train = fastest_item.get("train", "")
+    fastest_duration = fastest_item.get("segment_duration") or fastest_item.get("full_duration", "")
+    fastest_departure = fastest_item.get("boarding_time") or fastest_item.get("full_departure", "")
+    fastest_arrival = fastest_item.get("alighting_time") or fastest_item.get("full_arrival", "")
+
+    if len(valid_items) == 1 or min_minutes == max_minutes:
+        details = [f"مدة الرحلة من {from_station} إلى {to_station} هي {fastest_duration}"]
+        if fastest_train:
+            details[0] += f" على القطار رقم {fastest_train}"
+        if fastest_departure:
+            details.append(f"يقوم {fastest_departure}")
+        if fastest_arrival:
+            details.append(f"ويصل {fastest_arrival}")
+        return "، ".join(details) + "."
+
+    slowest_duration = slowest_item.get("segment_duration") or slowest_item.get("full_duration", "")
+    return (
+        f"المدة من {from_station} إلى {to_station} تختلف حسب القطار. "
+        f"أسرع رحلة تستغرق {fastest_duration} على القطار رقم {fastest_train}"
+        f"{f'، يقوم {fastest_departure}' if fastest_departure else ''}"
+        f"{f' ويصل {fastest_arrival}' if fastest_arrival else ''}. "
+        f"وبشكل عام الرحلات المتاحة تتراوح مدتها بين {fastest_duration} و {slowest_duration}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chat with local results (offline bundle from Flutter)
 # ---------------------------------------------------------------------------
 async def _chat_with_local_results(
     user_message: str,
-    conversation_history: list[dict[str, str]] | None,
+    conversation_history: list[dict[str, Any]] | None,
     local_results: dict,
 ) -> dict[str, Any]:
     """
@@ -356,6 +458,18 @@ async def _chat_with_local_results(
     ):
         return {
             "reply": _build_fastest_reply(fastest_train, local_results),
+            "tool_used": local_results.get("tool_used", "search_trips"),
+            "tool_data": local_results,
+            "provider": "computed",
+            "cached": False,
+        }
+
+    if (
+        local_results.get("tool_used") == "search_trips"
+        and _is_duration_query(user_message)
+    ):
+        return {
+            "reply": _build_duration_reply(local_results),
             "tool_used": local_results.get("tool_used", "search_trips"),
             "tool_data": local_results,
             "provider": "computed",
@@ -386,8 +500,7 @@ async def _chat_with_local_results(
     )
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT_DATA}]
-    if conversation_history:
-        messages.extend(conversation_history[-3:])
+    messages.extend(_sanitize_history_messages(conversation_history))
     messages.append({"role": "user", "content": f"{user_message}\n\n{context_note}"})
 
     try:
@@ -462,7 +575,7 @@ async def _chat_with_local_results(
 # ---------------------------------------------------------------------------
 async def chat(
     user_message: str,
-    conversation_history: list[dict[str, str]] | None = None,
+    conversation_history: list[dict[str, Any]] | None = None,
     local_results: dict | None = None,
 ) -> dict[str, Any]:
     """
@@ -475,6 +588,11 @@ async def chat(
     Provider priority: OpenAI → Gemini → Groq
     Auto-fallback on rate limits.
     """
+    # Reuse the last assistant tool context for follow-up questions when the
+    # current message did not produce a fresh local search result.
+    if local_results is None:
+        local_results = _extract_recent_tool_context(conversation_history)
+
     # If Flutter sent local offline results, use them as context
     if local_results and (local_results.get("items") or local_results.get("train_id")):
         return await _chat_with_local_results(
@@ -486,9 +604,7 @@ async def chat(
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT_GENERAL}]
 
-    if conversation_history:
-        history_slice = conversation_history[-3:]
-        messages.extend(history_slice)
+    messages.extend(_sanitize_history_messages(conversation_history))
 
     messages.append({"role": "user", "content": user_message})
 

@@ -4,6 +4,8 @@ AI Chat endpoint – secured, rate-limited, read-only.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends
 
@@ -15,10 +17,10 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
-    history: list[dict[str, str]] = Field(
+    history: list[dict[str, Any]] = Field(
         default=[],
-        max_items=10,
-        description="آخر 10 رسائل من المحادثة [{role, content}]",
+        max_items=3,
+        description="آخر 3 ردود من المساعد [{role, content, tool_used?, tool_data?}]",
     )
     local_results: dict | None = Field(
         default=None,
