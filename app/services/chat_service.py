@@ -283,7 +283,7 @@ def _calculate_fastest_train(items: list[dict]) -> dict | None:
         if not isinstance(item, dict):
             continue
 
-        duration_str = item.get('full_duration', '')
+        duration_str = item.get('segment_duration') or item.get('full_duration', '')
         minutes = _parse_duration_to_minutes(duration_str)
 
         if minutes < fastest_minutes:
@@ -313,7 +313,7 @@ async def _chat_with_local_results(
     fastest_info = ""
     if fastest_train:
         train_num = fastest_train.get('train', 'unknown')
-        duration = fastest_train.get('full_duration', 'unknown')
+        duration = fastest_train.get('segment_duration') or fastest_train.get('full_duration', 'unknown')
         fastest_info = f"\n=== معلومة محسوبة مسبقاً ===\nالقطار الأسرع هو رقم {train_num} (مدة: {duration})\n===\n"
 
     results_json = json.dumps(local_results, ensure_ascii=False)
