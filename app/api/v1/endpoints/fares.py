@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import require_admin
 from app.core.database import get_db
+from app.core.security import require_authenticated_user
 from app.models.station import Station
 from app.models.trip_fare import TripFare
+from app.services.enr_fare_refresh_service import refresh_route_fares_from_enr
 
 router = APIRouter(prefix="/fares", tags=["fares"])
 
@@ -49,6 +51,29 @@ class FareUpdate(BaseModel):
     class_name_ar: str | None = None
     class_name_en: str | None = None
     price: int | None = None
+
+
+class FareRefreshRequest(BaseModel):
+    from_station_id: int
+    to_station_id: int
+
+
+class FareRefreshItem(BaseModel):
+    class_ar: str
+    class_en: str
+    price: int
+    source: str = "online"
+
+
+class FareRefreshResponse(BaseModel):
+    ok: bool
+    departure_date: str
+    seen_count: int
+    inserted_count: int
+    updated_count: int
+    unchanged_count: int
+    missing_train_count: int
+    route_fares: dict[str, list[FareRefreshItem]]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -107,6 +132,31 @@ def _apply_filters(query, count_query, from_st, to_st, *,
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/refresh-route",
+    response_model=FareRefreshResponse,
+    dependencies=[Depends(require_authenticated_user)],
+)
+async def refresh_route_fares(
+    payload: FareRefreshRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch live ENR fares for a station pair, upsert known train fares, and return route fares."""
+    try:
+        return await refresh_route_fares_from_enr(
+            db,
+            from_station_id=payload.from_station_id,
+            to_station_id=payload.to_station_id,
+        )
+    except ValueError as exc:
+        if str(exc) == "station_not_found":
+            raise HTTPException(status_code=404, detail="Station not found") from exc
+        if str(exc) == "station_missing_enr_id":
+            raise HTTPException(status_code=400, detail="Station is missing ENR ID") from exc
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Unable to refresh fares from ENR") from exc
 
 @router.get("", response_model=FareListResponse, dependencies=[Depends(require_admin)])
 async def list_fares(
