@@ -1,8 +1,11 @@
 """Admin endpoints for managing trip fares."""
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.admin_auth import require_admin
@@ -29,6 +32,7 @@ class FareItem(BaseModel):
     class_name_ar: str
     class_name_en: str
     price: int
+    online_updated_at: datetime | None = None
 
 
 class FareListResponse(BaseModel):
@@ -76,6 +80,27 @@ class FareRefreshResponse(BaseModel):
     route_fares: dict[str, list[FareRefreshItem]]
 
 
+class OnlineFareRouteStat(BaseModel):
+    from_station_id: int
+    from_station_ar: str
+    from_station_en: str
+    to_station_id: int
+    to_station_ar: str
+    to_station_en: str
+    fare_count: int
+    train_count: int
+    last_online_update: datetime | None
+
+
+class OnlineFareStatsResponse(BaseModel):
+    total_online_updated: int
+    updated_today: int
+    routes_count: int
+    trains_count: int
+    last_online_update: datetime | None
+    recent_routes: list[OnlineFareRouteStat]
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _base_query():
@@ -96,6 +121,7 @@ def _base_query():
             TripFare.class_name_ar,
             TripFare.class_name_en,
             TripFare.price,
+            TripFare.online_updated_at,
         )
         .join(from_st, TripFare.from_station_id == from_st.c.id)
         .join(to_st, TripFare.to_station_id == to_st.c.id)
@@ -158,6 +184,110 @@ async def refresh_route_fares(
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Unable to refresh fares from ENR") from exc
 
+
+@router.get(
+    "/online-stats",
+    response_model=OnlineFareStatsResponse,
+    dependencies=[Depends(require_admin)],
+)
+async def get_online_fare_stats(
+    limit: int = Query(8, ge=1, le=30),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return dashboard stats for fares refreshed from the live ENR endpoint."""
+    online_filter = TripFare.online_updated_at.is_not(None)
+
+    summary = (
+        await db.execute(
+            select(
+                func.count(TripFare.id).label("total_online_updated"),
+                func.count(func.distinct(TripFare.train_number)).label("trains_count"),
+                func.max(TripFare.online_updated_at).label("last_online_update"),
+            ).where(online_filter)
+        )
+    ).one()
+
+    route_pairs = (
+        select(TripFare.from_station_id, TripFare.to_station_id)
+        .where(online_filter)
+        .distinct()
+        .subquery()
+    )
+    routes_count = (
+        await db.execute(select(func.count()).select_from(route_pairs))
+    ).scalar_one()
+
+    cairo_tz = ZoneInfo("Africa/Cairo")
+    cairo_today = datetime.now(cairo_tz).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    updated_today = (
+        await db.execute(
+            select(func.count(TripFare.id)).where(
+                TripFare.online_updated_at >= cairo_today
+            )
+        )
+    ).scalar_one()
+
+    from_st = Station.__table__.alias("from_st")
+    to_st = Station.__table__.alias("to_st")
+    last_update = func.max(TripFare.online_updated_at).label("last_online_update")
+
+    recent_rows = (
+        await db.execute(
+            select(
+                TripFare.from_station_id,
+                from_st.c.name_ar.label("from_station_ar"),
+                from_st.c.name_en.label("from_station_en"),
+                TripFare.to_station_id,
+                to_st.c.name_ar.label("to_station_ar"),
+                to_st.c.name_en.label("to_station_en"),
+                func.count(TripFare.id).label("fare_count"),
+                func.count(func.distinct(TripFare.train_number)).label("train_count"),
+                last_update,
+            )
+            .join(from_st, TripFare.from_station_id == from_st.c.id)
+            .join(to_st, TripFare.to_station_id == to_st.c.id)
+            .where(online_filter)
+            .group_by(
+                TripFare.from_station_id,
+                from_st.c.name_ar,
+                from_st.c.name_en,
+                TripFare.to_station_id,
+                to_st.c.name_ar,
+                to_st.c.name_en,
+            )
+            .order_by(last_update.desc())
+            .limit(limit)
+        )
+    ).all()
+
+    return OnlineFareStatsResponse(
+        total_online_updated=summary.total_online_updated or 0,
+        updated_today=updated_today or 0,
+        routes_count=routes_count or 0,
+        trains_count=summary.trains_count or 0,
+        last_online_update=summary.last_online_update,
+        recent_routes=[
+            OnlineFareRouteStat(
+                from_station_id=row.from_station_id,
+                from_station_ar=row.from_station_ar,
+                from_station_en=row.from_station_en,
+                to_station_id=row.to_station_id,
+                to_station_ar=row.to_station_ar,
+                to_station_en=row.to_station_en,
+                fare_count=row.fare_count,
+                train_count=row.train_count,
+                last_online_update=row.last_online_update,
+            )
+            for row in recent_rows
+        ],
+    )
+
+
 @router.get("", response_model=FareListResponse, dependencies=[Depends(require_admin)])
 async def list_fares(
     page: int = Query(1, ge=1),
@@ -207,6 +337,7 @@ async def list_fares(
             class_name_ar=r.class_name_ar,
             class_name_en=r.class_name_en,
             price=r.price,
+            online_updated_at=r.online_updated_at,
         )
         for r in rows
     ]
@@ -271,6 +402,7 @@ async def create_fare(
         class_name_ar=fare.class_name_ar,
         class_name_en=fare.class_name_en,
         price=fare.price,
+        online_updated_at=fare.online_updated_at,
     )
 
 
@@ -355,6 +487,7 @@ async def update_fare(
         class_name_ar=fare.class_name_ar,
         class_name_en=fare.class_name_en,
         price=fare.price,
+        online_updated_at=fare.online_updated_at,
     )
 
 
