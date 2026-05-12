@@ -45,6 +45,7 @@ _DISABLED_KEY = "tchat:{train_id}:disabled"
 # ── Message types ─────────────────────────────────────────────────────────────
 
 VALID_MESSAGE_TYPES = {"normal", "lost_item", "found_item"}
+VALID_ADMIN_NAMES = {"مشرف", "مسؤول"}
 
 
 # ── Sanitization ──────────────────────────────────────────────────────────────
@@ -69,6 +70,13 @@ def sanitize_message(text: str) -> str:
     text = html.escape(text, quote=True)
     text = _MULTISPACE_RE.sub('  ', text)
     return text[:_MAX_MESSAGE_LENGTH]
+
+
+def normalize_admin_name(name: str | None) -> str:
+    clean_name = sanitize_message(name or "").strip()
+    if clean_name == "المشرف":
+        clean_name = "مشرف"
+    return clean_name if clean_name in VALID_ADMIN_NAMES else "مشرف"
 
 
 # ── Chat Room ─────────────────────────────────────────────────────────────────
@@ -455,7 +463,7 @@ class TrainChatManager:
         self,
         train_id: str,
         text: str,
-        admin_name: str = "المشرف",
+        admin_name: str = "مشرف",
     ) -> dict:
         """
         Send a message from admin. No rate-limit, no ban check.
@@ -471,7 +479,7 @@ class TrainChatManager:
         message = {
             "id": str(uuid.uuid4()),
             "user_id": "admin",
-            "user_name": admin_name,
+            "user_name": normalize_admin_name(admin_name),
             "user_avatar": "",
             "text": clean_text,
             "type": "admin",

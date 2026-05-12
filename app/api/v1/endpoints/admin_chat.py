@@ -117,7 +117,7 @@ async def admin_chat_ws(
                     result = await train_chat_manager.process_admin_message(
                         train_id=train_id,
                         text=msg_text,
-                        admin_name=data.get("admin_name", "المشرف"),
+                        admin_name=data.get("admin_name", "مشرف"),
                     )
                     if not result.get("ok"):
                         await ws.send_json({"type": "error", "data": result})
@@ -136,7 +136,7 @@ async def admin_chat_ws(
 
 class AdminMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=300)
-    admin_name: str = Field("المشرف", max_length=30)
+    admin_name: str = Field("مشرف", max_length=30)
 
 
 @router.post("/{train_id}/send", dependencies=[Depends(get_admin_or_legacy_key)])
