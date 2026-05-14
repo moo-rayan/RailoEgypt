@@ -29,7 +29,7 @@ router = APIRouter(prefix="/admin/audit", tags=["Admin Audit"])
 _VALID_EVENT_TYPES = {
     "rate_limit", "auth_failure", "brute_force", "bot_detected",
     "path_scan", "spam", "attack", "suspicious", "admin_action",
-    "forbidden_access", "token_abuse", "invalid_input",
+    "forbidden_access", "token_abuse", "invalid_input", "ip_block",
 }
 _VALID_SEVERITIES = {"info", "warning", "critical"}
 _IP_RE = re.compile(r'^[0-9a-fA-F.:]+$')
@@ -118,6 +118,7 @@ async def get_audit_stats(
         f"  COUNT(*) FILTER (WHERE event_type = 'suspicious') AS suspicious, "
         f"  COUNT(*) FILTER (WHERE event_type = 'admin_action') AS admin_actions, "
         f"  COUNT(*) FILTER (WHERE event_type = 'forbidden_access') AS forbidden, "
+        f"  COUNT(*) FILTER (WHERE event_type = 'ip_block') AS ip_blocks, "
         f"  COUNT(DISTINCT ip_address) AS unique_ips "
         f'FROM "EgRailway".audit_log '
         f"WHERE created_at >= NOW() - make_interval(hours => {safe_hours})"
@@ -143,8 +144,9 @@ async def get_audit_stats(
             "suspicious": row[11],
             "admin_action": row[12],
             "forbidden_access": row[13],
+            "ip_block": row[14],
         },
-        "unique_ips": row[14],
+        "unique_ips": row[15],
     }
 
 

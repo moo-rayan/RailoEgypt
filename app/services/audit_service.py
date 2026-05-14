@@ -44,6 +44,7 @@ SUSPICIOUS       = "suspicious"
 ADMIN_ACTION     = "admin_action"
 FORBIDDEN_ACCESS = "forbidden_access"
 TOKEN_ABUSE      = "token_abuse"
+IP_BLOCK         = "ip_block"
 
 # ── Severity levels ──────────────────────────────────────────────────────────
 INFO     = "info"
