@@ -17,6 +17,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy import select, func, desc
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -24,11 +25,18 @@ from app.core.security import require_authenticated_user
 from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.config import settings
 from app.models.news import News
+from app.models.news_view import NewsView
 from app.schemas.news import NewsCreate, NewsUpdate, NewsRead, NewsList
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/news", tags=["News"])
+
+
+def _news_read(article: News, view_count: int = 0) -> NewsRead:
+    data = NewsRead.model_validate(article)
+    data.view_count = view_count
+    return data
 
 
 # ── Public endpoints (Flutter app) ─────────────────────────────────────────
@@ -61,7 +69,7 @@ async def list_published_news(
         .offset(offset)
         .limit(page_size)
     )
-    items = [NewsRead.model_validate(r) for r in rows.scalars().all()]
+    items = [_news_read(r) for r in rows.scalars().all()]
 
     return NewsList(items=items, total=total, page=page, page_size=page_size)
 
@@ -84,6 +92,36 @@ async def get_latest_news_id(db: AsyncSession = Depends(get_db)):
     return {"latest_id": result.id, "published_at": result.published_at}
 
 
+@router.post("/{news_id}/view")
+async def mark_news_viewed(
+    news_id: int,
+    user_id: str = Depends(require_authenticated_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record that the authenticated user opened a news article."""
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid user ID")
+
+    exists_q = await db.execute(
+        select(News.id).where(News.id == news_id, News.is_published == True)
+    )
+    if exists_q.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="News article not found")
+
+    stmt = (
+        insert(NewsView)
+        .values(news_id=news_id, user_id=user_uuid)
+        .on_conflict_do_update(
+            constraint="uq_news_views_news_user",
+            set_={"viewed_at": func.now()},
+        )
+    )
+    await db.execute(stmt)
+    return {"ok": True}
+
+
 # ── Admin endpoints (Dashboard) ────────────────────────────────────────────
 
 
@@ -103,12 +141,14 @@ async def admin_list_news(
     total = total_q.scalar() or 0
 
     rows = await db.execute(
-        select(News)
+        select(News, func.count(NewsView.user_id).label("view_count"))
+        .outerjoin(NewsView, NewsView.news_id == News.id)
+        .group_by(News.id)
         .order_by(desc(News.created_at))
         .offset(offset)
         .limit(page_size)
     )
-    items = [NewsRead.model_validate(r) for r in rows.scalars().all()]
+    items = [_news_read(article, int(view_count or 0)) for article, view_count in rows.all()]
 
     return NewsList(items=items, total=total, page=page, page_size=page_size)
 
@@ -132,7 +172,7 @@ async def create_news(
     await db.flush()
     await db.refresh(article)
     logger.info("News created: id=%s title=%s", article.id, article.title[:50])
-    return NewsRead.model_validate(article)
+    return _news_read(article)
 
 
 @router.put("/admin/{news_id}", response_model=NewsRead)
@@ -167,7 +207,11 @@ async def update_news(
     await db.flush()
     await db.refresh(article)
     logger.info("News updated: id=%s", article.id)
-    return NewsRead.model_validate(article)
+    view_count_q = await db.execute(
+        select(func.count(NewsView.user_id)).where(NewsView.news_id == article.id)
+    )
+    view_count = view_count_q.scalar() or 0
+    return _news_read(article, int(view_count))
 
 
 @router.delete("/admin/{news_id}")

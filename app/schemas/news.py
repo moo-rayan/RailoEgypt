@@ -28,6 +28,7 @@ class NewsRead(BaseModel):
     published_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    view_count: int = 0
 
 
 class NewsList(BaseModel):

@@ -4,6 +4,7 @@ from app.models.app_config import AppConfig
 from app.models.audit_log import AuditLog
 from app.models.device_token import DeviceToken
 from app.models.news import News
+from app.models.news_view import NewsView
 from app.models.notification_history import NotificationHistory
 from app.models.profile import Profile
 from app.models.railway_graph import RailwayGraphData
@@ -19,6 +20,7 @@ __all__ = [
     "AuditLog",
     "DeviceToken",
     "News",
+    "NewsView",
     "NotificationHistory",
     "Profile",
     "RailwayGraphData",
