@@ -8,7 +8,7 @@ GET  /api/v1/train-chat/{train_id}/messages
     Get recent messages (requires auth).
 
 GET  /api/v1/train-chat/{train_id}/pinned
-    Get pinned messages (lost/found items).
+    Get pinned messages (emergency/lost/found items).
 
 GET  /api/v1/train-chat/{train_id}/count
     Lightweight message count (for badge).
@@ -189,7 +189,7 @@ async def chat_websocket(
     WebSocket endpoint for train chat.
 
     Client sends:
-      {"type": "message", "text": "...", "msg_type": "normal|lost_item|found_item"}
+      {"type": "message", "text": "...", "msg_type": "normal|emergency|lost_item|found_item"}
 
     Client receives:
       {"type": "chat_message", "data": {...message...}}
@@ -296,7 +296,7 @@ async def get_pinned_messages(
     train_id: str,
     authorization: str = Header(..., description="Bearer <supabase_access_token>"),
 ):
-    """Get pinned messages (lost/found items) for a train."""
+    """Get pinned messages (emergency/lost/found items) for a train."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization header")
     user = await verify_supabase_token(authorization[7:])
