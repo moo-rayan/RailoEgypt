@@ -242,6 +242,7 @@ async def chat_websocket(
             if msg_type_ws == "message":
                 text = data.get("text", "")
                 msg_type = data.get("msg_type", "normal")
+                reply_to = data.get("reply_to")
 
                 result = await train_chat_manager.process_message(
                     train_id=train_id,
@@ -250,6 +251,7 @@ async def chat_websocket(
                     user_avatar=unquote(user_avatar),
                     text=text,
                     msg_type=msg_type,
+                    reply_to=reply_to if isinstance(reply_to, dict) else None,
                 )
 
                 if not result.get("ok"):

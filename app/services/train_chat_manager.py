@@ -315,6 +315,7 @@ class TrainChatManager:
         user_avatar: str,
         text: str,
         msg_type: str = "normal",
+        reply_to: dict | None = None,
     ) -> dict:
         """
         Validate, sanitize, store and broadcast a chat message.
@@ -375,6 +376,15 @@ class TrainChatManager:
             "pinned": is_pinned,
             "timestamp": _iso_now(),
         }
+
+        if isinstance(reply_to, dict):
+            reply_message_id = sanitize_message(str(reply_to.get("message_id", "")))[:80]
+            reply_user_name = sanitize_message(str(reply_to.get("user_name", "")))[:30]
+            reply_text = sanitize_message(str(reply_to.get("text", "")))[:80]
+            if reply_message_id and reply_text:
+                message["reply_to_message_id"] = reply_message_id
+                message["reply_to_user_name"] = reply_user_name or "مجهول"
+                message["reply_to_text"] = reply_text
 
         # Store
         await self.store_message(train_id, message)
