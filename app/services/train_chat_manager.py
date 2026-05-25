@@ -250,7 +250,7 @@ class TrainChatManager:
         )
 
         disconnected: list[str] = []
-        for uid, ws in room.connections.items():
+        for uid, ws in list(room.connections.items()):
             if uid == exclude_user:
                 continue
             try:
@@ -263,7 +263,7 @@ class TrainChatManager:
 
         # Also send to admin observers
         dead_admins: list[str] = []
-        for oid, ws in room.admin_observers.items():
+        for oid, ws in list(room.admin_observers.items()):
             try:
                 await ws.send_text(payload)
             except Exception:
@@ -287,7 +287,7 @@ class TrainChatManager:
 
         payload = json.dumps(msg, ensure_ascii=False)
         disconnected: list[str] = []
-        for uid, ws in room.connections.items():
+        for uid, ws in list(room.connections.items()):
             try:
                 await ws.send_text(payload)
             except Exception:
@@ -297,7 +297,7 @@ class TrainChatManager:
 
         # Also send to admin observers
         dead_admins: list[str] = []
-        for oid, ws in room.admin_observers.items():
+        for oid, ws in list(room.admin_observers.items()):
             try:
                 await ws.send_text(payload)
             except Exception:
