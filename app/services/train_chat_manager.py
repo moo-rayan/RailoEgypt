@@ -3,7 +3,7 @@ Train Chat Manager – Real-time chat rooms per train.
 
 Redis storage:
   tchat:{train_id}:msgs     — List of JSON messages (newest first)
-  tchat:{train_id}:pinned   — List of pinned messages (emergency/lost/found items)
+  tchat:{train_id}:pinned   — List of pinned messages (emergency/lost/found/ticket sale)
   tchat:{train_id}:count    — Total message counter
   tchat:{train_id}:rate:{uid} — Rate-limit key (TTL 5s)
 
@@ -44,7 +44,7 @@ _DISABLED_KEY = "tchat:{train_id}:disabled"
 
 # ── Message types ─────────────────────────────────────────────────────────────
 
-VALID_MESSAGE_TYPES = {"normal", "emergency", "lost_item", "found_item"}
+VALID_MESSAGE_TYPES = {"normal", "emergency", "lost_item", "found_item", "ticket_sale"}
 VALID_ADMIN_NAMES = {"مشرف", "مسؤول"}
 
 
@@ -183,7 +183,7 @@ class TrainChatManager:
             logger.error("Failed to store message: %s", exc)
 
     async def store_pinned(self, train_id: str, message: dict) -> None:
-        """Store a pinned message (emergency/lost/found item)."""
+        """Store a pinned message (emergency/lost/found/ticket sale)."""
         try:
             r = await get_redis()
             pin_key = _PIN_KEY.format(train_id=train_id)
@@ -360,7 +360,7 @@ class TrainChatManager:
             return {"ok": False, "error": "empty_after_sanitize"}
 
         # Build message object
-        is_pinned = msg_type in ("emergency", "lost_item", "found_item")
+        is_pinned = msg_type in ("emergency", "lost_item", "found_item", "ticket_sale")
         # Validate avatar URL: only allow http(s) URLs
         safe_avatar = ""
         if user_avatar and user_avatar.startswith(("https://", "http://")):
