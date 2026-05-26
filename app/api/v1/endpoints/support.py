@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import verify_supabase_token
-from app.core.admin_auth import get_admin_or_legacy_key, require_fulladmin
+from app.core.admin_auth import get_admin_or_legacy_key
 from app.services.admin_alert_service import create_alert
 
 logger = logging.getLogger(__name__)
@@ -319,7 +319,7 @@ async def update_contact(
     item_id: int,
     status: str = Query(None),
     admin_notes: str = Query(None),
-    _=Depends(require_fulladmin),
+    _=Depends(get_admin_or_legacy_key),
     db: AsyncSession = Depends(get_db),
 ):
     sets = []
@@ -346,7 +346,7 @@ async def update_report(
     item_id: int,
     status: str = Query(None),
     admin_notes: str = Query(None),
-    _=Depends(require_fulladmin),
+    _=Depends(get_admin_or_legacy_key),
     db: AsyncSession = Depends(get_db),
 ):
     sets = []
