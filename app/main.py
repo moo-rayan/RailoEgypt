@@ -282,6 +282,22 @@ async def _stale_contributor_scheduler():
             logger.error("Stale contributor scheduler error: %s", exc)
 
 
+async def _chat_cleanup_scheduler():
+    """Background task: clean up expired chat rooms every 30 minutes.
+    Sends 'chat_expired' FCM signal so clients unsubscribe from stale topics."""
+    from app.services.train_chat_manager import train_chat_manager
+    while True:
+        try:
+            await asyncio.sleep(1800)  # 30 minutes
+            cleaned = await train_chat_manager.cleanup_expired_chats()
+            if cleaned:
+                logger.info("🗑️ Chat cleanup: %d expired chats cleaned", cleaned)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Chat cleanup scheduler error: %s", exc)
+
+
 async def _account_deletion_scheduler():
     """Background task: process expired account deletion requests every 6 hours."""
     from datetime import datetime, timezone
@@ -414,11 +430,12 @@ async def lifespan(app: FastAPI):
     deletion_task = asyncio.create_task(_account_deletion_scheduler())
     stale_task = asyncio.create_task(_stale_contributor_scheduler())
     bundle_sync_task = asyncio.create_task(_bundle_sync_checker())
+    chat_cleanup_task = asyncio.create_task(_chat_cleanup_scheduler())
 
     yield
 
     # Cleanup: cancel background tasks
-    for task in (deletion_task, stale_task, bundle_sync_task):
+    for task in (deletion_task, stale_task, bundle_sync_task, chat_cleanup_task):
         task.cancel()
         try:
             await task

@@ -26,6 +26,7 @@ from fastapi import WebSocket
 from app.core.cache import get_redis
 from app.services.chat_report_service import check_user_banned
 from app.services import fcm_service
+from app.services.tracking_manager import tracking_manager
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +36,14 @@ _MAX_MESSAGE_LENGTH = 150
 _RATE_LIMIT_SECONDS = 5
 _MAX_MESSAGES_STORED = 200        # Keep last 200 messages per train
 _MAX_PINNED_MESSAGES = 10         # Max pinned messages per train
-_CHAT_TTL_SECONDS = 86400         # 24 hours
+_CHAT_TTL_SECONDS = 57600         # 16 hours (max realistic journey + buffer)
 _MSG_KEY = "tchat:{train_id}:msgs"
 _PIN_KEY = "tchat:{train_id}:pinned"
 _COUNT_KEY = "tchat:{train_id}:count"
 _RATE_KEY = "tchat:{train_id}:rate:{user_id}"
 _DISABLED_KEY = "tchat:{train_id}:disabled"
+_FCM_SUBS_KEY = "tchat:{train_id}:fcm_subs"  # Set of user_ids subscribed to FCM topic
+_CREATED_KEY = "tchat:{train_id}:created"     # Timestamp of first message
 
 # ── Message types ─────────────────────────────────────────────────────────────
 
@@ -396,16 +399,28 @@ class TrainChatManager:
 
         # Send FCM push to topic subscribers (background/terminated users)
         try:
+            room = tracking_manager.get_room(train_id)
+            fcm_data = {
+                "type": "chat_message",
+                "sender_id": user_id,
+                "train_id": train_id,
+                "sender_name": sanitize_message(user_name)[:30],
+                "text": clean_text[:100],
+            }
+            if room is not None:
+                if room.trip_id is not None:
+                    fcm_data["trip_id"] = room.trip_id
+                if room.start_station:
+                    fcm_data["start_station"] = room.start_station
+                if room.end_station:
+                    fcm_data["end_station"] = room.end_station
+
             await fcm_service.send_to_topic(
                 topic=f"train_chat_{train_id}",
-                data={
-                    "type": "chat_message",
-                    "sender_id": user_id,
-                    "train_id": train_id,
-                    "sender_name": sanitize_message(user_name)[:30],
-                    "text": clean_text[:100],
-                },
+                data=fcm_data,
             )
+            # Track this user as an FCM subscriber for cleanup
+            await self._track_fcm_subscriber(train_id, user_id)
         except Exception as exc:
             logger.warning("FCM topic push failed for %s: %s", train_id, exc)
 
@@ -545,9 +560,14 @@ class TrainChatManager:
                 _MSG_KEY.format(train_id=train_id),
                 _PIN_KEY.format(train_id=train_id),
                 _COUNT_KEY.format(train_id=train_id),
+                _DISABLED_KEY.format(train_id=train_id),
+                _FCM_SUBS_KEY.format(train_id=train_id),
+                _CREATED_KEY.format(train_id=train_id),
             ]
             await r.delete(*keys)
 
+            # Signal FCM subscribers to unsubscribe
+            await self.send_chat_expired_signal(train_id)
             # Broadcast clear to all connected clients
             await self._broadcast_chat_cleared(train_id)
             logger.info("🗑️ Chat cleared for train %s", train_id)
@@ -596,6 +616,90 @@ class TrainChatManager:
                 await ws.send_text(payload)
             except Exception:
                 pass
+
+    # ── FCM subscriber tracking ────────────────────────────────────────
+
+    async def _track_fcm_subscriber(self, train_id: str, user_id: str) -> None:
+        """Track a user as an FCM topic subscriber in Redis (auto-expires with chat)."""
+        try:
+            r = await get_redis()
+            subs_key = _FCM_SUBS_KEY.format(train_id=train_id)
+            created_key = _CREATED_KEY.format(train_id=train_id)
+
+            pipe = r.pipeline()
+            pipe.sadd(subs_key, user_id)
+            pipe.expire(subs_key, _CHAT_TTL_SECONDS)
+            # Track creation time (only set if not exists)
+            pipe.setnx(created_key, str(int(time.time())))
+            pipe.expire(created_key, _CHAT_TTL_SECONDS)
+            await pipe.execute()
+        except Exception as exc:
+            logger.warning("Failed to track FCM subscriber: %s", exc)
+
+    async def get_fcm_subscriber_count(self, train_id: str) -> int:
+        """Get count of FCM topic subscribers for a train."""
+        try:
+            r = await get_redis()
+            key = _FCM_SUBS_KEY.format(train_id=train_id)
+            return await r.scard(key)
+        except Exception:
+            return 0
+
+    async def send_chat_expired_signal(self, train_id: str) -> None:
+        """Send a 'chat_expired' FCM data message to the topic.
+        Clients receiving this should unsubscribe from the topic."""
+        try:
+            await fcm_service.send_to_topic(
+                topic=f"train_chat_{train_id}",
+                data={
+                    "type": "chat_expired",
+                    "train_id": train_id,
+                },
+            )
+            logger.info("📤 Sent chat_expired signal for train %s", train_id)
+        except Exception as exc:
+            logger.warning("Failed to send chat_expired for %s: %s", train_id, exc)
+
+    async def cleanup_expired_chats(self) -> int:
+        """Check for chats that should have expired and send cleanup signals.
+        Returns the number of expired chats cleaned up."""
+        try:
+            r = await get_redis()
+            # Scan for all chat creation keys
+            cleaned = 0
+            async for key in r.scan_iter(match="tchat:*:created"):
+                key_str = key if isinstance(key, str) else key.decode()
+                train_id = key_str.split(":")[1]
+
+                created_at = await r.get(key)
+                if not created_at:
+                    continue
+
+                age = int(time.time()) - int(created_at)
+                if age >= _CHAT_TTL_SECONDS:
+                    # Chat has expired — send signal and clean up
+                    await self.send_chat_expired_signal(train_id)
+
+                    # Delete all chat keys for this train
+                    keys_to_delete = [
+                        _MSG_KEY.format(train_id=train_id),
+                        _PIN_KEY.format(train_id=train_id),
+                        _COUNT_KEY.format(train_id=train_id),
+                        _DISABLED_KEY.format(train_id=train_id),
+                        _FCM_SUBS_KEY.format(train_id=train_id),
+                        key_str,
+                    ]
+                    await r.delete(*keys_to_delete)
+                    cleaned += 1
+                    logger.info(
+                        "🗑️ Expired chat cleaned up: train %s (age: %dh)",
+                        train_id, age // 3600,
+                    )
+
+            return cleaned
+        except Exception as exc:
+            logger.error("Chat cleanup error: %s", exc)
+            return 0
 
     def get_room_user_count(self, train_id: str) -> int:
         """Get the number of connected users in a chat room."""

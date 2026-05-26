@@ -1250,6 +1250,7 @@ class TrackingManager:
         """Return compact position dict suitable for HTTP responses."""
         return {
             "tid": room.train_id,
+            "trip_id": room.trip_id,
             "la": round(room.lat, 6),
             "ln": round(room.lng, 6),
             "sp": round(room.speed, 1),

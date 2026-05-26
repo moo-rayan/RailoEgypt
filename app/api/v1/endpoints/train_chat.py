@@ -107,8 +107,9 @@ async def get_chat_ticket(
                 )
                 await session.commit()
         else:
-            # No profile row (edge case) — use real name
+            # No profile row (edge case) — still respect the explicit client choice.
             chat_alias = f"مسافر {random.randint(1000, 9999)}"
+            is_anonymous = bool(body is not None and body.anonymous is True)
 
     # Decide which name to display
     display_name = chat_alias if is_anonymous else real_name
@@ -172,6 +173,46 @@ async def set_chat_preferences(
         "ok": True,
         "chat_alias": chat_alias,
         "chat_anonymous": body.anonymous,
+    }
+
+
+@router.get("/preferences")
+async def get_chat_preferences(
+    authorization: str = Header(..., description="Bearer <supabase_access_token>"),
+):
+    """Return the stored chat identity preference for the current user."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    token = authorization[7:]
+
+    user = await verify_supabase_token(token)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user_id = user.get("id", "")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID not found")
+
+    async with AsyncSessionFactory() as session:
+        row = await session.execute(
+            select(Profile.chat_alias, Profile.chat_anonymous).where(Profile.id == cast(user_id, UUID))
+        )
+        profile = row.first()
+
+    if profile is None:
+        return {
+            "ok": True,
+            "mode_chosen": False,
+            "chat_alias": None,
+            "chat_anonymous": False,
+        }
+
+    return {
+        "ok": True,
+        # chat_alias is only generated when the user has entered/selected chat mode before.
+        "mode_chosen": bool(profile.chat_alias),
+        "chat_alias": profile.chat_alias,
+        "chat_anonymous": bool(profile.chat_anonymous),
     }
 
 
