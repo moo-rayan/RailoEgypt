@@ -489,6 +489,7 @@ class TrainChatManager:
         train_id: str,
         text: str,
         admin_name: str = "مشرف",
+        reply_to: dict | None = None,
     ) -> dict:
         """
         Send a message from admin. No rate-limit, no ban check.
@@ -512,6 +513,15 @@ class TrainChatManager:
             "pinned": False,
             "timestamp": _iso_now(),
         }
+
+        if isinstance(reply_to, dict):
+            reply_message_id = sanitize_message(str(reply_to.get("message_id", "")))[:80]
+            reply_user_name = sanitize_message(str(reply_to.get("user_name", "")))[:30]
+            reply_text = sanitize_message(str(reply_to.get("text", "")))[:80]
+            if reply_message_id and reply_text:
+                message["reply_to_message_id"] = reply_message_id
+                message["reply_to_user_name"] = reply_user_name or "مجهول"
+                message["reply_to_text"] = reply_text
 
         await self.store_message(train_id, message)
         await self.broadcast(train_id, message)

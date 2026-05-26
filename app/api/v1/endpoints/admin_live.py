@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from app.core.admin_auth import AdminUser, get_admin_or_legacy_key, require_admin, require_fulladmin
 from app.services.audit_service import audit
 from app.services.ban_service import ban_contributor, is_banned, list_bans, unban_contributor
+from app.services.train_chat_manager import train_chat_manager
 from app.services.tracking_manager import tracking_manager
 
 logger = logging.getLogger(__name__)
@@ -173,12 +174,14 @@ async def get_admin_rooms():
             # Wrong location reports
             count = await redis.hget(f"wrong_loc:{tid}", "count")
             room["wrong_location_reports"] = int(count) if count else 0
+            room["chat_message_count"] = await train_chat_manager.get_message_count(tid)
             # Crowd reports
             crowd_data = await redis.hgetall(f"crowd:{tid}")
             room["crowd_crowded"] = int(crowd_data.get("crowded", 0) if isinstance(crowd_data.get("crowded"), (str, int)) else (crowd_data.get(b"crowded", 0)))
             room["crowd_not_crowded"] = int(crowd_data.get("not_crowded", 0) if isinstance(crowd_data.get("not_crowded"), (str, int)) else (crowd_data.get(b"not_crowded", 0)))
         else:
             room["wrong_location_reports"] = 0
+            room["chat_message_count"] = 0
             room["crowd_crowded"] = 0
             room["crowd_not_crowded"] = 0
 

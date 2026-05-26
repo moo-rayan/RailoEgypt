@@ -118,6 +118,7 @@ async def admin_chat_ws(
                         train_id=train_id,
                         text=msg_text,
                         admin_name=data.get("admin_name", "مشرف"),
+                        reply_to=data.get("reply_to") if isinstance(data.get("reply_to"), dict) else None,
                     )
                     if not result.get("ok"):
                         await ws.send_json({"type": "error", "data": result})
@@ -137,6 +138,7 @@ async def admin_chat_ws(
 class AdminMessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=300)
     admin_name: str = Field("مشرف", max_length=30)
+    reply_to: dict | None = None
 
 
 @router.post("/{train_id}/send", dependencies=[Depends(get_admin_or_legacy_key)])
@@ -146,6 +148,7 @@ async def admin_send_message(train_id: str, body: AdminMessageRequest):
         train_id=train_id,
         text=body.text,
         admin_name=body.admin_name,
+        reply_to=body.reply_to,
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "unknown"))
