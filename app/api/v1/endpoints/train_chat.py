@@ -209,8 +209,9 @@ async def get_chat_preferences(
 
     return {
         "ok": True,
-        # chat_alias is only generated when the user has entered/selected chat mode before.
-        "mode_chosen": bool(profile.chat_alias),
+        # Only anonymous mode can be restored safely across devices. chat_alias
+        # may be generated automatically and does not prove a real-name choice.
+        "mode_chosen": bool(profile.chat_anonymous),
         "chat_alias": profile.chat_alias,
         "chat_anonymous": bool(profile.chat_anonymous),
     }
