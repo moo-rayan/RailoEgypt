@@ -502,26 +502,39 @@ class TrainChatManager:
         if not clean_text:
             return {"ok": False, "error": "empty_after_sanitize"}
 
-        message = {
-            "id": str(uuid.uuid4()),
-            "user_id": "admin",
-            "user_name": normalize_admin_name(admin_name),
-            "user_avatar": "",
-            "text": clean_text,
-            "type": "admin",
-            "is_admin": True,
-            "pinned": False,
-            "timestamp": _iso_now(),
-        }
+        display_text = clean_text
+        admin_text = None
+        reply_message_id = ""
+        reply_user_name = ""
+        reply_text = ""
 
         if isinstance(reply_to, dict):
             reply_message_id = sanitize_message(str(reply_to.get("message_id", "")))[:80]
             reply_user_name = sanitize_message(str(reply_to.get("user_name", "")))[:30]
             reply_text = sanitize_message(str(reply_to.get("text", "")))[:80]
             if reply_message_id and reply_text:
-                message["reply_to_message_id"] = reply_message_id
-                message["reply_to_user_name"] = reply_user_name or "مجهول"
-                message["reply_to_text"] = reply_text
+                admin_text = clean_text
+                reply_label = reply_user_name or "مجهول"
+                display_text = f"رد على {reply_label}: {reply_text}\n\n{clean_text}"
+
+        message = {
+            "id": str(uuid.uuid4()),
+            "user_id": "admin",
+            "user_name": normalize_admin_name(admin_name),
+            "user_avatar": "",
+            "text": display_text,
+            "type": "admin",
+            "is_admin": True,
+            "pinned": False,
+            "timestamp": _iso_now(),
+        }
+        if admin_text is not None:
+            message["admin_text"] = admin_text
+
+        if reply_message_id and reply_text:
+            message["reply_to_message_id"] = reply_message_id
+            message["reply_to_user_name"] = reply_user_name or "مجهول"
+            message["reply_to_text"] = reply_text
 
         await self.store_message(train_id, message)
         await self.broadcast(train_id, message)
