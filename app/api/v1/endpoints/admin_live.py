@@ -6,19 +6,27 @@ Read endpoints: monitor + fulladmin. Write endpoints: fulladmin only.
 """
 
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from app.core.admin_auth import AdminUser, get_admin_or_legacy_key, require_admin, require_fulladmin
+from app.core.database import AsyncSessionFactory
 from app.services.audit_service import audit
 from app.services.ban_service import ban_contributor, is_banned, list_bans, unban_contributor
 from app.services.train_chat_manager import train_chat_manager
 from app.services.tracking_manager import tracking_manager
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/live/admin", tags=["Live Admin"])
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
 
 
 # ── Request schemas ───────────────────────────────────────────────────────────
@@ -117,7 +125,46 @@ async def unban_contributor_endpoint(body: UnbanRequest, request: Request):
 async def list_bans_endpoint():
     """List all currently banned contributors."""
     bans = await list_bans()
-    return {"total": len(bans), "bans": bans}
+    user_ids = sorted({
+        str(ban.get("user_id"))
+        for ban in bans
+        if ban.get("user_id") and _UUID_RE.match(str(ban.get("user_id")))
+    })
+
+    profiles: dict[str, dict] = {}
+    if user_ids:
+        try:
+            placeholders = ", ".join(f"'{uid}'" for uid in user_ids)
+            async with AsyncSessionFactory() as session:
+                result = await session.execute(
+                    text(
+                        'SELECT id, display_name, email, avatar_url '
+                        'FROM "EgRailway".profiles '
+                        f"WHERE id IN ({placeholders})"
+                    )
+                )
+                profiles = {
+                    str(row["id"]): {
+                        "user_name": row["display_name"] or "",
+                        "user_email": row["email"] or "",
+                        "user_avatar": row["avatar_url"] or "",
+                    }
+                    for row in result.mappings().all()
+                }
+        except Exception as exc:
+            logger.warning("Failed to enrich contributor bans with profiles: %s", exc)
+
+    enriched_bans = []
+    for ban in bans:
+        user_id = str(ban.get("user_id", ""))
+        enriched_bans.append({
+            **ban,
+            "user_name": profiles.get(user_id, {}).get("user_name", ""),
+            "user_email": profiles.get(user_id, {}).get("user_email", ""),
+            "user_avatar": profiles.get(user_id, {}).get("user_avatar", ""),
+        })
+
+    return {"total": len(enriched_bans), "bans": enriched_bans}
 
 
 @router.post("/set-leader", dependencies=[Depends(require_fulladmin)])
