@@ -1,10 +1,11 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import account_deletion, admin_audit, admin_auth, admin_chat, admin_live, admin_users, app_config, auth, chat, data_bundle, fares, health, live, news, notifications, railway, speech, stations, support, train_chat, trains, trips
+from app.api.v1.endpoints import account_deletion, admin_audit, admin_auth, admin_chat, admin_live, admin_users, announcements, app_config, auth, chat, data_bundle, fares, health, live, news, notifications, railway, speech, stations, support, train_chat, trains, trips
 
 api_router = APIRouter(prefix="/api/v1")
 
 api_router.include_router(app_config.router)
+api_router.include_router(announcements.router)
 api_router.include_router(health.router)
 api_router.include_router(stations.router)
 api_router.include_router(trains.router)
