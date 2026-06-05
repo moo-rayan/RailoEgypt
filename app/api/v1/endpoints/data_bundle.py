@@ -24,6 +24,7 @@ from app.core.encryption import encrypt_bundle
 from app.core.r2_storage import r2_upload_bundle
 from app.models.station import Station
 from app.models.train import Train
+from app.models.train_seat_layout import TrainSeatLayout
 from app.models.trip import Trip, TripStop
 from app.models.trip_fare import TripFare
 from app.services.railway_service import railway_graph
@@ -33,6 +34,105 @@ BUNDLE_REDIS_VERSION_KEY = "bundle:current_version"
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["data-bundle"])
+
+
+def _compact_seat_layout(layout_row: TrainSeatLayout) -> dict:
+    """Return a mobile-friendly compact seat layout payload."""
+    raw_layout = layout_row.layout or {}
+    compact_coaches: list[dict] = []
+    for coach in raw_layout.get("coaches", []) or []:
+        compact_seats = []
+        for seat in coach.get("seats", []) or []:
+            position_type = seat.get("position_type") or "inner"
+            position_code = {
+                "inner": 0,
+                "window": 1,
+                "aisle": 2,
+                "window_aisle": 3,
+            }.get(position_type, 0)
+            compact_seats.append([
+                str(seat.get("number", "")),
+                seat.get("x") or 0,
+                seat.get("y") or 0,
+                position_code,
+                seat.get("row_index", -1),
+            ])
+
+        compact_coaches.append({
+            "o": coach.get("coach_order") or 0,
+            "n": str(coach.get("coach_name") or ""),
+            "sc": coach.get("seat_count") or len(compact_seats),
+            "wc": coach.get("window_seat_count") or 0,
+            "ac": coach.get("aisle_seat_count") or 0,
+            "rc": coach.get("row_count") or 0,
+            "s": compact_seats,
+        })
+
+    return {
+        "tn": layout_row.train_number,
+        "c": layout_row.class_code,
+        "a": layout_row.class_name_ar,
+        "e": layout_row.class_name_en,
+        "cc": layout_row.coach_count,
+        "sc": layout_row.seat_count,
+        "wc": layout_row.window_seat_count,
+        "ac": layout_row.aisle_seat_count,
+        "h": layout_row.layout_hash[:12],
+        "ch": compact_coaches,
+    }
+
+
+async def _build_seat_layouts_payload(db: AsyncSession) -> dict:
+    rows = (
+        await db.execute(
+            select(TrainSeatLayout)
+            .join(Train, Train.train_id == TrainSeatLayout.train_number)
+            .where(Train.is_active.is_(True))
+            .order_by(TrainSeatLayout.train_number, TrainSeatLayout.class_code)
+        )
+    ).scalars().all()
+
+    layouts_by_train: dict[str, list[dict]] = {}
+    version_seed: list[str] = []
+    for row in rows:
+        layouts_by_train.setdefault(row.train_number, []).append(
+            _compact_seat_layout(row)
+        )
+        version_seed.append(f"{row.train_number}:{row.class_code}:{row.layout_hash}")
+
+    version = hashlib.sha256("|".join(sorted(version_seed)).encode("utf-8")).hexdigest()[:16]
+    return {
+        "version": version,
+        "total": len(rows),
+        "trains_count": len(layouts_by_train),
+        "layouts": layouts_by_train,
+    }
+
+
+async def _build_seat_layouts_version_info(db: AsyncSession) -> dict:
+    rows = (
+        await db.execute(
+            select(
+                TrainSeatLayout.train_number,
+                TrainSeatLayout.class_code,
+                TrainSeatLayout.layout_hash,
+            )
+            .join(Train, Train.train_id == TrainSeatLayout.train_number)
+            .where(Train.is_active.is_(True))
+            .order_by(TrainSeatLayout.train_number, TrainSeatLayout.class_code)
+        )
+    ).all()
+    version_seed = [
+        f"{train_number}:{class_code}:{layout_hash}"
+        for train_number, class_code, layout_hash in rows
+    ]
+    train_numbers = {str(train_number) for train_number, _, _ in rows}
+    version = hashlib.sha256("|".join(sorted(version_seed)).encode("utf-8")).hexdigest()[:16]
+    return {
+        "version": version,
+        "total": len(rows),
+        "trains_count": len(train_numbers),
+    }
 
 
 async def _build_all_trip_paths(db: AsyncSession) -> dict[int, dict]:
@@ -328,6 +428,46 @@ async def get_data_version(response: Response):
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Data bundle not ready. Server is starting up."
+    )
+
+
+@router.get("/seat-layouts/version")
+async def get_seat_layouts_version(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Lightweight version check for train seat layouts."""
+    response.headers["Cache-Control"] = "no-store"
+    return await _build_seat_layouts_version_info(db)
+
+
+@router.get("/seat-layouts")
+async def get_seat_layouts(db: AsyncSession = Depends(get_db)):
+    """
+    Compact gzip-compressed seat layouts grouped by train number.
+
+    Response shape:
+      {
+        "version": "...",
+        "total": 35,
+        "trains_count": 25,
+        "layouts": {
+          "1902": [{ "c": "AC 1", "a": "...", "ch": [...] }]
+        }
+      }
+    """
+    payload = await _build_seat_layouts_payload(db)
+    gzip_bytes = gzip.compress(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        compresslevel=6,
+    )
+    return Response(
+        content=gzip_bytes,
+        media_type="application/json",
+        headers={
+            "Content-Encoding": "gzip",
+            "Cache-Control": "no-store",
+        },
     )
 
 
