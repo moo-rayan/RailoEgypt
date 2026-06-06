@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
 from sqlalchemy import select
@@ -28,6 +29,10 @@ from app.models.train_seat_layout import TrainSeatLayout
 from app.models.trip import Trip, TripStop
 from app.models.trip_fare import TripFare
 from app.services.railway_service import railway_graph
+from app.services.train_seat_layout_importer import (
+    SeatLayoutImportError,
+    import_layouts_from_enr_for_train,
+)
 
 BUNDLE_REDIS_VERSION_KEY = "bundle:current_version"
 
@@ -469,6 +474,37 @@ async def get_seat_layouts(db: AsyncSession = Depends(get_db)):
             "Cache-Control": "no-store",
         },
     )
+
+
+@router.post(
+    "/seat-layouts/import-from-enr/{train_number}",
+    dependencies=[Depends(require_admin)],
+)
+async def import_seat_layout_from_enr(
+    train_number: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch ENR search results for the train route using departure date +2 days,
+    then upsert any static seat layouts found in the response.
+    """
+    try:
+        return await import_layouts_from_enr_for_train(db, train_number)
+    except SeatLayoutImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"ENR returned HTTP {exc.response.status_code}",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"ENR request failed: {exc.__class__.__name__}",
+        ) from exc
 
 
 @router.get("/bundle")
