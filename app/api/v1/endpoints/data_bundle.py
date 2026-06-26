@@ -5,15 +5,15 @@ GET /data/version  → lightweight version check
 GET /data/bundle   → AES-256 encrypted bundle of all stations, trips, trains, trip_paths
 """
 
+import copy
 import gzip
 import hashlib
 import json
 import logging
-import copy
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -113,6 +113,7 @@ def _prepare_admin_seat_layout_for_target(
 
         coach_window = 0
         coach_aisle = 0
+        seen_numbers: set[str] = set()
         for seat_index, seat in enumerate(seats):
             if not isinstance(seat, dict):
                 raise HTTPException(
@@ -122,7 +123,8 @@ def _prepare_admin_seat_layout_for_target(
                         "must be a JSON object"
                     ),
                 )
-            if not str(seat.get("number") or "").strip():
+            seat_number = str(seat.get("number") or "").strip()
+            if not seat_number:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=(
@@ -130,6 +132,16 @@ def _prepare_admin_seat_layout_for_target(
                         "does not have a number"
                     ),
                 )
+            if seat_number in seen_numbers:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"Duplicate seat number {seat_number} in coach "
+                        f"#{coach_index + 1}"
+                    ),
+                )
+            seen_numbers.add(seat_number)
+            seat["number"] = seat_number
 
             seat["x"] = _coerce_coordinate(seat.get("x"))
             seat["y"] = _coerce_coordinate(seat.get("y"))
@@ -685,6 +697,93 @@ async def update_admin_seat_layout(
             **_admin_seat_layout_summary(row),
             "layout": row.layout,
         },
+        "version_info": version_info,
+    }
+
+
+@router.delete(
+    "/seat-layouts/admin/{layout_id}",
+    dependencies=[Depends(require_admin)],
+)
+async def delete_admin_seat_layout(
+    layout_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete one train/class seat layout."""
+    row = await db.get(TrainSeatLayout, layout_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seat layout not found",
+        )
+
+    await db.delete(row)
+    await db.commit()
+    version_info = await _build_seat_layouts_version_info(db)
+    return {
+        "ok": True,
+        "deleted": 1,
+        "layout_id": layout_id,
+        "version_info": version_info,
+    }
+
+
+@router.delete(
+    "/seat-layouts/admin/{layout_id}/type",
+    dependencies=[Depends(require_admin)],
+)
+async def delete_admin_seat_layout_for_type(
+    layout_id: int,
+    train_type_ar: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete the selected class layout from all active trains of a type."""
+    source_row = await db.get(TrainSeatLayout, layout_id)
+    if source_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seat layout not found",
+        )
+
+    clean_type = train_type_ar.strip()
+    trains = (
+        await db.execute(
+            select(Train)
+            .where(
+                Train.is_active.is_(True),
+                Train.type_ar == clean_type,
+            )
+            .order_by(Train.train_id)
+        )
+    ).scalars().all()
+    if not trains:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No active trains found for this type",
+        )
+
+    train_numbers = [train.train_id for train in trains]
+    rows = (
+        await db.execute(
+            select(TrainSeatLayout).where(
+                TrainSeatLayout.train_number.in_(train_numbers),
+                TrainSeatLayout.class_code == source_row.class_code,
+            )
+        )
+    ).scalars().all()
+
+    for row in rows:
+        await db.delete(row)
+    await db.commit()
+    version_info = await _build_seat_layouts_version_info(db)
+
+    return {
+        "ok": True,
+        "train_type_ar": clean_type,
+        "class_code": source_row.class_code,
+        "deleted": len(rows),
+        "target_trains_count": len(trains),
+        "target_train_numbers": train_numbers,
         "version_info": version_info,
     }
 
