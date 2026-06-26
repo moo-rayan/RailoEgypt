@@ -9,10 +9,12 @@ import gzip
 import hashlib
 import json
 import logging
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -39,6 +41,142 @@ BUNDLE_REDIS_VERSION_KEY = "bundle:current_version"
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/data", tags=["data-bundle"])
+
+
+class SeatLayoutAdminUpdate(BaseModel):
+    layout: dict[str, Any] = Field(..., description="Full train seat layout JSON")
+
+
+def _seat_layout_hash(layout: dict[str, Any]) -> str:
+    raw = json.dumps(layout, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _seat_flag_from_position_type(seat: dict[str, Any], flag: str) -> bool:
+    position_type = str(seat.get("position_type") or "inner")
+    if flag == "window":
+        return bool(seat.get("is_window")) or position_type in ("window", "window_aisle")
+    if flag == "aisle":
+        return bool(seat.get("is_aisle")) or position_type in ("aisle", "window_aisle")
+    return False
+
+
+def _coerce_coordinate(value: Any) -> int | float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    return int(number) if number.is_integer() else round(number, 2)
+
+
+def _prepare_admin_seat_layout(
+    row: TrainSeatLayout,
+    layout: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, int]]:
+    if not isinstance(layout, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Layout must be a JSON object",
+        )
+
+    coaches = layout.get("coaches")
+    if not isinstance(coaches, list) or not coaches:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Layout must contain at least one coach",
+        )
+
+    total_seats = 0
+    total_window = 0
+    total_aisle = 0
+    for coach_index, coach in enumerate(coaches):
+        if not isinstance(coach, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Coach #{coach_index + 1} must be a JSON object",
+            )
+
+        seats = coach.get("seats")
+        if not isinstance(seats, list) or not seats:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Coach #{coach_index + 1} must contain seats",
+            )
+
+        coach_window = 0
+        coach_aisle = 0
+        for seat_index, seat in enumerate(seats):
+            if not isinstance(seat, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"Seat #{seat_index + 1} in coach #{coach_index + 1} "
+                        "must be a JSON object"
+                    ),
+                )
+            if not str(seat.get("number") or "").strip():
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"Seat #{seat_index + 1} in coach #{coach_index + 1} "
+                        "does not have a number"
+                    ),
+                )
+
+            seat["x"] = _coerce_coordinate(seat.get("x"))
+            seat["y"] = _coerce_coordinate(seat.get("y"))
+            seat["position_type"] = str(seat.get("position_type") or "inner")
+            seat["is_window"] = _seat_flag_from_position_type(seat, "window")
+            seat["is_aisle"] = _seat_flag_from_position_type(seat, "aisle")
+            coach_window += 1 if seat["is_window"] else 0
+            coach_aisle += 1 if seat["is_aisle"] else 0
+
+        coach["seat_count"] = len(seats)
+        coach["window_seat_count"] = coach_window
+        coach["aisle_seat_count"] = coach_aisle
+        if not coach.get("coach_order"):
+            coach["coach_order"] = coach_index + 1
+        if not coach.get("coach_name"):
+            coach["coach_name"] = str(coach["coach_order"])
+
+        total_seats += len(seats)
+        total_window += coach_window
+        total_aisle += coach_aisle
+
+    prepared = dict(layout)
+    prepared["schema_version"] = int(prepared.get("schema_version") or 1)
+    prepared["train_number"] = row.train_number
+    prepared["enr_train_id"] = row.enr_train_id
+    prepared["coach_count"] = len(coaches)
+    prepared["seat_count"] = total_seats
+    prepared["window_seat_count"] = total_window
+    prepared["aisle_seat_count"] = total_aisle
+
+    return prepared, {
+        "coach_count": len(coaches),
+        "seat_count": total_seats,
+        "window_seat_count": total_window,
+        "aisle_seat_count": total_aisle,
+    }
+
+
+def _admin_seat_layout_summary(row: TrainSeatLayout) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "train_number": row.train_number,
+        "class_code": row.class_code,
+        "class_name_ar": row.class_name_ar,
+        "class_name_en": row.class_name_en,
+        "enr_train_id": row.enr_train_id,
+        "coach_count": row.coach_count,
+        "seat_count": row.seat_count,
+        "window_seat_count": row.window_seat_count,
+        "aisle_seat_count": row.aisle_seat_count,
+        "layout_hash": row.layout_hash,
+        "source_file": row.source_file,
+        "imported_at": row.imported_at.isoformat() if row.imported_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
 
 
 def _compact_seat_layout(layout_row: TrainSeatLayout) -> dict:
@@ -444,6 +582,92 @@ async def get_seat_layouts_version(
     """Lightweight version check for train seat layouts."""
     response.headers["Cache-Control"] = "no-store"
     return await _build_seat_layouts_version_info(db)
+
+
+@router.get(
+    "/seat-layouts/admin",
+    dependencies=[Depends(require_admin)],
+)
+async def list_admin_seat_layouts(
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin-only seat layout index with editable layout ids."""
+    rows = (
+        await db.execute(
+            select(TrainSeatLayout)
+            .join(Train, Train.train_id == TrainSeatLayout.train_number)
+            .where(Train.is_active.is_(True))
+            .order_by(TrainSeatLayout.train_number, TrainSeatLayout.class_code)
+        )
+    ).scalars().all()
+    version_info = await _build_seat_layouts_version_info(db)
+    return {
+        **version_info,
+        "layouts": [_admin_seat_layout_summary(row) for row in rows],
+    }
+
+
+@router.get(
+    "/seat-layouts/admin/{layout_id}",
+    dependencies=[Depends(require_admin)],
+)
+async def get_admin_seat_layout(
+    layout_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin-only full raw layout payload for visual editing."""
+    row = await db.get(TrainSeatLayout, layout_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seat layout not found",
+        )
+    return {
+        **_admin_seat_layout_summary(row),
+        "layout": row.layout,
+    }
+
+
+@router.patch(
+    "/seat-layouts/admin/{layout_id}",
+    dependencies=[Depends(require_admin)],
+)
+async def update_admin_seat_layout(
+    layout_id: int,
+    payload: SeatLayoutAdminUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Save a manually edited raw seat layout and bump the public layout version."""
+    row = await db.get(TrainSeatLayout, layout_id)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Seat layout not found",
+        )
+
+    prepared_layout, counts = _prepare_admin_seat_layout(row, payload.layout)
+    layout_hash = _seat_layout_hash(prepared_layout)
+
+    row.layout = prepared_layout
+    row.coach_count = counts["coach_count"]
+    row.seat_count = counts["seat_count"]
+    row.window_seat_count = counts["window_seat_count"]
+    row.aisle_seat_count = counts["aisle_seat_count"]
+    row.layout_hash = layout_hash
+    row.source_file = "dashboard:manual-editor"
+
+    await db.commit()
+    await db.refresh(row)
+    version_info = await _build_seat_layouts_version_info(db)
+
+    return {
+        "ok": True,
+        "layout": {
+            **_admin_seat_layout_summary(row),
+            "layout": row.layout,
+        },
+        "version_info": version_info,
+    }
 
 
 @router.get("/seat-layouts")
