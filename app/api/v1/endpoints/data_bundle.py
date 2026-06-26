@@ -53,6 +53,22 @@ class SeatLayoutApplyToTypeRequest(BaseModel):
     layout: dict[str, Any] = Field(..., description="Full train seat layout JSON")
 
 
+class SeatLayoutAdminCreateRequest(BaseModel):
+    train_number: str = Field(..., min_length=1)
+    class_code: str = Field(..., min_length=1)
+    class_name_ar: str = Field(..., min_length=1)
+    class_name_en: str = ""
+    coach_count: int = Field(1, ge=1, le=40)
+    seats_per_coach: int = Field(24, ge=1, le=120)
+
+
+class SeatLayoutAdminCopyRequest(BaseModel):
+    target_train_number: str = Field(..., min_length=1)
+    source_layout_id: int | None = None
+    source_train_type_ar: str | None = None
+    source_class_code: str | None = None
+
+
 def _seat_layout_hash(layout: dict[str, Any]) -> str:
     raw = json.dumps(layout, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -189,6 +205,77 @@ def _prepare_admin_seat_layout(
         enr_train_id=row.enr_train_id,
         layout=layout,
     )
+
+
+def _build_manual_seat_layout(
+    *,
+    train_number: str,
+    class_code: str,
+    class_name_ar: str,
+    class_name_en: str,
+    coach_count: int,
+    seats_per_coach: int,
+) -> dict[str, Any]:
+    y_positions = [-72, -24, 24, 72]
+    seats_in_row = len(y_positions)
+    row_gap = 56
+    coaches: list[dict[str, Any]] = []
+
+    for coach_index in range(coach_count):
+        seats: list[dict[str, Any]] = []
+        for seat_index in range(seats_per_coach):
+            column_index = seat_index % seats_in_row
+            row_index = seat_index // seats_in_row
+            is_window = column_index in (0, seats_in_row - 1)
+            is_aisle = column_index in (1, 2)
+            seats.append({
+                "enr_place_id": (
+                    f"manual:{train_number}:{class_code}:"
+                    f"{coach_index + 1}:{seat_index + 1}"
+                ),
+                "number": str(seat_index + 1),
+                "x": row_index * row_gap,
+                "y": y_positions[column_index],
+                "row_index": row_index,
+                "position_type": "window" if is_window else "aisle",
+                "is_window": is_window,
+                "is_aisle": is_aisle,
+            })
+
+        coaches.append({
+            "coach_order": coach_index + 1,
+            "coach_name": str(coach_index + 1),
+            "enr_coach_id": f"manual:{train_number}:{class_code}:{coach_index + 1}",
+            "type": class_name_ar,
+            "code": class_code,
+            "row_count": (seats_per_coach + seats_in_row - 1) // seats_in_row,
+            "aisle_before_row": 0,
+            "seat_count": len(seats),
+            "window_seat_count": sum(1 for seat in seats if seat["is_window"]),
+            "aisle_seat_count": sum(1 for seat in seats if seat["is_aisle"]),
+            "rows": [],
+            "seats": seats,
+        })
+
+    return {
+        "schema_version": 1,
+        "train_number": train_number,
+        "enr_train_id": "",
+        "class": {
+            "code": class_code,
+            "name_ar": class_name_ar,
+            "name_en": class_name_en,
+            "enr_class_id": "",
+            "pax_class": "",
+        },
+        "coach_count": coach_count,
+        "seat_count": coach_count * seats_per_coach,
+        "window_seat_count": sum(
+            coach["window_seat_count"] for coach in coaches
+        ),
+        "aisle_seat_count": sum(coach["aisle_seat_count"] for coach in coaches),
+        "coaches": coaches,
+    }
 
 
 def _admin_seat_layout_summary(row: TrainSeatLayout) -> dict[str, Any]:
@@ -635,6 +722,216 @@ async def list_admin_seat_layouts(
     return {
         **version_info,
         "layouts": [_admin_seat_layout_summary(row) for row in rows],
+    }
+
+
+@router.post(
+    "/seat-layouts/admin",
+    dependencies=[Depends(require_admin)],
+)
+async def create_admin_seat_layout(
+    payload: SeatLayoutAdminCreateRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a manual editable seat layout for a train/class."""
+    train_number = payload.train_number.strip()
+    class_code = payload.class_code.strip()
+    class_name_ar = payload.class_name_ar.strip()
+    class_name_en = payload.class_name_en.strip()
+    if not class_code or not class_name_ar:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Class code and Arabic class name are required",
+        )
+
+    target_train = (
+        await db.execute(
+            select(Train).where(
+                Train.train_id == train_number,
+                Train.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if target_train is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Target train not found",
+        )
+
+    existing = (
+        await db.execute(
+            select(TrainSeatLayout).where(
+                TrainSeatLayout.train_number == train_number,
+                TrainSeatLayout.class_code == class_code,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Seat layout already exists for this train/class",
+        )
+
+    raw_layout = _build_manual_seat_layout(
+        train_number=train_number,
+        class_code=class_code,
+        class_name_ar=class_name_ar,
+        class_name_en=class_name_en,
+        coach_count=payload.coach_count,
+        seats_per_coach=payload.seats_per_coach,
+    )
+    prepared_layout, counts = _prepare_admin_seat_layout_for_target(
+        train_number=train_number,
+        enr_train_id="",
+        layout=raw_layout,
+    )
+    layout_hash = _seat_layout_hash(prepared_layout)
+    row = TrainSeatLayout(
+        train_number=train_number,
+        class_code=class_code,
+        class_name_ar=class_name_ar,
+        class_name_en=class_name_en,
+        enr_train_id="",
+        coach_count=counts["coach_count"],
+        seat_count=counts["seat_count"],
+        window_seat_count=counts["window_seat_count"],
+        aisle_seat_count=counts["aisle_seat_count"],
+        layout_hash=layout_hash,
+        layout=prepared_layout,
+        source_file="dashboard:manual-create",
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    version_info = await _build_seat_layouts_version_info(db)
+
+    return {
+        "ok": True,
+        "layout": {
+            **_admin_seat_layout_summary(row),
+            "layout": row.layout,
+        },
+        "version_info": version_info,
+    }
+
+
+@router.post(
+    "/seat-layouts/admin/copy",
+    dependencies=[Depends(require_admin)],
+)
+async def copy_admin_seat_layout(
+    payload: SeatLayoutAdminCopyRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Copy a layout from a specific train/class or from a train type/class."""
+    target_train_number = payload.target_train_number.strip()
+    has_source_layout = payload.source_layout_id is not None
+    has_source_type = bool(
+        (payload.source_train_type_ar or "").strip()
+        and (payload.source_class_code or "").strip()
+    )
+    if has_source_layout == has_source_type:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Provide either source_layout_id or "
+                "source_train_type_ar with source_class_code"
+            ),
+        )
+
+    target_train = (
+        await db.execute(
+            select(Train).where(
+                Train.train_id == target_train_number,
+                Train.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if target_train is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Target train not found",
+        )
+
+    if payload.source_layout_id is not None:
+        source_row = await db.get(TrainSeatLayout, payload.source_layout_id)
+    else:
+        source_type = (payload.source_train_type_ar or "").strip()
+        source_class_code = (payload.source_class_code or "").strip()
+        source_row = (
+            await db.execute(
+                select(TrainSeatLayout)
+                .join(Train, Train.train_id == TrainSeatLayout.train_number)
+                .where(
+                    Train.is_active.is_(True),
+                    Train.type_ar == source_type,
+                    TrainSeatLayout.class_code == source_class_code,
+                )
+                .order_by(
+                    TrainSeatLayout.updated_at.desc(),
+                    TrainSeatLayout.train_number,
+                )
+            )
+        ).scalars().first()
+
+    if source_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source seat layout not found",
+        )
+    if source_row.train_number == target_train_number:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Source and target train are the same",
+        )
+
+    existing = (
+        await db.execute(
+            select(TrainSeatLayout).where(
+                TrainSeatLayout.train_number == target_train_number,
+                TrainSeatLayout.class_code == source_row.class_code,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Target train already has this class layout",
+        )
+
+    prepared_layout, counts = _prepare_admin_seat_layout_for_target(
+        train_number=target_train_number,
+        enr_train_id="",
+        layout=copy.deepcopy(source_row.layout),
+    )
+    layout_hash = _seat_layout_hash(prepared_layout)
+    row = TrainSeatLayout(
+        train_number=target_train_number,
+        class_code=source_row.class_code,
+        class_name_ar=source_row.class_name_ar,
+        class_name_en=source_row.class_name_en,
+        enr_train_id="",
+        coach_count=counts["coach_count"],
+        seat_count=counts["seat_count"],
+        window_seat_count=counts["window_seat_count"],
+        aisle_seat_count=counts["aisle_seat_count"],
+        layout_hash=layout_hash,
+        layout=prepared_layout,
+        source_file=f"dashboard:copy:{source_row.train_number}:{source_row.id}",
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    version_info = await _build_seat_layouts_version_info(db)
+
+    return {
+        "ok": True,
+        "source_layout": _admin_seat_layout_summary(source_row),
+        "layout": {
+            **_admin_seat_layout_summary(row),
+            "layout": row.layout,
+        },
+        "version_info": version_info,
     }
 
 
