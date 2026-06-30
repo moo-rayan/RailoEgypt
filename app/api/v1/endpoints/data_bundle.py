@@ -83,6 +83,27 @@ def _seat_flag_from_position_type(seat: dict[str, Any], flag: str) -> bool:
     return False
 
 
+def _coerce_seat_direction(value: Any) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if int(value) else 0
+    direction = str(value or "").strip().lower()
+    if direction in {
+        "1",
+        "true",
+        "reverse",
+        "reversed",
+        "backward",
+        "back",
+        "right",
+        "down",
+        "bottom",
+    }:
+        return 1
+    return 0
+
+
 def _coerce_coordinate(value: Any) -> int | float:
     try:
         number = float(value)
@@ -164,6 +185,9 @@ def _prepare_admin_seat_layout_for_target(
             seat["position_type"] = str(seat.get("position_type") or "inner")
             seat["is_window"] = _seat_flag_from_position_type(seat, "window")
             seat["is_aisle"] = _seat_flag_from_position_type(seat, "aisle")
+            seat["direction"] = _coerce_seat_direction(
+                seat.get("direction", seat.get("seat_direction", seat.get("dir")))
+            )
             coach_window += 1 if seat["is_window"] else 0
             coach_aisle += 1 if seat["is_aisle"] else 0
 
@@ -180,7 +204,7 @@ def _prepare_admin_seat_layout_for_target(
         total_aisle += coach_aisle
 
     prepared = dict(layout)
-    prepared["schema_version"] = int(prepared.get("schema_version") or 1)
+    prepared["schema_version"] = max(2, int(prepared.get("schema_version") or 1))
     prepared["train_number"] = train_number
     prepared["enr_train_id"] = enr_train_id
     prepared["coach_count"] = len(coaches)
@@ -240,6 +264,7 @@ def _build_manual_seat_layout(
                 "position_type": "window" if is_window else "aisle",
                 "is_window": is_window,
                 "is_aisle": is_aisle,
+                "direction": row_index % 2,
             })
 
         coaches.append({
@@ -258,7 +283,7 @@ def _build_manual_seat_layout(
         })
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "train_number": train_number,
         "enr_train_id": "",
         "class": {
@@ -317,6 +342,9 @@ def _compact_seat_layout(layout_row: TrainSeatLayout) -> dict:
                 seat.get("y") or 0,
                 position_code,
                 seat.get("row_index", -1),
+                _coerce_seat_direction(
+                    seat.get("direction", seat.get("seat_direction", seat.get("dir")))
+                ),
             ])
 
         compact_coaches.append({

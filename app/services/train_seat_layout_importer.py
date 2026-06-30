@@ -58,6 +58,23 @@ def _position_type(is_window: bool, is_aisle: bool) -> str:
     return "inner"
 
 
+def _seat_direction_from_value(value: Any) -> int:
+    direction = str(value or "").strip().lower()
+    if direction in {
+        "1",
+        "true",
+        "reverse",
+        "reversed",
+        "backward",
+        "back",
+        "right",
+        "down",
+        "bottom",
+    }:
+        return 1
+    return 0
+
+
 def _class_info(coach: dict[str, Any]) -> dict[str, str]:
     coach_class = coach.get("coachClass") if isinstance(coach.get("coachClass"), dict) else {}
     params = coach_class.get("params") if isinstance(coach_class.get("params"), dict) else {}
@@ -161,6 +178,7 @@ def _normalize_coach(coach: dict[str, Any], coach_order: int) -> dict[str, Any]:
     seats: list[dict[str, Any]] = []
     for place in places:
         top_left = place.get("topLeft") or {}
+        place_params = place.get("params") if isinstance(place.get("params"), dict) else {}
         row_index = row_by_place_id.get(id(place), -1)
         is_window = bool(rows) and (row_index == 0 or row_index == len(rows) - 1)
         is_aisle = row_index == aisle_before or row_index == aisle_before + 1
@@ -176,6 +194,9 @@ def _normalize_coach(coach: dict[str, Any], coach_order: int) -> dict[str, Any]:
                 "position_type": _position_type(is_window, is_aisle),
                 "is_window": is_window,
                 "is_aisle": is_aisle,
+                "direction": _seat_direction_from_value(
+                    place_params.get("direction", place_params.get("dir"))
+                ),
             }
         )
 
@@ -256,7 +277,7 @@ def _candidate_from_step(
         window_seat_count = sum(coach["window_seat_count"] for coach in normalized_coaches)
         aisle_seat_count = sum(coach["aisle_seat_count"] for coach in normalized_coaches)
         layout = {
-            "schema_version": 1,
+            "schema_version": 2,
             "train_number": train_number,
             "enr_train_id": _clean(train.get("id")),
             "class": class_info,
