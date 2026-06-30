@@ -330,6 +330,10 @@ def _compact_seat_layout(layout_row: TrainSeatLayout) -> dict:
         compact_seats = []
         for seat in coach.get("seats", []) or []:
             position_type = seat.get("position_type") or "inner"
+            direction_value = seat.get(
+                "direction",
+                seat.get("seat_direction", seat.get("dir")),
+            )
             position_code = {
                 "inner": 0,
                 "window": 1,
@@ -342,8 +346,10 @@ def _compact_seat_layout(layout_row: TrainSeatLayout) -> dict:
                 seat.get("y") or 0,
                 position_code,
                 seat.get("row_index", -1),
-                _coerce_seat_direction(
-                    seat.get("direction", seat.get("seat_direction", seat.get("dir")))
+                (
+                    _coerce_seat_direction(direction_value)
+                    if direction_value is not None
+                    else -1
                 ),
             ])
 
