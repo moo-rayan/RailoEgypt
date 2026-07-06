@@ -519,33 +519,6 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
         for s in stations_result.scalars().all()
     ]
 
-    # Passing trains by station: station_id -> [train_number, ...]
-    # Stored on trains to keep dashboard editing simple, then inverted here so
-    # each trip stop can be rendered offline without extra lookups.
-    passing_rows = (
-        await db.execute(
-            select(Train.train_id, Train.passing_station_ids)
-            .where(Train.is_active.is_(True))
-            .order_by(Train.train_id)
-        )
-    ).all()
-    passing_trains_by_station: dict[int, list[str]] = {}
-    for train_number, station_ids in passing_rows:
-        if not isinstance(station_ids, list):
-            continue
-        seen_station_ids: set[int] = set()
-        for raw_station_id in station_ids:
-            try:
-                station_id = int(raw_station_id)
-            except (TypeError, ValueError):
-                continue
-            if station_id <= 0 or station_id in seen_station_ids:
-                continue
-            seen_station_ids.add(station_id)
-            passing_trains_by_station.setdefault(station_id, []).append(
-                str(train_number)
-            )
-
     # Trips with stops (eager load station relationship for name resolution)
     trips_result = await db.execute(
         select(Trip).options(selectinload(Trip.stops).selectinload(TripStop.station)).order_by(Trip.id)
@@ -563,17 +536,14 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
                 "ta": st.time_ar,
                 "te": st.time_en,
             }
-            if st.station_id is not None:
-                passing_train_numbers = [
-                    train_number
-                    for train_number in passing_trains_by_station.get(
-                        int(st.station_id),
-                        [],
-                    )
-                    if train_number != str(t.train_number)
-                ]
-                if passing_train_numbers:
-                    stop_payload["pt"] = passing_train_numbers
+            passing_train_numbers = [
+                str(train_number)
+                for train_number in (st.passing_train_numbers or [])
+                if str(train_number).strip()
+                and str(train_number).strip() != str(t.train_number)
+            ]
+            if passing_train_numbers:
+                stop_payload["pt"] = passing_train_numbers
             compact_stops.append(stop_payload)
 
         trips.append({
@@ -631,8 +601,6 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
         if tr.note_ar or tr.note_en:
             key = (tr.note_ar.strip(), tr.note_en.strip())
             item["ni"] = notes_map[key]  # note index into train_notes
-        if tr.passing_station_ids:
-            item["psi"] = tr.passing_station_ids
         trains.append(item)
 
     # ── Fares — deduplicated class lookup + compact fare dict ──────────────

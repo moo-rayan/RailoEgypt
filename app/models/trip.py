@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, ForeignKey, Index, Integer, SmallInteger, String, Text, func
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, SmallInteger, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -85,6 +85,12 @@ class TripStop(Base):
     station_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("EgRailway.stations.id", ondelete="SET NULL"), nullable=True)
     time_ar:    Mapped[str]           = mapped_column(Text, nullable=False, default="")
     time_en:    Mapped[str]           = mapped_column(Text, nullable=False, default="")
+    passing_train_numbers: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
 
     trip:    Mapped["Trip"] = relationship("Trip", back_populates="stops")
     station: Mapped[Optional["Station"]] = relationship("Station", lazy="joined")

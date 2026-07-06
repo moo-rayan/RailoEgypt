@@ -18,7 +18,6 @@ class TrainBase(BaseModel):
     arrival_en: str = ""
     note_ar: str = ""
     note_en: str = ""
-    passing_station_ids: list[int] = Field(default_factory=list)
 
 
 class TrainCreate(TrainBase):
@@ -39,7 +38,6 @@ class TrainUpdate(BaseModel):
     arrival_en: str | None = None
     note_ar: str | None = None
     note_en: str | None = None
-    passing_station_ids: list[int] | None = None
     is_active: bool | None = None
 
 

@@ -7,7 +7,6 @@ from app.core.cache import cache_delete_pattern
 from app.core.database import get_db
 from app.crud.trains import train_crud
 from app.crud.stations import station_crud
-from app.models.station import Station
 from app.models.trip import Trip
 from app.schemas.train import (
     TrainCreate,
@@ -18,47 +17,6 @@ from app.schemas.train import (
 )
 
 router = APIRouter(prefix="/trains", tags=["trains"])
-
-
-def _normalize_passing_station_ids(values: list[int] | None) -> list[int]:
-    if not values:
-        return []
-
-    normalized: list[int] = []
-    seen: set[int] = set()
-    for raw_value in values:
-        try:
-            station_id = int(raw_value)
-        except (TypeError, ValueError):
-            continue
-        if station_id <= 0 or station_id in seen:
-            continue
-        seen.add(station_id)
-        normalized.append(station_id)
-    return normalized
-
-
-async def _validate_passing_station_ids(
-    db: AsyncSession,
-    station_ids: list[int],
-) -> None:
-    if not station_ids:
-        return
-
-    rows = (
-        await db.execute(
-            select(Station.id).where(
-                Station.id.in_(station_ids),
-                Station.is_active.is_(True),
-            )
-        )
-    ).scalars().all()
-    missing = sorted(set(station_ids) - set(rows))
-    if missing:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid passing station IDs: {missing}",
-        )
 
 
 def _calc_duration(dep: str, arr: str) -> tuple[str, str]:
@@ -154,13 +112,6 @@ async def create_train(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Train {payload.train_id} already exists",
         )
-    passing_station_ids = _normalize_passing_station_ids(
-        payload.passing_station_ids
-    )
-    await _validate_passing_station_ids(db, passing_station_ids)
-    payload = payload.model_copy(
-        update={"passing_station_ids": passing_station_ids}
-    )
     result = await train_crud.create_from_schema(db, obj_in=payload)
 
     # Auto-create a default trip linked to this train
@@ -185,7 +136,6 @@ async def create_train(
 
     await cache_delete_pattern("trains:*")
     await cache_delete_pattern("trips:*")
-    await cache_delete_pattern("railway:stations:*")
     return result
 
 
@@ -198,15 +148,6 @@ async def update_train(
     train = await train_crud.get_by_train_id(db, train_number)
     if not train:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Train not found")
-    if payload.passing_station_ids is not None:
-        passing_station_ids = _normalize_passing_station_ids(
-            payload.passing_station_ids
-        )
-        await _validate_passing_station_ids(db, passing_station_ids)
-        payload = payload.model_copy(
-            update={"passing_station_ids": passing_station_ids}
-        )
-
     result = await train_crud.update_from_schema(db, db_obj=train, obj_in=payload)
 
     # Sync the primary trip (first trip) with updated train data
@@ -242,7 +183,6 @@ async def update_train(
 
     await cache_delete_pattern("trains:*")
     await cache_delete_pattern("trips:*")
-    await cache_delete_pattern("railway:stations:*")
     return result
 
 
@@ -256,4 +196,3 @@ async def delete_train(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Train not found")
     await train_crud.delete(db, record_id=train.id)
     await cache_delete_pattern("trains:*")
-    await cache_delete_pattern("railway:stations:*")
