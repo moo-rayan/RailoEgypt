@@ -536,14 +536,16 @@ async def _build_raw_bundle(db: AsyncSession) -> dict:
                 "ta": st.time_ar,
                 "te": st.time_en,
             }
-            passing_train_numbers = [
-                str(train_number)
-                for train_number in (st.passing_train_numbers or [])
-                if str(train_number).strip()
-                and str(train_number).strip() != str(t.train_number)
-            ]
-            if passing_train_numbers:
-                stop_payload["pt"] = passing_train_numbers
+            passing_note = str(st.passing_note or "").strip()
+            if not passing_note and st.passing_train_numbers:
+                passing_note = "، ".join(
+                    str(train_number).strip()
+                    for train_number in (st.passing_train_numbers or [])
+                    if str(train_number).strip()
+                    and str(train_number).strip() != str(t.train_number)
+                )
+            if passing_note:
+                stop_payload["pn"] = passing_note
             compact_stops.append(stop_payload)
 
         trips.append({

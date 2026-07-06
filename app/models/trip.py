@@ -91,6 +91,12 @@ class TripStop(Base):
         default=list,
         server_default=text("'[]'::jsonb"),
     )
+    passing_note: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="",
+        server_default=text("''"),
+    )
 
     trip:    Mapped["Trip"] = relationship("Trip", back_populates="stops")
     station: Mapped[Optional["Station"]] = relationship("Station", lazy="joined")

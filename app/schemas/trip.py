@@ -15,6 +15,7 @@ class TripStopOut(BaseModel):
     time_ar:    str
     time_en:    str
     passing_train_numbers: list[str] = []
+    passing_note: str = ""
 
 
 class TripBase(BaseModel):

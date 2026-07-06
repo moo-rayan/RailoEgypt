@@ -22,7 +22,7 @@ from app.core.cache import cache_get, cache_set
 from app.core.database import get_db
 from app.core.security import require_authenticated_user
 from app.models.station import Station
-from app.models.trip import Trip, TripStop
+from app.models.trip import TripStop
 from app.services.railway_service import railway_graph
 
 router = APIRouter(prefix="/railway", tags=["Railway"])
@@ -188,10 +188,6 @@ async def get_trip_stations(
         )
     ).all()
 
-    current_train_number = (
-        await db.execute(select(Trip.train_number).where(Trip.id == trip_id))
-    ).scalar_one_or_none()
-
     stations = [
         {
             "order":    stop.stop_order,
@@ -203,12 +199,7 @@ async def get_trip_stations(
             "time_ar":  stop.time_ar,
             "time_en":  stop.time_en,
             "audio_id": station.audio_id,
-            "passing_train_numbers": [
-                str(train_number)
-                for train_number in (stop.passing_train_numbers or [])
-                if str(train_number).strip()
-                and str(train_number).strip() != str(current_train_number)
-            ],
+            "passing_note": stop.passing_note or "",
         }
         for stop, station in rows
         if station

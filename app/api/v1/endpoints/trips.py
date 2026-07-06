@@ -8,7 +8,6 @@ from app.core.admin_auth import get_admin_or_legacy_key, require_admin
 from app.core.cache import cache_delete_pattern, cache_get, cache_set
 from app.core.database import get_db
 from app.crud.trips import trip_crud
-from app.models.train import Train
 from app.models.trip import Trip, TripStop
 from app.schemas.trip import TripListOut, TripOut, TripStopOut
 
@@ -33,38 +32,12 @@ def _normalize_passing_train_numbers(values: list[str] | None) -> list[str]:
     return normalized
 
 
-async def _validate_passing_train_numbers(
-    db: AsyncSession,
-    *,
-    trip_id: int,
-    train_numbers: list[str],
-) -> None:
-    if not train_numbers:
-        return
+def _normalize_passing_note(value: str | None) -> str:
+    return str(value or "").strip()[:180]
 
-    current_train_number = (
-        await db.execute(select(Trip.train_number).where(Trip.id == trip_id))
-    ).scalar_one_or_none()
-    if current_train_number is not None and str(current_train_number) in train_numbers:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Passing train cannot be the same train as this trip",
-        )
 
-    rows = (
-        await db.execute(
-            select(Train.train_id).where(
-                Train.train_id.in_(train_numbers),
-                Train.is_active.is_(True),
-            )
-        )
-    ).scalars().all()
-    missing = sorted(set(train_numbers) - set(str(row) for row in rows))
-    if missing:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid passing train numbers: {missing}",
-        )
+def _passing_numbers_to_note(values: list[str] | None) -> str:
+    return "، ".join(_normalize_passing_train_numbers(values))[:180]
 
 
 @router.get("", response_model=dict, dependencies=[Depends(get_admin_or_legacy_key)])
@@ -130,6 +103,8 @@ class AddStopRequest(BaseModel):
     stop_order: int
     time_ar: str
     time_en: str = ""
+    passing_note: str = ""
+    # Legacy compatibility: older dashboard builds sent train numbers.
     passing_train_numbers: list[str] = []
 
 
@@ -149,14 +124,9 @@ async def add_trip_stop(
     trip_exists = (await db.execute(select(Trip.id).where(Trip.id == trip_id))).scalar_one_or_none()
     if trip_exists is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trip not found")
-    passing_train_numbers = _normalize_passing_train_numbers(
-        body.passing_train_numbers
-    )
-    await _validate_passing_train_numbers(
-        db,
-        trip_id=trip_id,
-        train_numbers=passing_train_numbers,
-    )
+    passing_note = _normalize_passing_note(body.passing_note)
+    if not passing_note:
+        passing_note = _passing_numbers_to_note(body.passing_train_numbers)
 
     # Get current max stop_order via SQL
     max_order = (await db.execute(
@@ -179,7 +149,8 @@ async def add_trip_stop(
         stop_order=insert_at,
         time_ar=body.time_ar,
         time_en=body.time_en or body.time_ar,
-        passing_train_numbers=passing_train_numbers,
+        passing_note=passing_note,
+        passing_train_numbers=[],
     )
     db.add(new_stop)
 
@@ -207,6 +178,8 @@ async def add_trip_stop(
 class UpdateStopRequest(BaseModel):
     time_ar: str | None = None
     time_en: str | None = None
+    passing_note: str | None = None
+    # Legacy compatibility: older dashboard builds sent train numbers.
     passing_train_numbers: list[str] | None = None
 
 
@@ -221,7 +194,7 @@ async def update_trip_stop(
     body: UpdateStopRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Update a stop's time and/or exact passing train numbers."""
+    """Update a stop's time and/or free-form displayed note."""
     result = await db.execute(
         select(TripStop)
         .options(selectinload(TripStop.station))
@@ -235,15 +208,12 @@ async def update_trip_stop(
         stop.time_ar = body.time_ar
     if body.time_en is not None:
         stop.time_en = body.time_en
-    if body.passing_train_numbers is not None:
-        passing_train_numbers = _normalize_passing_train_numbers(
-            body.passing_train_numbers
-        )
-        await _validate_passing_train_numbers(
-            db,
-            trip_id=trip_id,
-            train_numbers=passing_train_numbers,
-        )
+    if body.passing_note is not None:
+        stop.passing_note = _normalize_passing_note(body.passing_note)
+        stop.passing_train_numbers = []
+    elif body.passing_train_numbers is not None:
+        passing_train_numbers = _normalize_passing_train_numbers(body.passing_train_numbers)
+        stop.passing_note = _passing_numbers_to_note(passing_train_numbers)
         stop.passing_train_numbers = passing_train_numbers
 
     await db.commit()
