@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Index, Integer, String, Text, func
+from sqlalchemy import Boolean, Index, Integer, String, Text, func, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -31,6 +32,12 @@ class Train(Base):
     arrival_en: Mapped[str] = mapped_column(Text, nullable=False, default="")
     note_ar: Mapped[str] = mapped_column(Text, nullable=False, default="")
     note_en: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    passing_station_ids: Mapped[list[int]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         nullable=False, server_default=func.now()

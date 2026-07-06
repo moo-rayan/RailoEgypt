@@ -22,7 +22,8 @@ from app.core.cache import cache_get, cache_set
 from app.core.database import get_db
 from app.core.security import require_authenticated_user
 from app.models.station import Station
-from app.models.trip import TripStop
+from app.models.train import Train
+from app.models.trip import Trip, TripStop
 from app.services.railway_service import railway_graph
 
 router = APIRouter(prefix="/railway", tags=["Railway"])
@@ -188,9 +189,42 @@ async def get_trip_stations(
         )
     ).all()
 
+    current_train_number = (
+        await db.execute(select(Trip.train_number).where(Trip.id == trip_id))
+    ).scalar_one_or_none()
+    stop_station_ids = {
+        int(stop.station_id)
+        for stop, station in rows
+        if stop.station_id is not None and station is not None
+    }
+    passing_trains_by_station: dict[int, list[str]] = {
+        station_id: [] for station_id in stop_station_ids
+    }
+    if stop_station_ids:
+        passing_rows = (
+            await db.execute(
+                select(Train.train_id, Train.passing_station_ids)
+                .where(Train.is_active.is_(True))
+                .order_by(Train.train_id)
+            )
+        ).all()
+        for train_number, station_ids in passing_rows:
+            if not isinstance(station_ids, list):
+                continue
+            if str(train_number) == str(current_train_number):
+                continue
+            for raw_station_id in station_ids:
+                try:
+                    station_id = int(raw_station_id)
+                except (TypeError, ValueError):
+                    continue
+                if station_id in passing_trains_by_station:
+                    passing_trains_by_station[station_id].append(str(train_number))
+
     stations = [
         {
             "order":    stop.stop_order,
+            "station_id": stop.station_id,
             "name_ar":  stop.station_ar,
             "name_en":  stop.station_en,
             "lat":      station.latitude,
@@ -198,6 +232,10 @@ async def get_trip_stations(
             "time_ar":  stop.time_ar,
             "time_en":  stop.time_en,
             "audio_id": station.audio_id,
+            "passing_train_numbers": passing_trains_by_station.get(
+                int(stop.station_id),
+                [],
+            ) if stop.station_id is not None else [],
         }
         for stop, station in rows
         if station
