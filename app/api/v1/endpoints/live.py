@@ -340,6 +340,7 @@ async def get_active_trains(
             "speed": room["speed"],
             "status": room["status"],
             "contributors_count": room["contributors_count"],
+            "listeners_count": room.get("listeners_count", 0),
             "chat_message_count": chat_count,
             "crowd_crowded": crowded_out,
             "crowd_not_crowded": not_crowded_out,

@@ -1256,6 +1256,7 @@ class TrackingManager:
             "sp": round(room.speed, 1),
             "st": room.status,
             "cn": self._active_contributor_count(room),
+            "lc": self._count_active_listeners(room.train_id),
             "dir": room.direction,
             "ss": room.start_station,
             "es": room.end_station,
