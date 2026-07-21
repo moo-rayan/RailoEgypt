@@ -10,6 +10,7 @@ from app.core.database import get_db
 from app.crud.trips import trip_crud
 from app.models.trip import Trip, TripStop
 from app.schemas.trip import TripListOut, TripOut, TripStopOut
+from app.services.trip_summary_service import sync_trip_summary_from_stops
 
 router = APIRouter(prefix="/trips", tags=["trips"])
 
@@ -148,19 +149,15 @@ async def add_trip_stop(
         station_id=body.station_id,
         stop_order=insert_at,
         time_ar=body.time_ar,
-        time_en=body.time_en or body.time_ar,
+        time_en=body.time_en,
         passing_note=passing_note,
         passing_train_numbers=[],
     )
     db.add(new_stop)
 
-    # Update stops_count via SQL (avoids stale ORM count)
-    await db.execute(
-        update(Trip).where(Trip.id == trip_id).values(stops_count=Trip.stops_count + 1)
-    )
-
     await db.flush()           # populate new_stop.id
     new_stop_id = new_stop.id
+    await sync_trip_summary_from_stops(db, trip_id)
     await db.commit()
 
     # Re-query with station relationship after commit
@@ -216,6 +213,7 @@ async def update_trip_stop(
         stop.passing_note = _passing_numbers_to_note(passing_train_numbers)
         stop.passing_train_numbers = passing_train_numbers
 
+    await sync_trip_summary_from_stops(db, trip_id)
     await db.commit()
     await db.refresh(stop)
     await cache_delete_pattern("trips:*")
@@ -255,10 +253,7 @@ async def remove_trip_stop(
         .values(stop_order=TripStop.stop_order - 1)
     )
 
-    trip = await trip_crud.get_by_id(db, trip_id)
-    if trip:
-        trip.stops_count = max(0, len(trip.stops) - 1)
-
+    await sync_trip_summary_from_stops(db, trip_id)
     await db.commit()
     await cache_delete_pattern("trips:*")
     await cache_delete_pattern("railway:stations:*")

@@ -15,48 +15,9 @@ from app.schemas.train import (
     TrainSearchParams,
     TrainUpdate,
 )
+from app.services.trip_summary_service import calc_duration, sync_trip_summary_from_stops
 
 router = APIRouter(prefix="/trains", tags=["trains"])
-
-
-def _calc_duration(dep: str, arr: str) -> tuple[str, str]:
-    """Calculate duration between departure and arrival time strings.
-    Accepts formats like '6:20 AM', '6:20 ص', '3:50 م', '3:50 PM'.
-    Returns (duration_ar, duration_en) e.g. ('1 س و 30 د', '1h 30m').
-    """
-    import re
-
-    def _to_minutes(t: str) -> int | None:
-        t = t.strip()
-        if not t:
-            return None
-        m = re.match(r"(\d{1,2}):(\d{2})\s*(ص|م|AM|PM|am|pm)", t)
-        if not m:
-            return None
-        h, mi, period = int(m.group(1)), int(m.group(2)), m.group(3).lower()
-        if period in ("م", "pm"):
-            if h != 12:
-                h += 12
-        elif h == 12:
-            h = 0
-        return h * 60 + mi
-
-    dep_min = _to_minutes(dep)
-    arr_min = _to_minutes(arr)
-    if dep_min is None or arr_min is None:
-        return ("", "")
-
-    diff = arr_min - dep_min
-    if diff <= 0:
-        diff += 24 * 60  # next day
-
-    hours, mins = divmod(diff, 60)
-    if hours and mins:
-        return (f"{hours} س و {mins} د", f"{hours}h {mins}m")
-    elif hours:
-        return (f"{hours} س", f"{hours}h")
-    else:
-        return (f"{mins} د", f"{mins}m")
 
 
 @router.get("", response_model=TrainListResponse, dependencies=[Depends(get_admin_or_legacy_key)])
@@ -117,7 +78,7 @@ async def create_train(
     # Auto-create a default trip linked to this train
     from_station = await station_crud.get_by_name_ar(db, payload.start_station_ar) if payload.start_station_ar else None
     to_station = await station_crud.get_by_name_ar(db, payload.end_station_ar) if payload.end_station_ar else None
-    dur_ar, dur_en = _calc_duration(payload.departure_ar, payload.arrival_ar)
+    dur_ar, dur_en = calc_duration(payload.departure_ar, payload.arrival_ar)
     trip = Trip(
         train_number=payload.train_id,
         from_station_id=from_station.id if from_station else None,
@@ -169,7 +130,7 @@ async def update_train(
         # Recalculate duration if departure or arrival changed
         new_dep = payload.departure_ar if payload.departure_ar is not None else trip.departure_ar
         new_arr = payload.arrival_ar if payload.arrival_ar is not None else trip.arrival_ar
-        dur_ar, dur_en = _calc_duration(new_dep, new_arr)
+        dur_ar, dur_en = calc_duration(new_dep, new_arr)
         if dur_ar:
             trip.duration_ar = dur_ar
             trip.duration_en = dur_en
@@ -179,7 +140,11 @@ async def update_train(
         if payload.end_station_ar is not None:
             to_station = await station_crud.get_by_name_ar(db, payload.end_station_ar) if payload.end_station_ar else None
             trip.to_station_id = to_station.id if to_station else None
-        await db.commit()
+
+        await sync_trip_summary_from_stops(db, trip.id, clear_when_empty=False)
+
+    await db.commit()
+    await db.refresh(result)
 
     await cache_delete_pattern("trains:*")
     await cache_delete_pattern("trips:*")
