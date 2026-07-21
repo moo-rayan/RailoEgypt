@@ -191,6 +191,19 @@ async def list_feature_votes(
         )
         total = int(total_result.scalar_one() or 0)
 
+        users_result = await db.execute(
+            text(
+                f"""
+                SELECT COUNT(DISTINCT fv.user_id) AS users_count
+                FROM "EgRailway".feature_votes fv
+                LEFT JOIN "EgRailway".profiles p ON p.id = fv.user_id
+                {where_clause}
+                """
+            ),
+            params,
+        )
+        users_count = int(users_result.scalar_one() or 0)
+
         summary_result = await db.execute(
             text(
                 f"""
@@ -234,6 +247,7 @@ async def list_feature_votes(
 
         return {
             "total": total,
+            "users_count": users_count,
             "page": page,
             "page_size": page_size,
             "summary": [
@@ -254,4 +268,84 @@ async def list_feature_votes(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to load votes",
+        ) from exc
+
+
+@router.get("/admin/votes/overview", dependencies=[Depends(get_admin_or_legacy_key)])
+async def list_feature_vote_overview(
+    q: str | None = Query(None, min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    filters: list[str] = []
+    params: dict[str, Any] = {}
+
+    if q:
+        params["q"] = f"%{q.strip()}%"
+        filters.append(
+            """
+            (
+                fv.feature_key ILIKE :q
+                OR fv.vote_value ILIKE :q
+                OR fv.target_type ILIKE :q
+                OR fv.target_id ILIKE :q
+                OR p.email ILIKE :q
+                OR p.display_name ILIKE :q
+                OR fv.context_data::text ILIKE :q
+                OR fv.client_metadata::text ILIKE :q
+            )
+            """
+        )
+
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    try:
+        result = await db.execute(
+            text(
+                f"""
+                SELECT
+                    fv.feature_key,
+                    COUNT(*)::integer AS total,
+                    COUNT(DISTINCT fv.user_id)::integer AS users_count,
+                    COUNT(DISTINCT (fv.target_type || ':' || COALESCE(fv.target_id, '')))::integer AS targets_count,
+                    SUM(CASE WHEN fv.vote_value = 'interested' THEN 1 ELSE 0 END)::integer AS interested_count,
+                    SUM(CASE WHEN fv.vote_value = 'not_interested' THEN 1 ELSE 0 END)::integer AS not_interested_count,
+                    SUM(CASE WHEN fv.vote_value NOT IN ('interested', 'not_interested') THEN 1 ELSE 0 END)::integer AS other_count,
+                    MAX(fv.updated_at) AS latest_at,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT fv.target_type), NULL) AS target_types,
+                    ARRAY_REMOVE(ARRAY_AGG(DISTINCT fv.source), NULL) AS sources
+                FROM "EgRailway".feature_votes fv
+                LEFT JOIN "EgRailway".profiles p ON p.id = fv.user_id
+                {where_clause}
+                GROUP BY fv.feature_key
+                ORDER BY latest_at DESC, total DESC, fv.feature_key ASC
+                """
+            ),
+            params,
+        )
+        rows = result.mappings().all()
+        items = [
+            {
+                "feature_key": row["feature_key"],
+                "total": row["total"],
+                "users_count": row["users_count"],
+                "targets_count": row["targets_count"],
+                "interested_count": row["interested_count"],
+                "not_interested_count": row["not_interested_count"],
+                "other_count": row["other_count"],
+                "latest_at": row["latest_at"],
+                "target_types": list(row["target_types"] or []),
+                "sources": list(row["sources"] or []),
+            }
+            for row in rows
+        ]
+        return {
+            "total_features": len(items),
+            "total_votes": sum(item["total"] for item in items),
+            "items": items,
+        }
+    except Exception as exc:
+        logger.error("Failed to list feature vote overview: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to load vote overview",
         ) from exc
