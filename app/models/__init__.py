@@ -4,6 +4,7 @@ from app.models.app_config import AppConfig
 from app.models.app_announcement import AppAnnouncement
 from app.models.audit_log import AuditLog
 from app.models.device_token import DeviceToken
+from app.models.kiosk import Kiosk
 from app.models.news import News
 from app.models.news_view import NewsView
 from app.models.notification_history import NotificationHistory
@@ -22,6 +23,7 @@ __all__ = [
     "AppAnnouncement",
     "AuditLog",
     "DeviceToken",
+    "Kiosk",
     "News",
     "NewsView",
     "NotificationHistory",
