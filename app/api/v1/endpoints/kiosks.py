@@ -5,11 +5,13 @@ from sqlalchemy.orm import selectinload
 
 from app.core.admin_auth import require_admin
 from app.core.database import get_db
+from app.core.security import require_authenticated_user
 from app.models.kiosk import Kiosk
 from app.models.station import Station
 from app.schemas.kiosk import KioskCreate, KioskListResponse, KioskRead, KioskUpdate
 
 router = APIRouter(prefix="/kiosks", tags=["kiosks"])
+MAX_PUBLIC_STATION_IDS = 200
 
 
 async def _get_station_or_400(db: AsyncSession, station_id: int) -> Station:
@@ -39,6 +41,72 @@ async def _get_kiosk_or_404(db: AsyncSession, kiosk_id: int) -> Kiosk:
 
 def _serialize_kiosk(kiosk: Kiosk) -> dict:
     return KioskRead.model_validate(kiosk).model_dump(mode="json")
+
+
+def _parse_station_ids(raw_station_ids: str) -> list[int]:
+    station_ids: list[int] = []
+    seen: set[int] = set()
+    for raw in raw_station_ids.split(","):
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            station_id = int(value)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="station_ids must be comma-separated integers",
+            ) from exc
+        if station_id <= 0 or station_id in seen:
+            continue
+        seen.add(station_id)
+        station_ids.append(station_id)
+        if len(station_ids) > MAX_PUBLIC_STATION_IDS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"station_ids limit is {MAX_PUBLIC_STATION_IDS}",
+            )
+    return station_ids
+
+
+def _serialize_public_kiosk(kiosk: Kiosk) -> dict:
+    return {
+        "id": kiosk.id,
+        "station_id": kiosk.station_id,
+        "merchant_name": kiosk.merchant_name,
+        "seller_phone": kiosk.seller_phone if kiosk.is_phone_visible else "",
+        "menu": kiosk.menu,
+        "working_hours": kiosk.working_hours,
+        "platform_location": kiosk.platform_location,
+        "is_open": kiosk.is_open,
+        "is_phone_visible": kiosk.is_phone_visible,
+        "updated_at": kiosk.updated_at.isoformat() if kiosk.updated_at else None,
+    }
+
+
+@router.get("/station-map", dependencies=[Depends(require_authenticated_user)])
+async def get_kiosks_for_station_map(
+    station_ids: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    parsed_ids = _parse_station_ids(station_ids)
+    if not parsed_ids:
+        return {"items": [], "station_ids": []}
+
+    result = await db.execute(
+        select(Kiosk)
+        .where(
+            Kiosk.is_active.is_(True),
+            Kiosk.station_id.in_(parsed_ids),
+        )
+        .order_by(Kiosk.station_id.asc(), Kiosk.is_open.desc(), Kiosk.id.asc())
+    )
+    kiosks = result.scalars().all()
+
+    return {
+        "station_ids": parsed_ids,
+        "items": [_serialize_public_kiosk(kiosk) for kiosk in kiosks],
+    }
 
 
 @router.get("", response_model=KioskListResponse, dependencies=[Depends(require_admin)])
