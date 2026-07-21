@@ -8,7 +8,13 @@ from app.core.database import get_db
 from app.core.security import require_authenticated_user
 from app.models.kiosk import Kiosk
 from app.models.station import Station
-from app.schemas.kiosk import KioskCreate, KioskListResponse, KioskRead, KioskUpdate
+from app.schemas.kiosk import (
+    KioskCreate,
+    KioskListResponse,
+    KioskRead,
+    KioskUpdate,
+    normalize_kiosk_platform_location,
+)
 
 router = APIRouter(prefix="/kiosks", tags=["kiosks"])
 MAX_PUBLIC_STATION_IDS = 200
@@ -77,7 +83,7 @@ def _serialize_public_kiosk(kiosk: Kiosk) -> dict:
         "seller_phone": kiosk.seller_phone if kiosk.is_phone_visible else "",
         "menu": kiosk.menu,
         "working_hours": kiosk.working_hours,
-        "platform_location": kiosk.platform_location,
+        "platform_location": normalize_kiosk_platform_location(kiosk.platform_location),
         "is_open": kiosk.is_open,
         "is_phone_visible": kiosk.is_phone_visible,
         "updated_at": kiosk.updated_at.isoformat() if kiosk.updated_at else None,

@@ -24,7 +24,7 @@ class Kiosk(Base):
     seller_phone: Mapped[str] = mapped_column(Text, nullable=False, default="")
     menu: Mapped[dict | list] = mapped_column(JSONB, nullable=False, default=list)
     working_hours: Mapped[dict | list] = mapped_column(JSONB, nullable=False, default=dict)
-    platform_location: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    platform_location: Mapped[str] = mapped_column(Text, nullable=False, default="right")
     is_open: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_phone_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
