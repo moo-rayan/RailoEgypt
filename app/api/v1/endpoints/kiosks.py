@@ -84,6 +84,39 @@ def _serialize_public_kiosk(kiosk: Kiosk) -> dict:
     }
 
 
+async def _get_station_kiosk_versions(
+    db: AsyncSession,
+    station_ids: list[int],
+) -> dict[str, dict[str, int | str | None]]:
+    if not station_ids:
+        return {}
+
+    result = await db.execute(
+        select(
+            Kiosk.station_id,
+            func.count(Kiosk.id).label("active_count"),
+            func.max(Kiosk.updated_at).label("updated_at"),
+        )
+        .where(
+            Kiosk.is_active.is_(True),
+            Kiosk.station_id.in_(station_ids),
+        )
+        .group_by(Kiosk.station_id)
+    )
+    rows = {row.station_id: row for row in result.all()}
+
+    versions: dict[str, dict[str, int | str | None]] = {}
+    for station_id in station_ids:
+        row = rows.get(station_id)
+        versions[str(station_id)] = {
+            "active_count": int(row.active_count) if row else 0,
+            "updated_at": row.updated_at.isoformat()
+            if row and row.updated_at
+            else None,
+        }
+    return versions
+
+
 @router.get("/station-map", dependencies=[Depends(require_authenticated_user)])
 async def get_kiosks_for_station_map(
     station_ids: str = Query(..., min_length=1),
@@ -106,6 +139,19 @@ async def get_kiosks_for_station_map(
     return {
         "station_ids": parsed_ids,
         "items": [_serialize_public_kiosk(kiosk) for kiosk in kiosks],
+        "versions": await _get_station_kiosk_versions(db, parsed_ids),
+    }
+
+
+@router.get("/station-map/versions", dependencies=[Depends(require_authenticated_user)])
+async def get_station_kiosk_versions(
+    station_ids: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db),
+):
+    parsed_ids = _parse_station_ids(station_ids)
+    return {
+        "station_ids": parsed_ids,
+        "versions": await _get_station_kiosk_versions(db, parsed_ids),
     }
 
 
