@@ -37,6 +37,9 @@ class AppConfigResponse(BaseModel):
     store_url_android: str
     store_url_ios: str
     station_schedule_check_enabled: bool
+    map_viewer_boost_enabled: bool
+    map_viewer_boost_min: int
+    map_viewer_boost_max: int
 
 
 class AppConfigUpdateRequest(BaseModel):
@@ -51,6 +54,9 @@ class AppConfigUpdateRequest(BaseModel):
     store_url_android: Optional[str] = None
     store_url_ios: Optional[str] = None
     station_schedule_check_enabled: Optional[bool] = None
+    map_viewer_boost_enabled: Optional[bool] = None
+    map_viewer_boost_min: Optional[int] = None
+    map_viewer_boost_max: Optional[int] = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -79,6 +85,9 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
             store_url_android="",
             store_url_ios="",
             station_schedule_check_enabled=True,
+            map_viewer_boost_enabled=False,
+            map_viewer_boost_min=15,
+            map_viewer_boost_max=30,
         )
 
     return AppConfigResponse(
@@ -93,6 +102,9 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
         store_url_android=config.store_url_android,
         store_url_ios=config.store_url_ios,
         station_schedule_check_enabled=config.station_schedule_check_enabled,
+        map_viewer_boost_enabled=config.map_viewer_boost_enabled,
+        map_viewer_boost_min=config.map_viewer_boost_min,
+        map_viewer_boost_max=config.map_viewer_boost_max,
     )
 
 
@@ -112,6 +124,16 @@ async def update_app_config(
 
     # Only update fields that were provided
     update_data = body.model_dump(exclude_unset=True)
+    if "map_viewer_boost_min" in update_data or "map_viewer_boost_max" in update_data:
+        min_count = int(update_data.get("map_viewer_boost_min", config.map_viewer_boost_min))
+        max_count = int(update_data.get("map_viewer_boost_max", config.map_viewer_boost_max))
+        min_count = max(0, min(min_count, 999))
+        max_count = max(0, min(max_count, 999))
+        if min_count > max_count:
+            min_count, max_count = max_count, min_count
+        update_data["map_viewer_boost_min"] = min_count
+        update_data["map_viewer_boost_max"] = max_count
+
     for field, value in update_data.items():
         setattr(config, field, value)
 
@@ -137,4 +159,7 @@ async def update_app_config(
         store_url_android=config.store_url_android,
         store_url_ios=config.store_url_ios,
         station_schedule_check_enabled=config.station_schedule_check_enabled,
+        map_viewer_boost_enabled=config.map_viewer_boost_enabled,
+        map_viewer_boost_min=config.map_viewer_boost_min,
+        map_viewer_boost_max=config.map_viewer_boost_max,
     )

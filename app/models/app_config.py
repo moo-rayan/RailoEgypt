@@ -28,4 +28,7 @@ class AppConfig(Base):
     store_url_android: Mapped[str] = mapped_column(Text, nullable=False, default="")
     store_url_ios: Mapped[str] = mapped_column(Text, nullable=False, default="")
     station_schedule_check_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    map_viewer_boost_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    map_viewer_boost_min: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
+    map_viewer_boost_max: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
     updated_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now(), onupdate=func.now())
