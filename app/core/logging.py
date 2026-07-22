@@ -6,8 +6,13 @@ import structlog
 from app.core.config import settings
 
 
+def _resolve_log_level() -> int:
+    level_name = (settings.app_log_level or "WARNING").upper()
+    return getattr(logging, level_name, logging.WARNING)
+
+
 def setup_logging() -> None:
-    log_level = logging.DEBUG if not settings.is_production else logging.INFO
+    log_level = _resolve_log_level()
 
     shared_processors = [
         structlog.contextvars.merge_contextvars,
@@ -37,9 +42,17 @@ def setup_logging() -> None:
         format="%(message)s",
         stream=sys.stdout,
         level=log_level,
+        force=True,
     )
 
     # Silence noisy loggers
+    noisy_server_level = logging.INFO if log_level <= logging.INFO else logging.WARNING
+    logging.getLogger("uvicorn.access").disabled = log_level > logging.INFO
+    logging.getLogger("uvicorn.access").setLevel(noisy_server_level)
+    logging.getLogger("uvicorn.error").setLevel(noisy_server_level)
+    logging.getLogger("uvicorn.protocols.websockets").setLevel(noisy_server_level)
+    logging.getLogger("websockets").setLevel(noisy_server_level)
+    logging.getLogger("websockets.server").setLevel(noisy_server_level)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_secret_key: str = "change-me"
     app_allowed_origins: str = "http://localhost,http://localhost:3000,http://localhost:8000"
+    app_log_level: str = "WARNING"
 
     # Supabase
     supabase_url: str
