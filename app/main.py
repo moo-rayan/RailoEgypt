@@ -298,88 +298,6 @@ async def _chat_cleanup_scheduler():
             logger.error("Chat cleanup scheduler error: %s", exc)
 
 
-async def _account_deletion_scheduler():
-    """Background task: process expired account deletion requests every 6 hours."""
-    from datetime import datetime, timezone
-    from sqlalchemy import select, update
-    from app.models.account_deletion_request import AccountDeletionRequest
-    from app.models.device_token import DeviceToken
-    from app.models.profile import Profile
-    import httpx
-
-    while True:
-        try:
-            await asyncio.sleep(6 * 3600)  # Run every 6 hours
-
-            now = datetime.now(timezone.utc)
-            async with AsyncSessionFactory() as session:
-                result = await session.execute(
-                    select(AccountDeletionRequest)
-                    .where(
-                        AccountDeletionRequest.status == "pending",
-                        AccountDeletionRequest.scheduled_deletion_at <= now,
-                    )
-                )
-                expired = result.scalars().all()
-
-                if not expired:
-                    continue
-
-                logger.info("Processing %d expired account deletion requests...", len(expired))
-
-                for req in expired:
-                    try:
-                        # Delete user from Supabase Auth
-                        async with httpx.AsyncClient(timeout=15) as client:
-                            resp = await client.delete(
-                                f"{settings.supabase_url}/auth/v1/admin/users/{req.user_id}",
-                                headers={
-                                    "Authorization": f"Bearer {settings.supabase_service_role_key}",
-                                    "apikey": settings.supabase_service_role_key,
-                                },
-                            )
-                            if resp.status_code not in (200, 204, 404):
-                                logger.error(
-                                    "Failed to delete Supabase user %s: %d",
-                                    req.user_id, resp.status_code,
-                                )
-                                continue
-
-                        # Delete device tokens
-                        await session.execute(
-                            DeviceToken.__table__.delete().where(
-                                DeviceToken.user_id == req.user_id
-                            )
-                        )
-
-                        # Deactivate profile
-                        await session.execute(
-                            update(Profile)
-                            .where(Profile.id == req.user_id)
-                            .values(
-                                is_active=False,
-                                email=None,
-                                display_name="Deleted User",
-                                avatar_url=None,
-                            )
-                        )
-
-                        req.status = "completed"
-                        req.completed_at = now
-                        logger.info("Account deleted: user=%s", req.user_id)
-
-                    except Exception as exc:
-                        logger.error("Error deleting user %s: %s", req.user_id, exc)
-
-                await session.commit()
-
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.error("Account deletion scheduler error: %s", exc)
-            await asyncio.sleep(60)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging()
@@ -427,7 +345,8 @@ async def lifespan(app: FastAPI):
             pass
 
     # ── 5. Start background tasks ────────────────────────────────────────────
-    deletion_task = asyncio.create_task(_account_deletion_scheduler())
+    # Account deletion is intentionally manual-only. Use the admin endpoint
+    # /api/v1/account/process-deletions when deletions should be processed.
     stale_task = asyncio.create_task(_stale_contributor_scheduler())
     bundle_sync_task = asyncio.create_task(_bundle_sync_checker())
     chat_cleanup_task = asyncio.create_task(_chat_cleanup_scheduler())
@@ -435,7 +354,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup: cancel background tasks
-    for task in (deletion_task, stale_task, bundle_sync_task, chat_cleanup_task):
+    for task in (stale_task, bundle_sync_task, chat_cleanup_task):
         task.cancel()
         try:
             await task

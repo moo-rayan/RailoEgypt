@@ -7,7 +7,7 @@ Endpoints:
   - POST /account/cancel-deletion         → Cancel pending deletion
   - GET  /account/delete-page             → Public HTML page (for Google Play / App Store policy)
   - POST /account/delete-page             → Public form submission
-  - POST /account/process-deletions       → Admin: process expired requests (called by cron)
+  - POST /account/process-deletions       → Admin: manually process expired requests
 """
 
 import logging
@@ -495,7 +495,7 @@ async def submit_web_deletion(
     }
 
 
-# ── Admin: Process Expired Deletions (called by cron / scheduler) ────────────
+# ── Admin: Manually Process Expired Deletions ────────────────────────────────
 
 @router.post("/process-deletions")
 async def process_deletions(
@@ -504,7 +504,7 @@ async def process_deletions(
 ):
     """
     Process all pending deletion requests where grace period has expired.
-    This should be called by a cron job (e.g., daily).
+    This is manual/admin-only; no background scheduler runs automatically.
     """
     import httpx
 
