@@ -40,6 +40,7 @@ from app.core.security_middleware import SecurityMiddleware
 from app.services.audit_service import audit
 from app.core.r2_storage import r2_download_bundle, r2_download_version, r2_upload_bundle
 from app.models.railway_graph import RailwayGraphData
+from app.services.global_chat_manager import global_chat_manager
 from app.services.railway_service import railway_graph
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
@@ -347,6 +348,7 @@ async def lifespan(app: FastAPI):
     # ── 5. Start background tasks ────────────────────────────────────────────
     # Account deletion is intentionally manual-only. Use the admin endpoint
     # /api/v1/account/process-deletions when deletions should be processed.
+    await global_chat_manager.start()
     stale_task = asyncio.create_task(_stale_contributor_scheduler())
     bundle_sync_task = asyncio.create_task(_bundle_sync_checker())
     chat_cleanup_task = asyncio.create_task(_chat_cleanup_scheduler())
@@ -360,6 +362,7 @@ async def lifespan(app: FastAPI):
             await task
         except asyncio.CancelledError:
             pass
+    await global_chat_manager.stop()
 
 
 class _WebSocketSafeRateLimiter:

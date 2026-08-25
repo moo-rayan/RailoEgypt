@@ -5,6 +5,7 @@ from app.api.v1.endpoints import (
     admin_audit,
     admin_auth,
     admin_chat,
+    admin_global_chat,
     admin_live,
     admin_users,
     announcements,
@@ -14,6 +15,7 @@ from app.api.v1.endpoints import (
     data_bundle,
     fares,
     feedback,
+    global_chat,
     health,
     kiosks,
     live,
@@ -40,9 +42,11 @@ api_router.include_router(railway.router)
 api_router.include_router(live.router)
 api_router.include_router(admin_live.router)
 api_router.include_router(admin_chat.router)
+api_router.include_router(admin_global_chat.router)
 api_router.include_router(speech.router)
 api_router.include_router(chat.router)
 api_router.include_router(train_chat.router)
+api_router.include_router(global_chat.router)
 api_router.include_router(data_bundle.router)
 api_router.include_router(news.router)
 api_router.include_router(notifications.router)

@@ -107,9 +107,14 @@ async def submit_report(
 
         # Create admin dashboard alert
         from app.services.admin_alert_service import create_alert
+        is_global_chat = train_id == "global_chat"
         await create_alert(
             alert_type="report",
-            title=f"بلاغ جديد على رسالة في قطار {train_id}",
+            title=(
+                "بلاغ جديد على رسالة في الشات الجماعي"
+                if is_global_chat
+                else f"بلاغ جديد على رسالة في قطار {train_id}"
+            ),
             body=f"الرسالة: {message_text[:100]}{'…' if len(message_text) > 100 else ''}"
                  + (f"\nالسبب: {report_reason}" if report_reason else ""),
             metadata={
@@ -118,7 +123,11 @@ async def submit_report(
                 "reported_user_id": reported_user_id,
                 "message_id": message_id,
             },
-            navigate_to=f"/admin/contributors?train={train_id}",
+            navigate_to=(
+                "/admin/global-chat"
+                if is_global_chat
+                else f"/admin/contributors?train={train_id}"
+            ),
         )
 
         return {"ok": True}

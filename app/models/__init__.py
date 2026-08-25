@@ -4,6 +4,7 @@ from app.models.app_config import AppConfig
 from app.models.app_announcement import AppAnnouncement
 from app.models.audit_log import AuditLog
 from app.models.device_token import DeviceToken
+from app.models.global_chat import GlobalChatMessage, GlobalChatReaction, GlobalChatSetting
 from app.models.kiosk import Kiosk
 from app.models.news import News
 from app.models.news_view import NewsView
@@ -23,6 +24,9 @@ __all__ = [
     "AppAnnouncement",
     "AuditLog",
     "DeviceToken",
+    "GlobalChatMessage",
+    "GlobalChatReaction",
+    "GlobalChatSetting",
     "Kiosk",
     "News",
     "NewsView",
