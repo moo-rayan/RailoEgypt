@@ -113,6 +113,46 @@ async def send_to_topic(
         return False
 
 
+async def send_data_to_tokens(
+    tokens: list[str],
+    data: dict,
+) -> dict:
+    """Send a data-only FCM message to multiple tokens."""
+    app = get_firebase_app()
+    if app is None:
+        return {"success": 0, "failure": len(tokens), "invalid_tokens": []}
+
+    if not tokens:
+        return {"success": 0, "failure": 0, "invalid_tokens": []}
+
+    str_data = {k: str(v) for k, v in data.items()}
+    message = messaging.MulticastMessage(
+        data=str_data,
+        tokens=tokens,
+        android=messaging.AndroidConfig(priority="high"),
+    )
+
+    try:
+        response = messaging.send_each_for_multicast(message, app=app)
+        invalid_tokens = []
+        for i, send_response in enumerate(response.responses):
+            if send_response.exception and isinstance(send_response.exception, (
+                messaging.UnregisteredError,
+                messaging.SenderIdMismatchError,
+                messaging.InvalidArgumentError,
+            )):
+                invalid_tokens.append(tokens[i])
+
+        return {
+            "success": response.success_count,
+            "failure": response.failure_count,
+            "invalid_tokens": invalid_tokens,
+        }
+    except Exception as e:
+        logger.error("❌ FCM data send error: %s", e)
+        return {"success": 0, "failure": len(tokens), "invalid_tokens": []}
+
+
 async def send_to_tokens(
     tokens: list[str],
     title: str,

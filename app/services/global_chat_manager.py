@@ -294,6 +294,7 @@ class GlobalChatManager:
 
         await self.broadcast_event({"type": "chat_message", "data": message})
         await self._send_fcm(message)
+        await self._send_reply_fcm(message, sender_user_id=user_id)
         await self._trim_old_messages()
         return {"ok": True, "message": message}
 
@@ -320,6 +321,7 @@ class GlobalChatManager:
         )
         await self.broadcast_event({"type": "chat_message", "data": message})
         await self._send_fcm(message)
+        await self._send_reply_fcm(message, sender_user_id=None)
         return {"ok": True, "message": message}
 
     async def toggle_love(self, message_id: str, user_id: str) -> dict:
@@ -641,6 +643,60 @@ class GlobalChatManager:
             )
         except Exception as exc:
             logger.warning("Global chat FCM push failed: %s", exc)
+
+    async def _send_reply_fcm(self, message: dict, sender_user_id: str | None) -> None:
+        reply_message_id = _uuid_or_none(message.get("reply_to_message_id"))
+        if reply_message_id is None:
+            return
+
+        try:
+            async with AsyncSessionFactory() as session:
+                owner_result = await session.execute(
+                    text(
+                        """
+                        SELECT user_id::text
+                        FROM "EgRailway".global_chat_messages
+                        WHERE id = CAST(:message_id AS uuid)
+                          AND is_deleted = false
+                        LIMIT 1
+                        """
+                    ),
+                    {"message_id": reply_message_id},
+                )
+                target_user_id = owner_result.scalar()
+
+                if not target_user_id or target_user_id == sender_user_id:
+                    return
+
+                token_result = await session.execute(
+                    text(
+                        """
+                        SELECT fcm_token
+                        FROM "EgRailway".device_tokens
+                        WHERE user_id = :user_id
+                        """
+                    ),
+                    {"user_id": target_user_id},
+                )
+                tokens = [row[0] for row in token_result.all() if row[0]]
+
+            if not tokens:
+                return
+
+            await fcm_service.send_data_to_tokens(
+                tokens=tokens,
+                data={
+                    "type": "global_chat_message",
+                    "reply_direct": "1",
+                    "sender_id": message.get("user_id", ""),
+                    "sender_name": message.get("user_name", "مجهول"),
+                    "text": str(message.get("text", ""))[:100],
+                    "message_id": message.get("id", ""),
+                    "reply_to_message_id": reply_message_id,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Global chat reply FCM failed: %s", exc)
 
     @staticmethod
     def _serialize_message(row: Any) -> dict:
