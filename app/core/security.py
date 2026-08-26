@@ -27,7 +27,7 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_TICKET_TTL = 43200  # seconds (12 hours - enough for full train journey)
+_TICKET_TTL = 7 * 24 * 3600  # seconds (7 days)
 
 
 # ── Separate token caches (prevents cross-contamination between App JWT and Supabase JWT)
@@ -401,7 +401,7 @@ def _sign(payload: str) -> str:
 
 def create_ticket(user_id: str, train_id: str, role: str) -> str:
     """
-    Create an HMAC ticket valid for 12 hours.
+    Create an HMAC ticket valid for 7 days.
     Format: user_id|train_id|role|timestamp|signature
     """
     ts = str(int(time.time()))
@@ -413,7 +413,7 @@ def create_ticket(user_id: str, train_id: str, role: str) -> str:
 def verify_ticket(ticket: str, expected_train_id: str) -> Optional[dict]:
     """
     Verify an HMAC ticket. Returns parsed ticket data or None if invalid.
-    Checks: signature validity, expiration (12h), and train_id match.
+    Checks: signature validity, expiration (7 days), and train_id match.
     """
     try:
         parts = ticket.split("|")
