@@ -44,6 +44,22 @@ class Profile(Base):
         nullable=True,
         comment="Timestamp of last tracking contribution",
     )
+    total_contribution_distance_km: Mapped[float] = mapped_column(
+        Double, nullable=False, default=0.0,
+        comment="Total trusted tracking distance rewarded to this user in kilometres",
+    )
+    reward_points_balance: Mapped[int] = mapped_column(
+        nullable=False, default=0,
+        comment="Current redeemable reward points balance",
+    )
+    reward_points_lifetime: Mapped[int] = mapped_column(
+        nullable=False, default=0,
+        comment="Total reward points ever earned",
+    )
+    reward_points_redeemed: Mapped[int] = mapped_column(
+        nullable=False, default=0,
+        comment="Total reward points redeemed",
+    )
 
     is_captain: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,

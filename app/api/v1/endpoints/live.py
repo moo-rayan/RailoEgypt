@@ -288,9 +288,13 @@ async def contributor_leave(
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     user_id = user["id"]
-    await tracking_manager.remove_participant(train_id, user_id, "user_left")
+    reward_summary = await tracking_manager.remove_participant(
+        train_id,
+        user_id,
+        "user_left",
+    )
     logger.info("🚪 [%s] Contributor %s left voluntarily", train_id, user_id[:8])
-    return {"ok": True}
+    return {"ok": True, "reward_summary": reward_summary}
 
 
 # ── REST: Active trains (for authenticated users) ────────────────────────────

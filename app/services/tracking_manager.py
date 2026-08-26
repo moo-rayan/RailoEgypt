@@ -19,11 +19,13 @@ import json
 import logging
 import math
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
 from app.core.cache import cache_delete, cache_get, cache_set
 from app.core.config import settings
+from app.services.contribution_reward_service import finalize_contribution_session
 from app.services.railway_service import railway_graph, _haversine
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ _MAX_TRAIN_DISTANCE_M = 5000.0  # contributor must be within this of train
 _TRAIN_POS_TTL       = 60      # Redis TTL for cached train position (60 seconds)
 _ROOM_GRACE_S        = 600.0   # keep empty room alive for 10 min before destroying
 _ROOM_HISTORY_TTL    = 43200   # Redis TTL for room history (12 hours)
+_MAX_REWARD_SEGMENT_SPEED_KMH = 180.0  # reward distance plausibility cap
+_REWARD_SEGMENT_GRACE_M = 750.0        # GPS/server timing tolerance
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -80,6 +84,20 @@ class Contributor:
     is_captain: bool = False
     is_silent: bool = False
     far_from_train_logged: bool = False  # prevent repeated silent_disconnect log
+    reward_started_at: float = field(default_factory=time.time)
+    reward_first_lat: Optional[float] = None
+    reward_first_lng: Optional[float] = None
+    reward_last_lat: Optional[float] = None
+    reward_last_lng: Optional[float] = None
+    reward_last_progress_m: Optional[float] = None
+    reward_last_progress_at: float = 0.0
+    reward_raw_distance_m: float = 0.0
+    reward_trusted_distance_m: float = 0.0
+    reward_accepted_updates: int = 0
+    reward_rejected_updates: int = 0
+    reward_max_speed_kmh: float = 0.0
+    reward_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    reward_finalized: bool = False
 
 
 @dataclass
@@ -332,6 +350,126 @@ class TrackingManager:
             )
         return total_m / 1000.0  # metres → km
 
+    @staticmethod
+    def _max_plausible_reward_delta_m(elapsed_s: float) -> float:
+        elapsed_s = max(1.0, elapsed_s)
+        metres_per_second = _MAX_REWARD_SEGMENT_SPEED_KMH * 1000.0 / 3600.0
+        return max(250.0, elapsed_s * metres_per_second + _REWARD_SEGMENT_GRACE_M)
+
+    def _record_reward_update(
+        self,
+        room: "TrainRoom",
+        contributor: "Contributor",
+        lat: float,
+        lng: float,
+        speed: float,
+        now: float,
+    ) -> None:
+        """Accumulate trusted distance for rewards from accepted updates only."""
+        contributor.reward_accepted_updates += 1
+        contributor.reward_max_speed_kmh = max(
+            contributor.reward_max_speed_kmh,
+            max(0.0, speed or 0.0),
+        )
+
+        if contributor.reward_first_lat is None:
+            contributor.reward_first_lat = lat
+            contributor.reward_first_lng = lng
+
+        previous_lat = contributor.reward_last_lat
+        previous_lng = contributor.reward_last_lng
+        previous_update_at = (
+            contributor.reward_last_progress_at
+            or contributor.reward_started_at
+            or now
+        )
+        elapsed_s = now - previous_update_at
+        max_delta_m = self._max_plausible_reward_delta_m(elapsed_s)
+
+        raw_delta_m = 0.0
+        if previous_lat is not None and previous_lng is not None:
+            raw_delta_m = _haversine(previous_lng, previous_lat, lng, lat)
+            contributor.reward_raw_distance_m += max(0.0, raw_delta_m)
+
+        if len(room.stations) >= 2:
+            progress_m = self._compute_route_progress(lat, lng, room.stations)
+            previous_progress_m = contributor.reward_last_progress_m
+            if previous_progress_m is None:
+                contributor.reward_last_progress_m = progress_m
+            else:
+                delta_m = progress_m - previous_progress_m
+                if 0 < delta_m <= max_delta_m:
+                    contributor.reward_trusted_distance_m += delta_m
+                    contributor.reward_last_progress_m = progress_m
+                elif delta_m > max_delta_m:
+                    contributor.reward_rejected_updates += 1
+                    contributor.reward_last_progress_m = progress_m
+                    logger.warning(
+                        "Reward segment rejected: train=%s user=%s delta=%.0fm max=%.0fm",
+                        room.train_id,
+                        contributor.user_id[:8],
+                        delta_m,
+                        max_delta_m,
+                    )
+                elif delta_m < -100:
+                    contributor.reward_rejected_updates += 1
+        elif raw_delta_m > 0:
+            if raw_delta_m <= max_delta_m:
+                contributor.reward_trusted_distance_m += raw_delta_m
+            else:
+                contributor.reward_rejected_updates += 1
+                logger.warning(
+                    "Reward raw segment rejected: train=%s user=%s delta=%.0fm max=%.0fm",
+                    room.train_id,
+                    contributor.user_id[:8],
+                    raw_delta_m,
+                    max_delta_m,
+                )
+
+        contributor.reward_last_lat = lat
+        contributor.reward_last_lng = lng
+        contributor.reward_last_progress_at = now
+
+    async def _finalize_contribution_reward(
+        self,
+        room: "TrainRoom",
+        contributor: "Contributor",
+        reason: str,
+    ) -> Optional[dict]:
+        if contributor.reward_finalized:
+            return None
+
+        contributor.reward_finalized = True
+        if (
+            contributor.reward_accepted_updates <= 0
+            and contributor.reward_trusted_distance_m <= 0
+        ):
+            return None
+
+        return await finalize_contribution_session(
+            session_id=contributor.reward_session_id,
+            user_id=contributor.user_id,
+            train_number=room.train_id,
+            trip_id=room.trip_id,
+            from_station_name=contributor.from_station_name,
+            to_station_name=contributor.to_station_name,
+            started_at_ts=contributor.reward_started_at,
+            ended_at_ts=time.time(),
+            end_reason=reason,
+            is_silent=contributor.is_silent,
+            accepted_updates_count=contributor.reward_accepted_updates,
+            rejected_updates_count=contributor.reward_rejected_updates,
+            raw_distance_m=contributor.reward_raw_distance_m,
+            trusted_distance_m=contributor.reward_trusted_distance_m,
+            first_lat=contributor.reward_first_lat,
+            first_lng=contributor.reward_first_lng,
+            last_lat=contributor.reward_last_lat,
+            last_lng=contributor.reward_last_lng,
+            max_reported_speed_kmh=contributor.reward_max_speed_kmh,
+            max_rail_distance_m=_MAX_RAIL_DISTANCE_M,
+            max_train_distance_m=_MAX_TRAIN_DISTANCE_M,
+        )
+
     async def add_contributor(self, train_id: str, user_id: str) -> dict:
         """
         Register a contributor in a room (HTTP model — no WebSocket).
@@ -410,6 +548,11 @@ class TrackingManager:
                     room, "demoted", demoted.user_id,
                     f"{demoted.display_name or demoted.user_id[:8]} نُقل لقائمة الانتظار لإفساح المجال للكابتن {name or user_id[:8]}",
                 )
+                await self._finalize_contribution_reward(
+                    room,
+                    demoted,
+                    "demoted_to_waiting",
+                )
                 logger.info(
                     "⬇️ [%s] Demoted %s to waiting (captain %s joining)",
                     train_id, demoted.user_id[:8], user_id[:8],
@@ -473,18 +616,25 @@ class TrackingManager:
         )
         return {"status": "waiting", "position": position, "total": len(room.waiting_list)}
 
-    async def remove_participant(self, train_id: str, user_id: str, disconnect_reason: str = "") -> None:
+    async def remove_participant(self, train_id: str, user_id: str, disconnect_reason: str = "") -> Optional[dict]:
         reason_text = disconnect_reason or "unknown"
 
         room = self._rooms.get(train_id)
         if not room:
-            return
+            return None
         removed = False
         was_contributor = False
         was_waiting = False
+        reward_summary = None
 
         if user_id in room.contributors:
-            display = room.contributors[user_id].display_name or user_id[:8]
+            contributor = room.contributors[user_id]
+            display = contributor.display_name or user_id[:8]
+            reward_summary = await self._finalize_contribution_reward(
+                room,
+                contributor,
+                reason_text,
+            )
             del room.contributors[user_id]
             removed = True
             was_contributor = True
@@ -532,6 +682,8 @@ class TrackingManager:
 
             self._cleanup_room(train_id)
 
+        return reward_summary
+
     async def _promote_from_waiting_list(self, room: TrainRoom) -> None:
         """Promote the highest-priority waiting contributor to active."""
         while room.waiting_list and len(room.contributors) < room.max_active_contributors:
@@ -545,6 +697,7 @@ class TrackingManager:
                 from_station_name=promoted.from_station_name,
                 to_station_name=promoted.to_station_name,
                 trip_distance_km=promoted.trip_distance_km,
+                is_captain=promoted.is_captain,
             )
 
             self._log_event(
@@ -773,6 +926,7 @@ class TrackingManager:
             else:
                 # Actually far from both sources → warn
                 contributor.far_from_rail_count += 1
+                contributor.reward_rejected_updates += 1
                 dist_str = f"{distance:.0f}m"
                 logger.warning(
                     "⚠️ [%s] User %s far from rail: %s (count=%d/%d)",
@@ -829,6 +983,7 @@ class TrackingManager:
             if train_lat != 0.0 or train_lng != 0.0:
                 dist_to_train = _haversine(lng, lat, train_lng, train_lat)
                 if dist_to_train > _MAX_TRAIN_DISTANCE_M:
+                    contributor.reward_rejected_updates += 1
                     # Log only once per far-from-train episode
                     if not contributor.far_from_train_logged:
                         self._log_event(room, "silent_disconnect", user_id, f"فصل تلقائي — بعيد عن القطار {dist_to_train:.0f}م")
@@ -851,6 +1006,7 @@ class TrackingManager:
         contributor.bearing = bearing
         contributor.dist_to_rail = distance if distance is not None else 0.0
         contributor.far_from_train_logged = False  # reset: update accepted, contributor is near train
+        self._record_reward_update(room, contributor, lat, lng, speed, now)
         # Persist last known position (survives room deletion/recreation)
         self._last_positions[user_id] = (lat, lng, speed)
 
@@ -1202,7 +1358,13 @@ class TrackingManager:
                 if c.last_update > 0 and (now - c.last_update) > _STALE_TIMEOUT_S
             ]
             for uid in stale:
-                display = room.contributors[uid].display_name or uid[:8]
+                contributor = room.contributors[uid]
+                display = contributor.display_name or uid[:8]
+                await self._finalize_contribution_reward(
+                    room,
+                    contributor,
+                    "stale_timeout",
+                )
                 del room.contributors[uid]
                 removed_count += 1
                 self._log_event(room, "leave", uid, f"{display} محذوف تلقائياً (انقطع عن الإرسال)")

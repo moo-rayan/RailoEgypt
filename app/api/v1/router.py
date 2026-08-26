@@ -22,6 +22,7 @@ from app.api.v1.endpoints import (
     news,
     notifications,
     railway,
+    rewards,
     speech,
     stations,
     support,
@@ -59,3 +60,4 @@ api_router.include_router(admin_users.router)
 api_router.include_router(fares.router)
 api_router.include_router(kiosks.router)
 api_router.include_router(feedback.router)
+api_router.include_router(rewards.router)

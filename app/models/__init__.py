@@ -2,6 +2,7 @@ from app.models.account_deletion_request import AccountDeletionRequest
 from app.models.admin_alert import AdminAlert
 from app.models.app_config import AppConfig
 from app.models.app_announcement import AppAnnouncement
+from app.models.contribution_session import ContributionSession
 from app.models.audit_log import AuditLog
 from app.models.device_token import DeviceToken
 from app.models.global_chat import GlobalChatMessage, GlobalChatReaction, GlobalChatSetting
@@ -22,6 +23,7 @@ __all__ = [
     "AdminAlert",
     "AppConfig",
     "AppAnnouncement",
+    "ContributionSession",
     "AuditLog",
     "DeviceToken",
     "GlobalChatMessage",
