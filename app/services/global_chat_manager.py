@@ -16,6 +16,7 @@ from sqlalchemy import text
 from app.core.cache import get_redis
 from app.core.database import AsyncSessionFactory
 from app.services import fcm_service
+from app.services.chat_moderation_service import moderate_chat_text
 from app.services.chat_report_service import check_user_banned
 
 logger = logging.getLogger(__name__)
@@ -276,6 +277,27 @@ class GlobalChatManager:
 
         if not await self.check_rate_limit(user_id):
             return {"ok": False, "error": "rate_limited", "wait_seconds": _RATE_LIMIT_SECONDS}
+
+        moderation = moderate_chat_text(text_value)
+        if not moderation.allowed:
+            return {
+                "ok": False,
+                "error": "moderation_blocked",
+                "reason": moderation.reason,
+                "message_ar": "لا يمكن إرسال هذه الرسالة لأنها تخالف قواعد الشات",
+            }
+
+        if isinstance(reply_to, dict):
+            reply_text_value = str(reply_to.get("text", ""))
+            if reply_text_value:
+                reply_moderation = moderate_chat_text(reply_text_value)
+                if not reply_moderation.allowed:
+                    return {
+                        "ok": False,
+                        "error": "moderation_blocked",
+                        "reason": reply_moderation.reason,
+                        "message_ar": "لا يمكن إرسال هذه الرسالة لأنها تخالف قواعد الشات",
+                    }
 
         clean_text = sanitize_message(text_value)
         if not clean_text:
