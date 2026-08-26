@@ -277,6 +277,9 @@ async def _stale_contributor_scheduler():
             removed = await tracking_manager.cleanup_stale_contributors()
             if removed:
                 logger.info("🧹 Stale contributor cleanup: removed %d", removed)
+            retried = await tracking_manager.retry_pending_reward_finalizations()
+            if retried:
+                logger.info("🎁 Contribution reward retries persisted: %d", retried)
         except asyncio.CancelledError:
             break
         except Exception as exc:

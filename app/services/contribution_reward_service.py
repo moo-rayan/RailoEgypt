@@ -24,6 +24,10 @@ REWARD_CATALOG: list[dict[str, Any]] = [
 ]
 
 
+class ContributionRewardPersistenceError(RuntimeError):
+    """Raised when a reward contribution could not be persisted."""
+
+
 def _utc_from_ts(timestamp: float) -> datetime:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc)
 
@@ -62,6 +66,22 @@ def _points_for_distance(trusted_distance_m: float, accepted_updates_count: int)
 def _source_session_ids(row: Mapping[str, Any]) -> set[str]:
     raw_ids = row.get("source_session_ids") or []
     return {str(item) for item in raw_ids if item}
+
+
+def _is_likely_schema_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "undefinedcolumn",
+            "undefined column",
+            "does not exist",
+            "undefinedtable",
+            "undefined table",
+            "column ",
+            "relation ",
+        )
+    )
 
 
 def _summary_from_row(row: Any) -> dict[str, Any]:
@@ -151,6 +171,16 @@ async def finalize_contribution_session(
                         f"{user_id}:{train_number}:{contribution_date.isoformat()}"
                     )
                 },
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO "EgRailway".profiles (id)
+                    VALUES (CAST(:user_id AS uuid))
+                    ON CONFLICT (id) DO NOTHING
+                    """
+                ),
+                {"user_id": user_id},
             )
 
             existing = (
@@ -541,13 +571,22 @@ async def finalize_contribution_session(
             )
         return _summary_from_row(row)
     except Exception as exc:
+        if _is_likely_schema_error(exc):
+            logger.error(
+                "Contribution rewards schema is not ready. "
+                "Run backend migrations 016_create_contribution_rewards.sql "
+                "and 017_daily_contribution_reward_rollups.sql, or the latest "
+                "repair migration, on the production database."
+            )
         logger.exception(
             "Failed to finalize contribution reward: train=%s user=%s error=%s",
             train_number,
             user_id[:8],
             exc,
         )
-        return None
+        raise ContributionRewardPersistenceError(
+            "Failed to persist contribution reward"
+        ) from exc
 
 
 async def get_reward_profile(user_id: str) -> dict[str, Any]:

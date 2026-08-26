@@ -25,7 +25,10 @@ from typing import Optional
 
 from app.core.cache import cache_delete, cache_get, cache_set
 from app.core.config import settings
-from app.services.contribution_reward_service import finalize_contribution_session
+from app.services.contribution_reward_service import (
+    ContributionRewardPersistenceError,
+    finalize_contribution_session,
+)
 from app.services.railway_service import railway_graph, _haversine
 
 logger = logging.getLogger(__name__)
@@ -41,6 +44,9 @@ _ROOM_GRACE_S        = 600.0   # keep empty room alive for 10 min before destroy
 _ROOM_HISTORY_TTL    = 43200   # Redis TTL for room history (12 hours)
 _MAX_REWARD_SEGMENT_SPEED_KMH = 180.0  # reward distance plausibility cap
 _REWARD_SEGMENT_GRACE_M = 750.0        # GPS/server timing tolerance
+_PENDING_REWARD_INDEX_KEY = "pending_contribution_reward_sessions"
+_PENDING_REWARD_KEY_PREFIX = "pending_contribution_reward:"
+_PENDING_REWARD_TTL_SECONDS = 7 * 24 * 3600
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -98,6 +104,7 @@ class Contributor:
     reward_max_speed_kmh: float = 0.0
     reward_session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     reward_finalized: bool = False
+    reward_finalizing: bool = False
 
 
 @dataclass
@@ -441,45 +448,191 @@ class TrackingManager:
         contributor.reward_last_lng = lng
         contributor.reward_last_progress_at = now
 
+    @staticmethod
+    def _build_contribution_reward_payload(
+        room: "TrainRoom",
+        contributor: "Contributor",
+        reason: str,
+    ) -> dict:
+        return {
+            "session_id": contributor.reward_session_id,
+            "user_id": contributor.user_id,
+            "train_number": room.train_id,
+            "trip_id": room.trip_id,
+            "from_station_name": contributor.from_station_name,
+            "to_station_name": contributor.to_station_name,
+            "started_at_ts": contributor.reward_started_at,
+            "ended_at_ts": time.time(),
+            "end_reason": reason,
+            "is_silent": contributor.is_silent,
+            "accepted_updates_count": contributor.reward_accepted_updates,
+            "rejected_updates_count": contributor.reward_rejected_updates,
+            "raw_distance_m": contributor.reward_raw_distance_m,
+            "trusted_distance_m": contributor.reward_trusted_distance_m,
+            "first_lat": contributor.reward_first_lat,
+            "first_lng": contributor.reward_first_lng,
+            "last_lat": contributor.reward_last_lat,
+            "last_lng": contributor.reward_last_lng,
+            "max_reported_speed_kmh": contributor.reward_max_speed_kmh,
+            "max_rail_distance_m": _MAX_RAIL_DISTANCE_M,
+            "max_train_distance_m": _MAX_TRAIN_DISTANCE_M,
+        }
+
+    async def _queue_pending_reward_finalization(
+        self,
+        payload: dict,
+        exc: Exception,
+    ) -> None:
+        try:
+            from app.core.cache import get_redis
+
+            r = await get_redis()
+            session_id = str(payload["session_id"])
+            stored_payload = {
+                **payload,
+                "queued_at_ts": time.time(),
+                "last_attempt_ts": time.time(),
+                "attempts": int(payload.get("attempts") or 0) + 1,
+                "last_error": str(getattr(exc, "__cause__", None) or exc)[:500],
+            }
+            await r.setex(
+                f"{_PENDING_REWARD_KEY_PREFIX}{session_id}",
+                _PENDING_REWARD_TTL_SECONDS,
+                json.dumps(stored_payload, ensure_ascii=False),
+            )
+            await r.sadd(_PENDING_REWARD_INDEX_KEY, session_id)
+            await r.expire(_PENDING_REWARD_INDEX_KEY, _PENDING_REWARD_TTL_SECONDS)
+            logger.warning(
+                "Queued contribution reward for retry: train=%s user=%s session=%s",
+                payload.get("train_number"),
+                str(payload.get("user_id", ""))[:8],
+                session_id,
+            )
+        except Exception as queue_exc:
+            logger.exception(
+                "Failed to queue contribution reward retry: train=%s user=%s error=%s",
+                payload.get("train_number"),
+                str(payload.get("user_id", ""))[:8],
+                queue_exc,
+            )
+
+    @staticmethod
+    def _clean_reward_payload(payload: dict) -> dict:
+        allowed_keys = {
+            "session_id",
+            "user_id",
+            "train_number",
+            "trip_id",
+            "from_station_name",
+            "to_station_name",
+            "started_at_ts",
+            "ended_at_ts",
+            "end_reason",
+            "is_silent",
+            "accepted_updates_count",
+            "rejected_updates_count",
+            "raw_distance_m",
+            "trusted_distance_m",
+            "first_lat",
+            "first_lng",
+            "last_lat",
+            "last_lng",
+            "max_reported_speed_kmh",
+            "max_rail_distance_m",
+            "max_train_distance_m",
+        }
+        return {key: payload.get(key) for key in allowed_keys}
+
+    async def retry_pending_reward_finalizations(self, limit: int = 25) -> int:
+        try:
+            from app.core.cache import get_redis
+
+            r = await get_redis()
+            session_ids = list(await r.smembers(_PENDING_REWARD_INDEX_KEY) or [])
+        except Exception as exc:
+            logger.warning("Failed to read pending reward retry queue: %s", exc)
+            return 0
+
+        persisted = 0
+        for raw_session_id in session_ids[: max(1, min(limit, 100))]:
+            session_id = (
+                raw_session_id.decode()
+                if isinstance(raw_session_id, bytes)
+                else str(raw_session_id)
+            )
+            key = f"{_PENDING_REWARD_KEY_PREFIX}{session_id}"
+            raw_payload = await r.get(key)
+            if not raw_payload:
+                await r.srem(_PENDING_REWARD_INDEX_KEY, session_id)
+                continue
+
+            try:
+                payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                await r.delete(key)
+                await r.srem(_PENDING_REWARD_INDEX_KEY, session_id)
+                logger.warning(
+                    "Dropped malformed contribution reward retry payload: %s",
+                    session_id,
+                )
+                continue
+
+            try:
+                await finalize_contribution_session(
+                    **self._clean_reward_payload(payload)
+                )
+            except ContributionRewardPersistenceError as exc:
+                attempts = int(payload.get("attempts") or 0) + 1
+                payload["attempts"] = attempts
+                payload["last_attempt_ts"] = time.time()
+                payload["last_error"] = str(getattr(exc, "__cause__", None) or exc)[:500]
+                await r.setex(
+                    key,
+                    _PENDING_REWARD_TTL_SECONDS,
+                    json.dumps(payload, ensure_ascii=False),
+                )
+                if attempts in (2, 3, 5) or attempts % 10 == 0:
+                    logger.warning(
+                        "Contribution reward retry still failing: session=%s attempts=%d",
+                        session_id,
+                        attempts,
+                    )
+                continue
+
+            await r.delete(key)
+            await r.srem(_PENDING_REWARD_INDEX_KEY, session_id)
+            persisted += 1
+
+        return persisted
+
     async def _finalize_contribution_reward(
         self,
         room: "TrainRoom",
         contributor: "Contributor",
         reason: str,
     ) -> Optional[dict]:
-        if contributor.reward_finalized:
+        if contributor.reward_finalized or contributor.reward_finalizing:
             return None
 
-        contributor.reward_finalized = True
         if (
             contributor.reward_accepted_updates <= 0
             and contributor.reward_trusted_distance_m <= 0
         ):
+            contributor.reward_finalized = True
             return None
 
-        return await finalize_contribution_session(
-            session_id=contributor.reward_session_id,
-            user_id=contributor.user_id,
-            train_number=room.train_id,
-            trip_id=room.trip_id,
-            from_station_name=contributor.from_station_name,
-            to_station_name=contributor.to_station_name,
-            started_at_ts=contributor.reward_started_at,
-            ended_at_ts=time.time(),
-            end_reason=reason,
-            is_silent=contributor.is_silent,
-            accepted_updates_count=contributor.reward_accepted_updates,
-            rejected_updates_count=contributor.reward_rejected_updates,
-            raw_distance_m=contributor.reward_raw_distance_m,
-            trusted_distance_m=contributor.reward_trusted_distance_m,
-            first_lat=contributor.reward_first_lat,
-            first_lng=contributor.reward_first_lng,
-            last_lat=contributor.reward_last_lat,
-            last_lng=contributor.reward_last_lng,
-            max_reported_speed_kmh=contributor.reward_max_speed_kmh,
-            max_rail_distance_m=_MAX_RAIL_DISTANCE_M,
-            max_train_distance_m=_MAX_TRAIN_DISTANCE_M,
-        )
+        contributor.reward_finalizing = True
+        payload = self._build_contribution_reward_payload(room, contributor, reason)
+        try:
+            reward_summary = await finalize_contribution_session(**payload)
+        except ContributionRewardPersistenceError as exc:
+            await self._queue_pending_reward_finalization(payload, exc)
+            return None
+        finally:
+            contributor.reward_finalizing = False
+
+        contributor.reward_finalized = True
+        return reward_summary
 
     async def add_contributor(self, train_id: str, user_id: str) -> dict:
         """
