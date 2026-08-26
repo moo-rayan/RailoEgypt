@@ -249,6 +249,17 @@ class TrackingManager:
     def get_room(self, train_id: str) -> Optional[TrainRoom]:
         return self._rooms.get(train_id)
 
+    def active_contribution_train_numbers(self, user_id: str) -> set[str]:
+        """Return train ids where this user is active or waiting right now."""
+        train_numbers: set[str] = set()
+        for train_id, room in self._rooms.items():
+            if user_id in room.contributors:
+                train_numbers.add(train_id)
+                continue
+            if any(waiting.user_id == user_id for waiting in room.waiting_list):
+                train_numbers.add(train_id)
+        return train_numbers
+
     def _cleanup_room(self, train_id: str) -> None:
         """Mark empty rooms for deferred cleanup instead of immediate deletion."""
         room = self._rooms.get(train_id)

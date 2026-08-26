@@ -111,18 +111,24 @@ CREATE TABLE IF NOT EXISTS "EgRailway".contribution_sessions (
     trip_id                 INTEGER REFERENCES "EgRailway".trips(id) ON DELETE SET NULL,
     from_station_name       TEXT NOT NULL DEFAULT '',
     to_station_name         TEXT NOT NULL DEFAULT '',
+    contribution_date       DATE NOT NULL,
     started_at              TIMESTAMPTZ NOT NULL,
     ended_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
     end_reason              TEXT NOT NULL DEFAULT '',
     status                  TEXT NOT NULL DEFAULT 'completed',
     is_silent               BOOLEAN NOT NULL DEFAULT FALSE,
+    session_runs_count      INTEGER NOT NULL DEFAULT 1,
+    source_session_ids      UUID[] NOT NULL DEFAULT '{}'::uuid[],
 
     accepted_updates_count  INTEGER NOT NULL DEFAULT 0,
     rejected_updates_count  INTEGER NOT NULL DEFAULT 0,
     raw_distance_m          NUMERIC(12, 2) NOT NULL DEFAULT 0,
     trusted_distance_m      NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    credited_distance_m     NUMERIC(12, 2) NOT NULL DEFAULT 0,
     points_rate_per_km      NUMERIC(8, 2) NOT NULL DEFAULT 2,
     points_awarded          INTEGER NOT NULL DEFAULT 0,
+    unseen_distance_m       NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    unseen_points_awarded   INTEGER NOT NULL DEFAULT 0,
 
     first_lat               DOUBLE PRECISION,
     first_lng               DOUBLE PRECISION,
@@ -132,18 +138,32 @@ CREATE TABLE IF NOT EXISTS "EgRailway".contribution_sessions (
     max_rail_distance_m     NUMERIC(8, 2) NOT NULL DEFAULT 500,
     max_train_distance_m    NUMERIC(8, 2) NOT NULL DEFAULT 5000,
 
+    last_session_id         UUID,
+    last_reward_at          TIMESTAMPTZ,
     reward_seen_at          TIMESTAMPTZ,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT chk_contribution_sessions_status
         CHECK (status IN ('completed', 'discarded')),
     CONSTRAINT chk_contribution_sessions_counts_nonnegative
-        CHECK (accepted_updates_count >= 0 AND rejected_updates_count >= 0),
+        CHECK (
+            session_runs_count >= 0
+            AND accepted_updates_count >= 0
+            AND rejected_updates_count >= 0
+        ),
     CONSTRAINT chk_contribution_sessions_distances_nonnegative
-        CHECK (raw_distance_m >= 0 AND trusted_distance_m >= 0),
+        CHECK (
+            raw_distance_m >= 0
+            AND trusted_distance_m >= 0
+            AND credited_distance_m >= 0
+            AND unseen_distance_m >= 0
+        ),
     CONSTRAINT chk_contribution_sessions_points_nonnegative
-        CHECK (points_awarded >= 0)
+        CHECK (points_awarded >= 0 AND unseen_points_awarded >= 0)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_contribution_sessions_user_train_date
+    ON "EgRailway".contribution_sessions(user_id, train_number, contribution_date);
 
 CREATE INDEX IF NOT EXISTS idx_contribution_sessions_user_created
     ON "EgRailway".contribution_sessions(user_id, created_at DESC);
