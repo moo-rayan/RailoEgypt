@@ -188,7 +188,7 @@ async def finalize_contribution_session(
                     text(
                         """
                         SELECT
-                            id::text AS id,
+                            CAST(id AS text) AS id,
                             train_number,
                             trip_id,
                             from_station_name,
@@ -328,6 +328,8 @@ async def finalize_contribution_session(
                 "max_reported_speed_kmh": round(max_reported_speed_kmh or 0.0, 2),
                 "max_rail_distance_m": max_rail_distance_m,
                 "max_train_distance_m": max_train_distance_m,
+                "has_new_points": points_delta > 0,
+                "last_reward_at": ended_at if points_delta > 0 else None,
             }
 
             if has_existing:
@@ -346,14 +348,23 @@ async def finalize_contribution_session(
                                     WHEN :to_station_name <> '' THEN :to_station_name
                                     ELSE to_station_name
                                 END,
-                                started_at = LEAST(started_at, :started_at),
-                                ended_at = GREATEST(ended_at, :ended_at),
+                                started_at = LEAST(
+                                    started_at,
+                                    CAST(:started_at AS timestamptz)
+                                ),
+                                ended_at = GREATEST(
+                                    ended_at,
+                                    CAST(:ended_at AS timestamptz)
+                                ),
                                 end_reason = :end_reason,
                                 status = :status,
-                                is_silent = is_silent AND :is_silent,
+                                is_silent = is_silent AND CAST(:is_silent AS boolean),
                                 session_runs_count = session_runs_count + 1,
                                 source_session_ids = array_append(
-                                    COALESCE(source_session_ids, '{}'::uuid[]),
+                                    COALESCE(
+                                        source_session_ids,
+                                        CAST(ARRAY[] AS uuid[])
+                                    ),
                                     CAST(:session_id AS uuid)
                                 ),
                                 accepted_updates_count = :total_accepted,
@@ -382,17 +393,17 @@ async def finalize_contribution_session(
                                     :max_train_distance_m
                                 ),
                                 last_session_id = CAST(:session_id AS uuid),
-                                last_reward_at = CASE
-                                    WHEN :points_delta > 0 THEN :ended_at
-                                    ELSE last_reward_at
-                                END,
+                                last_reward_at = COALESCE(
+                                    CAST(:last_reward_at AS timestamptz),
+                                    last_reward_at
+                                ),
                                 reward_seen_at = CASE
-                                    WHEN :points_delta > 0 THEN NULL
+                                    WHEN CAST(:has_new_points AS boolean) THEN NULL
                                     ELSE reward_seen_at
                                 END
                             WHERE id = CAST(:id AS uuid)
                             RETURNING
-                                id::text AS id,
+                                CAST(id AS text) AS id,
                                 train_number,
                                 trusted_distance_m,
                                 points_awarded,
@@ -409,7 +420,6 @@ async def finalize_contribution_session(
                             "total_rejected": total_rejected,
                             "total_raw_m": round(total_raw_m, 2),
                             "total_trusted_m": round(total_trusted_m, 2),
-                            "points_delta": points_delta,
                         },
                     )
                 ).mappings().first()
@@ -459,14 +469,14 @@ async def finalize_contribution_session(
                                 :trip_id,
                                 :from_station_name,
                                 :to_station_name,
-                                :contribution_date,
-                                :started_at,
-                                :ended_at,
+                                CAST(:contribution_date AS date),
+                                CAST(:started_at AS timestamptz),
+                                CAST(:ended_at AS timestamptz),
                                 :end_reason,
                                 :status,
-                                :is_silent,
+                                CAST(:is_silent AS boolean),
                                 1,
-                                ARRAY[CAST(:session_id AS uuid)],
+                                CAST(ARRAY[CAST(:session_id AS uuid)] AS uuid[]),
                                 :accepted_updates_count,
                                 :rejected_updates_count,
                                 :raw_distance_m,
@@ -484,10 +494,10 @@ async def finalize_contribution_session(
                                 :max_rail_distance_m,
                                 :max_train_distance_m,
                                 CAST(:session_id AS uuid),
-                                CASE WHEN :points_delta > 0 THEN :ended_at ELSE NULL END
+                                CAST(:last_reward_at AS timestamptz)
                             )
                             RETURNING
-                                id::text AS id,
+                                CAST(id AS text) AS id,
                                 train_number,
                                 trusted_distance_m,
                                 points_awarded,
@@ -497,7 +507,7 @@ async def finalize_contribution_session(
                                 ended_at
                             """
                         ),
-                        {**common_params, "points_delta": points_delta},
+                        common_params,
                     )
                 ).mappings().first()
 
@@ -518,8 +528,11 @@ async def finalize_contribution_session(
                             reward_points_lifetime =
                                 reward_points_lifetime + :points_delta,
                             last_contribution_at = GREATEST(
-                                COALESCE(last_contribution_at, :ended_at),
-                                :ended_at
+                                COALESCE(
+                                    last_contribution_at,
+                                    CAST(:ended_at AS timestamptz)
+                                ),
+                                CAST(:ended_at AS timestamptz)
                             ),
                             updated_at = now()
                         WHERE id = CAST(:user_id AS uuid)
@@ -649,7 +662,7 @@ async def get_pending_reward_summaries(
                 text(
                     """
                     SELECT
-                        id::text AS id,
+                        CAST(id AS text) AS id,
                         train_number,
                         trusted_distance_m,
                         points_awarded,
