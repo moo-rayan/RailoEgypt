@@ -115,6 +115,7 @@ async def get_global_chat_ticket(
     ticket = create_ticket(identity["user_id"], GLOBAL_CHAT_RESOURCE, "listener")
     return {
         "ticket": ticket,
+        "user_id": identity["user_id"],
         "user_name": identity["user_name"],
         "user_avatar": identity["user_avatar"],
         "chat_alias": identity["chat_alias"],
