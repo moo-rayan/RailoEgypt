@@ -120,6 +120,7 @@ async def get_chat_ticket(
 
     return {
         "ticket": ticket,
+        "user_id": user_id,
         "user_name": display_name,
         "user_avatar": display_avatar,
         "chat_alias": chat_alias,
