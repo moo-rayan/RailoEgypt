@@ -1098,6 +1098,7 @@ class TrackingManager:
                 rejected_updates_count=contributor.reward_rejected_updates,
                 raw_distance_m=contributor.reward_raw_distance_m,
                 trusted_distance_m=contributor.reward_trusted_distance_m,
+                route_progress_m=contributor.reward_last_progress_m,
                 first_lat=contributor.reward_first_lat,
                 first_lng=contributor.reward_first_lng,
                 last_lat=contributor.reward_last_lat,

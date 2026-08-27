@@ -262,6 +262,7 @@ async def credit_contribution_progress(
     rejected_updates_count: int,
     raw_distance_m: float,
     trusted_distance_m: float,
+    route_progress_m: float | None,
     first_lat: float | None,
     first_lng: float | None,
     last_lat: float | None,
@@ -283,6 +284,11 @@ async def credit_contribution_progress(
     rejected_updates_count = max(0, int(rejected_updates_count or 0))
     raw_distance_m = max(0.0, float(raw_distance_m or 0.0))
     trusted_distance_m = max(0.0, float(trusted_distance_m or 0.0))
+    route_progress_value = (
+        max(0.0, float(route_progress_m))
+        if route_progress_m is not None
+        else None
+    )
 
     if (
         accepted_updates_count <= 0
@@ -342,6 +348,7 @@ async def credit_contribution_progress(
                             raw_distance_m,
                             trusted_distance_m,
                             credited_distance_m,
+                            max_route_progress_m,
                             points_awarded,
                             unseen_distance_m,
                             unseen_points_awarded,
@@ -399,11 +406,33 @@ async def credit_contribution_progress(
             raw_delta_m = max(0.0, raw_distance_m - session_previous_raw_m)
             accepted_delta = max(0, accepted_updates_count - session_previous_accepted)
             rejected_delta = max(0, rejected_updates_count - session_previous_rejected)
+            previous_route_progress_m = (
+                _as_float(existing["max_route_progress_m"])
+                if has_existing
+                else 0.0
+            )
+            if route_progress_value is not None:
+                route_credit_delta_m = max(
+                    0.0,
+                    route_progress_value - previous_route_progress_m,
+                )
+                trusted_delta_m = min(trusted_delta_m, route_credit_delta_m)
+                max_route_progress_m = max(
+                    previous_route_progress_m,
+                    route_progress_value,
+                )
+            else:
+                max_route_progress_m = previous_route_progress_m
             progress_by_session[session_id] = {
                 "accepted_updates_count": accepted_updates_count,
                 "rejected_updates_count": rejected_updates_count,
                 "raw_distance_m": round(raw_distance_m, 2),
                 "trusted_distance_m": round(trusted_distance_m, 2),
+                "route_progress_m": (
+                    round(route_progress_value, 2)
+                    if route_progress_value is not None
+                    else None
+                ),
                 "last_observed_at": observed_at.isoformat(),
             }
 
@@ -468,6 +497,7 @@ async def credit_contribution_progress(
                 "total_raw_m": round(total_raw_m, 2),
                 "total_trusted_m": round(total_trusted_m, 2),
                 "credited_distance_m": round(credited_distance_m, 2),
+                "max_route_progress_m": round(max_route_progress_m, 2),
                 "points_rate_per_km": POINTS_PER_KM,
                 "points_awarded": total_points,
                 "points_delta": points_delta,
@@ -534,6 +564,10 @@ async def credit_contribution_progress(
                                 raw_distance_m = :total_raw_m,
                                 trusted_distance_m = :total_trusted_m,
                                 credited_distance_m = :credited_distance_m,
+                                max_route_progress_m = GREATEST(
+                                    max_route_progress_m,
+                                    :max_route_progress_m
+                                ),
                                 points_rate_per_km = :points_rate_per_km,
                                 points_awarded = :points_awarded,
                                 unseen_distance_m =
@@ -606,6 +640,7 @@ async def credit_contribution_progress(
                                 raw_distance_m,
                                 trusted_distance_m,
                                 credited_distance_m,
+                                max_route_progress_m,
                                 points_rate_per_km,
                                 points_awarded,
                                 unseen_distance_m,
@@ -641,6 +676,7 @@ async def credit_contribution_progress(
                                 :total_raw_m,
                                 :total_trusted_m,
                                 :credited_distance_m,
+                                :max_route_progress_m,
                                 :points_rate_per_km,
                                 :points_awarded,
                                 :profile_distance_delta_m,
