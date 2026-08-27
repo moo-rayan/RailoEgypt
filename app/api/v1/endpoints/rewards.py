@@ -6,6 +6,7 @@ from app.services.contribution_reward_service import (
     InsufficientRewardPoints,
     RewardCatalogItemNotFound,
     get_pending_reward_summaries,
+    get_reward_leaderboard,
     get_reward_profile,
     mark_reward_seen,
     request_reward_redemption,
@@ -23,6 +24,14 @@ class RewardRedemptionRequestBody(BaseModel):
 @router.get("/profile")
 async def rewards_profile(user_id: str = Depends(require_authenticated_user)):
     return await get_reward_profile(user_id)
+
+
+@router.get("/leaderboard")
+async def rewards_leaderboard(
+    limit: int = Query(50, ge=1, le=100),
+    user_id: str = Depends(require_authenticated_user),
+):
+    return await get_reward_leaderboard(user_id=user_id, limit=limit)
 
 
 @router.post("/redeem", status_code=status.HTTP_201_CREATED)

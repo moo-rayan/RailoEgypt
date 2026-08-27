@@ -738,6 +738,87 @@ async def get_reward_profile(user_id: str) -> dict[str, Any]:
     }
 
 
+async def get_reward_leaderboard(
+    *,
+    user_id: str,
+    limit: int = 50,
+) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 50), 100))
+
+    async with AsyncSessionFactory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    WITH ranked AS (
+                        SELECT
+                            CAST(id AS text) AS id,
+                            display_name,
+                            avatar_url,
+                            contribution_count,
+                            total_contribution_distance_km,
+                            reward_points_lifetime,
+                            last_contribution_at,
+                            ROW_NUMBER() OVER (
+                                ORDER BY
+                                    reward_points_lifetime DESC,
+                                    total_contribution_distance_km DESC,
+                                    contribution_count DESC,
+                                    created_at ASC
+                            ) AS rank
+                        FROM "EgRailway".profiles
+                        WHERE is_active = TRUE
+                          AND (
+                              contribution_count > 0
+                              OR total_contribution_distance_km > 0
+                              OR reward_points_lifetime > 0
+                          )
+                    )
+                    SELECT *
+                    FROM ranked
+                    WHERE rank <= :limit
+                       OR id = :user_id
+                    ORDER BY rank ASC
+                    """
+                ),
+                {
+                    "limit": limit,
+                    "user_id": user_id,
+                },
+            )
+        ).mappings().all()
+
+    items: list[dict[str, Any]] = []
+    current_user: dict[str, Any] | None = None
+    for row in rows:
+        last_contribution_at = row["last_contribution_at"]
+        item = {
+            "rank": _as_int(row["rank"]),
+            "user_id": str(row["id"]),
+            "display_name": row["display_name"],
+            "avatar_url": row["avatar_url"],
+            "contribution_count": _as_int(row["contribution_count"]),
+            "total_contribution_distance_km": _as_float(
+                row["total_contribution_distance_km"]
+            ),
+            "reward_points_lifetime": _as_int(row["reward_points_lifetime"]),
+            "last_contribution_at": (
+                last_contribution_at.isoformat() if last_contribution_at else None
+            ),
+            "is_current_user": str(row["id"]) == str(user_id),
+        }
+        if item["rank"] <= limit:
+            items.append(item)
+        if item["is_current_user"]:
+            current_user = item
+
+    return {
+        "items": items,
+        "current_user": current_user,
+        "limit": limit,
+    }
+
+
 async def get_pending_reward_summaries(
     user_id: str,
     limit: int = 3,
