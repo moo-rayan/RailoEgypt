@@ -753,8 +753,15 @@ async def get_reward_leaderboard(
                     WITH ranked AS (
                         SELECT
                             CAST(id AS text) AS id,
-                            display_name,
-                            avatar_url,
+                            CASE
+                                WHEN chat_anonymous = TRUE THEN
+                                    COALESCE(NULLIF(chat_alias, ''), 'مساهم')
+                                ELSE display_name
+                            END AS display_name,
+                            CASE
+                                WHEN chat_anonymous = TRUE THEN ''
+                                ELSE avatar_url
+                            END AS avatar_url,
                             contribution_count,
                             total_contribution_distance_km,
                             reward_points_lifetime,
