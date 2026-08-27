@@ -14,9 +14,11 @@ GET  /api/v1/live/status/{train_id}
 """
 
 import logging
+import time
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import cast, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.admin_auth import get_admin_or_legacy_key
 from app.core.database import AsyncSessionFactory, get_db
 from app.core.security import require_authenticated_user, verify_supabase_token
+from app.models.app_config import AppConfig
 from app.models.profile import Profile
 from app.models.station import Station
 from app.models.trip import TripStop
@@ -33,6 +36,17 @@ from app.services.train_chat_manager import train_chat_manager
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/live", tags=["Live Tracking"])
+
+_LOCATION_SPOOF_CONFIG_TTL_S = 30.0
+_LOCATION_SPOOF_CONFIG_DEFAULTS = {
+    "enabled": False,
+    "block_mock": True,
+    "block_fake_gps_apps": True,
+}
+_location_spoof_config_cache: tuple[float, dict[str, bool]] = (
+    0.0,
+    dict(_LOCATION_SPOOF_CONFIG_DEFAULTS),
+)
 
 
 # ── HTTP: Contributor sends GPS location update ───────────────────────────────
@@ -46,6 +60,56 @@ class LocationUpdateRequest(BaseModel):
     from_station_name: str | None = None
     to_station_name: str | None = None
     silent: bool = False
+    location_is_mocked: bool = False
+    spoofing_apps_detected: bool = False
+    spoofing_app_packages: list[str] = Field(default_factory=list)
+    location_integrity: dict[str, Any] = Field(default_factory=dict)
+
+
+async def _get_location_spoof_config(db: AsyncSession) -> dict[str, bool]:
+    """Short-lived cache to avoid a config DB read for every GPS update."""
+    global _location_spoof_config_cache
+    now = time.monotonic()
+    cached_at, cached = _location_spoof_config_cache
+    if now - cached_at < _LOCATION_SPOOF_CONFIG_TTL_S:
+        return cached
+
+    config = (await db.execute(select(AppConfig).where(AppConfig.id == 1))).scalar_one_or_none()
+    next_config = (
+        {
+            "enabled": bool(config.location_spoof_protection_enabled),
+            "block_mock": bool(config.block_mock_locations_enabled),
+            "block_fake_gps_apps": bool(config.block_fake_gps_apps_enabled),
+        }
+        if config
+        else dict(_LOCATION_SPOOF_CONFIG_DEFAULTS)
+    )
+    _location_spoof_config_cache = (now, next_config)
+    return next_config
+
+
+def _spoofed_location_response(reason: str, body: LocationUpdateRequest) -> dict[str, Any]:
+    message_ar = (
+        "تم رفض المساهمة لأن قراءة الموقع تبدو غير موثوقة. "
+        "تأكد من إيقاف تطبيقات تغيير الموقع ثم حاول مرة أخرى."
+    )
+    message_en = (
+        "Contribution rejected because the location reading looks untrusted. "
+        "Disable location spoofing apps and try again."
+    )
+    return {
+        "ok": False,
+        "status": "blocked",
+        "error": "spoofed_location",
+        "reason": reason,
+        "message_ar": message_ar,
+        "message_en": message_en,
+        "position_data": None,
+        "location_integrity": {
+            "location_is_mocked": body.location_is_mocked,
+            "spoofing_apps_detected": body.spoofing_apps_detected,
+        },
+    }
 
 
 async def _load_trip_info(train_id: str, trip_id: int) -> None:
@@ -143,6 +207,26 @@ async def post_contributor_location(
             "message_ar": "تم إيقاف مساهمتك مؤقتاً من قبل الإدارة",
             "position_data": None,
         }
+
+    spoof_config = await _get_location_spoof_config(db)
+    if spoof_config["enabled"]:
+        spoof_reason = ""
+        if spoof_config["block_mock"] and body.location_is_mocked:
+            spoof_reason = "mock_location_provider"
+        elif spoof_config["block_fake_gps_apps"] and body.spoofing_apps_detected:
+            spoof_reason = "known_fake_gps_app_installed"
+
+        if spoof_reason:
+            packages = ", ".join(body.spoofing_app_packages[:5])
+            logger.warning(
+                "🚫 [%s] Spoofed location rejected user=%s reason=%s mocked=%s apps=%s",
+                train_id,
+                user_id[:8],
+                spoof_reason,
+                body.location_is_mocked,
+                packages or "-",
+            )
+            return _spoofed_location_response(spoof_reason, body)
 
     # Store user metadata
     user_meta = user.get("user_metadata", {}) or {}

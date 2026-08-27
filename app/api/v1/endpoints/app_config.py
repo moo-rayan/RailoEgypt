@@ -40,6 +40,9 @@ class AppConfigResponse(BaseModel):
     map_viewer_boost_enabled: bool
     map_viewer_boost_min: int
     map_viewer_boost_max: int
+    location_spoof_protection_enabled: bool
+    block_mock_locations_enabled: bool
+    block_fake_gps_apps_enabled: bool
 
 
 class AppConfigUpdateRequest(BaseModel):
@@ -57,6 +60,9 @@ class AppConfigUpdateRequest(BaseModel):
     map_viewer_boost_enabled: Optional[bool] = None
     map_viewer_boost_min: Optional[int] = None
     map_viewer_boost_max: Optional[int] = None
+    location_spoof_protection_enabled: Optional[bool] = None
+    block_mock_locations_enabled: Optional[bool] = None
+    block_fake_gps_apps_enabled: Optional[bool] = None
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -88,6 +94,9 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
             map_viewer_boost_enabled=False,
             map_viewer_boost_min=15,
             map_viewer_boost_max=30,
+            location_spoof_protection_enabled=False,
+            block_mock_locations_enabled=True,
+            block_fake_gps_apps_enabled=True,
         )
 
     return AppConfigResponse(
@@ -105,6 +114,9 @@ async def get_app_config(db: AsyncSession = Depends(get_db)):
         map_viewer_boost_enabled=config.map_viewer_boost_enabled,
         map_viewer_boost_min=config.map_viewer_boost_min,
         map_viewer_boost_max=config.map_viewer_boost_max,
+        location_spoof_protection_enabled=config.location_spoof_protection_enabled,
+        block_mock_locations_enabled=config.block_mock_locations_enabled,
+        block_fake_gps_apps_enabled=config.block_fake_gps_apps_enabled,
     )
 
 
@@ -162,4 +174,7 @@ async def update_app_config(
         map_viewer_boost_enabled=config.map_viewer_boost_enabled,
         map_viewer_boost_min=config.map_viewer_boost_min,
         map_viewer_boost_max=config.map_viewer_boost_max,
+        location_spoof_protection_enabled=config.location_spoof_protection_enabled,
+        block_mock_locations_enabled=config.block_mock_locations_enabled,
+        block_fake_gps_apps_enabled=config.block_fake_gps_apps_enabled,
     )

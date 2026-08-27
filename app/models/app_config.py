@@ -31,4 +31,7 @@ class AppConfig(Base):
     map_viewer_boost_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     map_viewer_boost_min: Mapped[int] = mapped_column(Integer, nullable=False, default=15)
     map_viewer_boost_max: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    location_spoof_protection_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    block_mock_locations_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    block_fake_gps_apps_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     updated_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now(), onupdate=func.now())
