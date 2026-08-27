@@ -1,7 +1,7 @@
 from datetime import date, datetime
 
 from sqlalchemy import Boolean, Date, ForeignKey, Index, Integer, Numeric, String, Text, func
-from sqlalchemy.dialects.postgresql import ARRAY, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -35,13 +35,19 @@ class ContributionSession(Base):
     started_at: Mapped[datetime] = mapped_column(nullable=False)
     ended_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
     end_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="completed")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     is_silent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     session_runs_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     source_session_ids: Mapped[list[str]] = mapped_column(
         ARRAY(UUID(as_uuid=False)),
         nullable=False,
         default=list,
+    )
+    session_progress: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
     )
     accepted_updates_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     rejected_updates_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

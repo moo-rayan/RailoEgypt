@@ -121,6 +121,16 @@ def _source_session_ids(row: Mapping[str, Any]) -> set[str]:
     return {str(item) for item in raw_ids if item}
 
 
+def _session_progress_map(row: Mapping[str, Any]) -> dict[str, Any]:
+    raw_progress = row.get("session_progress") or {}
+    if isinstance(raw_progress, str):
+        try:
+            raw_progress = json.loads(raw_progress)
+        except json.JSONDecodeError:
+            return {}
+    return dict(raw_progress) if isinstance(raw_progress, Mapping) else {}
+
+
 def _catalog_item_by_key(reward_key: str) -> dict[str, Any]:
     key = (reward_key or "").strip()
     for item in REWARD_CATALOG:
@@ -237,7 +247,803 @@ def _summary_from_row(row: Any) -> dict[str, Any]:
     }
 
 
+async def credit_contribution_progress(
+    *,
+    session_id: str,
+    user_id: str,
+    train_number: str,
+    trip_id: int | None,
+    from_station_name: str,
+    to_station_name: str,
+    started_at_ts: float,
+    observed_at_ts: float,
+    is_silent: bool,
+    accepted_updates_count: int,
+    rejected_updates_count: int,
+    raw_distance_m: float,
+    trusted_distance_m: float,
+    first_lat: float | None,
+    first_lng: float | None,
+    last_lat: float | None,
+    last_lng: float | None,
+    max_reported_speed_kmh: float,
+    max_rail_distance_m: float,
+    max_train_distance_m: float,
+) -> dict[str, Any] | None:
+    """
+    Credit trusted contribution progress as GPS updates are accepted.
+
+    Security boundary:
+      - Called only from server-side tracking state.
+      - The client never submits points or trusted distance for rewards.
+      - Points are derived from the daily trusted-distance rollup, so repeated
+        leave/finalize events cannot award the same distance again.
+    """
+    accepted_updates_count = max(0, int(accepted_updates_count or 0))
+    rejected_updates_count = max(0, int(rejected_updates_count or 0))
+    raw_distance_m = max(0.0, float(raw_distance_m or 0.0))
+    trusted_distance_m = max(0.0, float(trusted_distance_m or 0.0))
+
+    if (
+        accepted_updates_count <= 0
+        and rejected_updates_count <= 0
+        and raw_distance_m <= 0
+        and trusted_distance_m <= 0
+    ):
+        return None
+
+    started_at = _utc_from_ts(started_at_ts)
+    observed_at = _utc_from_ts(observed_at_ts)
+    contribution_date = _contribution_date_from_ts(started_at_ts)
+
+    try:
+        async with AsyncSessionFactory() as session:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {
+                    "lock_key": (
+                        f"contribution_reward:"
+                        f"{user_id}:{train_number}:{contribution_date.isoformat()}"
+                    )
+                },
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO "EgRailway".profiles (id)
+                    VALUES (CAST(:user_id AS uuid))
+                    ON CONFLICT (id) DO NOTHING
+                    """
+                ),
+                {"user_id": user_id},
+            )
+
+            existing = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT
+                            CAST(id AS text) AS id,
+                            train_number,
+                            trip_id,
+                            from_station_name,
+                            to_station_name,
+                            contribution_date,
+                            started_at,
+                            ended_at,
+                            end_reason,
+                            status,
+                            is_silent,
+                            session_runs_count,
+                            source_session_ids,
+                            session_progress,
+                            accepted_updates_count,
+                            rejected_updates_count,
+                            raw_distance_m,
+                            trusted_distance_m,
+                            credited_distance_m,
+                            points_awarded,
+                            unseen_distance_m,
+                            unseen_points_awarded,
+                            first_lat,
+                            first_lng,
+                            last_lat,
+                            last_lng,
+                            max_reported_speed_kmh,
+                            max_rail_distance_m,
+                            max_train_distance_m,
+                            last_session_id,
+                            last_reward_at,
+                            reward_seen_at
+                        FROM "EgRailway".contribution_sessions
+                        WHERE user_id = CAST(:user_id AS uuid)
+                          AND train_number = :train_number
+                          AND contribution_date = :contribution_date
+                        FOR UPDATE
+                        """
+                    ),
+                    {
+                        "user_id": user_id,
+                        "train_number": train_number,
+                        "contribution_date": contribution_date,
+                    },
+                )
+            ).mappings().first()
+
+            has_existing = existing is not None
+            session_already_recorded = (
+                has_existing and session_id in _source_session_ids(existing)
+            )
+            session_runs_delta = 0 if session_already_recorded else 1
+            progress_by_session = (
+                _session_progress_map(existing) if has_existing else {}
+            )
+            previous_session_progress = (
+                progress_by_session.get(session_id, {})
+                if isinstance(progress_by_session.get(session_id, {}), Mapping)
+                else {}
+            )
+            session_previous_trusted_m = _as_float(
+                previous_session_progress.get("trusted_distance_m")
+            )
+            session_previous_raw_m = _as_float(
+                previous_session_progress.get("raw_distance_m")
+            )
+            session_previous_accepted = _as_int(
+                previous_session_progress.get("accepted_updates_count")
+            )
+            session_previous_rejected = _as_int(
+                previous_session_progress.get("rejected_updates_count")
+            )
+            trusted_delta_m = max(0.0, trusted_distance_m - session_previous_trusted_m)
+            raw_delta_m = max(0.0, raw_distance_m - session_previous_raw_m)
+            accepted_delta = max(0, accepted_updates_count - session_previous_accepted)
+            rejected_delta = max(0, rejected_updates_count - session_previous_rejected)
+            progress_by_session[session_id] = {
+                "accepted_updates_count": accepted_updates_count,
+                "rejected_updates_count": rejected_updates_count,
+                "raw_distance_m": round(raw_distance_m, 2),
+                "trusted_distance_m": round(trusted_distance_m, 2),
+                "last_observed_at": observed_at.isoformat(),
+            }
+
+            previous_points = _as_int(existing["points_awarded"]) if has_existing else 0
+            previous_credited_m = (
+                _as_float(existing["credited_distance_m"]) if has_existing else 0.0
+            )
+            previous_trusted_m = (
+                _as_float(existing["trusted_distance_m"]) if has_existing else 0.0
+            )
+            previous_raw_m = (
+                _as_float(existing["raw_distance_m"]) if has_existing else 0.0
+            )
+            previous_accepted = (
+                _as_int(existing["accepted_updates_count"]) if has_existing else 0
+            )
+            previous_rejected = (
+                _as_int(existing["rejected_updates_count"]) if has_existing else 0
+            )
+
+            total_trusted_m = previous_trusted_m + trusted_delta_m
+            total_raw_m = previous_raw_m + raw_delta_m
+            total_accepted = previous_accepted + accepted_delta
+            total_rejected = previous_rejected + rejected_delta
+            total_points = _points_for_distance(total_trusted_m, total_accepted)
+            points_delta = max(total_points - previous_points, 0)
+            credited_distance_m = (
+                total_trusted_m if total_points > 0 else previous_credited_m
+            )
+            profile_distance_delta_m = max(
+                credited_distance_m - previous_credited_m,
+                0.0,
+            )
+            contribution_count_delta = (
+                1 if previous_points <= 0 and total_points > 0 else 0
+            )
+
+            common_params = {
+                "session_id": session_id,
+                "user_id": user_id,
+                "train_number": train_number,
+                "trip_id": trip_id,
+                "from_station_name": from_station_name or "",
+                "to_station_name": to_station_name or "",
+                "contribution_date": contribution_date,
+                "started_at": started_at,
+                "observed_at": observed_at,
+                "is_silent": bool(is_silent),
+                "session_already_recorded": bool(session_already_recorded),
+                "session_runs_delta": session_runs_delta,
+                "session_progress": json.dumps(
+                    progress_by_session,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "accepted_updates_count": accepted_updates_count,
+                "rejected_updates_count": rejected_updates_count,
+                "raw_distance_m": round(raw_distance_m, 2),
+                "trusted_distance_m": round(trusted_distance_m, 2),
+                "total_accepted": total_accepted,
+                "total_rejected": total_rejected,
+                "total_raw_m": round(total_raw_m, 2),
+                "total_trusted_m": round(total_trusted_m, 2),
+                "credited_distance_m": round(credited_distance_m, 2),
+                "points_rate_per_km": POINTS_PER_KM,
+                "points_awarded": total_points,
+                "points_delta": points_delta,
+                "profile_distance_delta_km": round(
+                    profile_distance_delta_m / 1000.0,
+                    2,
+                ),
+                "profile_distance_delta_m": round(profile_distance_delta_m, 2),
+                "contribution_count_delta": contribution_count_delta,
+                "first_lat": first_lat,
+                "first_lng": first_lng,
+                "last_lat": last_lat,
+                "last_lng": last_lng,
+                "max_reported_speed_kmh": round(max_reported_speed_kmh or 0.0, 2),
+                "max_rail_distance_m": max_rail_distance_m,
+                "max_train_distance_m": max_train_distance_m,
+                "has_new_points": points_delta > 0,
+                "last_reward_at": observed_at if points_delta > 0 else None,
+            }
+
+            if has_existing:
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE "EgRailway".contribution_sessions
+                            SET
+                                trip_id = COALESCE(trip_id, :trip_id),
+                                from_station_name = CASE
+                                    WHEN from_station_name = '' THEN :from_station_name
+                                    ELSE from_station_name
+                                END,
+                                to_station_name = CASE
+                                    WHEN :to_station_name <> '' THEN :to_station_name
+                                    ELSE to_station_name
+                                END,
+                                started_at = LEAST(
+                                    started_at,
+                                    CAST(:started_at AS timestamptz)
+                                ),
+                                ended_at = GREATEST(
+                                    ended_at,
+                                    CAST(:observed_at AS timestamptz)
+                                ),
+                                end_reason = '',
+                                status = 'active',
+                                is_silent = is_silent AND CAST(:is_silent AS boolean),
+                                session_runs_count =
+                                    session_runs_count + :session_runs_delta,
+                                source_session_ids = CASE
+                                    WHEN CAST(:session_already_recorded AS boolean)
+                                        THEN source_session_ids
+                                    ELSE array_append(
+                                        COALESCE(
+                                            source_session_ids,
+                                            CAST(ARRAY[] AS uuid[])
+                                        ),
+                                        CAST(:session_id AS uuid)
+                                    )
+                                END,
+                                session_progress = CAST(:session_progress AS jsonb),
+                                accepted_updates_count = :total_accepted,
+                                rejected_updates_count = :total_rejected,
+                                raw_distance_m = :total_raw_m,
+                                trusted_distance_m = :total_trusted_m,
+                                credited_distance_m = :credited_distance_m,
+                                points_rate_per_km = :points_rate_per_km,
+                                points_awarded = :points_awarded,
+                                unseen_distance_m =
+                                    unseen_distance_m + :profile_distance_delta_m,
+                                unseen_points_awarded =
+                                    unseen_points_awarded + :points_delta,
+                                first_lat = COALESCE(first_lat, :first_lat),
+                                first_lng = COALESCE(first_lng, :first_lng),
+                                last_lat = COALESCE(:last_lat, last_lat),
+                                last_lng = COALESCE(:last_lng, last_lng),
+                                max_reported_speed_kmh = GREATEST(
+                                    max_reported_speed_kmh,
+                                    :max_reported_speed_kmh
+                                ),
+                                max_rail_distance_m = GREATEST(
+                                    max_rail_distance_m,
+                                    :max_rail_distance_m
+                                ),
+                                max_train_distance_m = GREATEST(
+                                    max_train_distance_m,
+                                    :max_train_distance_m
+                                ),
+                                last_session_id = CAST(:session_id AS uuid),
+                                last_reward_at = COALESCE(
+                                    CAST(:last_reward_at AS timestamptz),
+                                    last_reward_at
+                                ),
+                                reward_seen_at = CASE
+                                    WHEN CAST(:has_new_points AS boolean) THEN NULL
+                                    ELSE reward_seen_at
+                                END
+                            WHERE id = CAST(:id AS uuid)
+                            RETURNING
+                                CAST(id AS text) AS id,
+                                train_number,
+                                trusted_distance_m,
+                                points_awarded,
+                                unseen_distance_m,
+                                unseen_points_awarded,
+                                started_at,
+                                ended_at
+                            """
+                        ),
+                        {**common_params, "id": existing["id"]},
+                    )
+                ).mappings().first()
+            else:
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO "EgRailway".contribution_sessions (
+                                id,
+                                user_id,
+                                train_number,
+                                trip_id,
+                                from_station_name,
+                                to_station_name,
+                                contribution_date,
+                                started_at,
+                                ended_at,
+                                end_reason,
+                                status,
+                                is_silent,
+                                session_runs_count,
+                                source_session_ids,
+                                session_progress,
+                                accepted_updates_count,
+                                rejected_updates_count,
+                                raw_distance_m,
+                                trusted_distance_m,
+                                credited_distance_m,
+                                points_rate_per_km,
+                                points_awarded,
+                                unseen_distance_m,
+                                unseen_points_awarded,
+                                first_lat,
+                                first_lng,
+                                last_lat,
+                                last_lng,
+                                max_reported_speed_kmh,
+                                max_rail_distance_m,
+                                max_train_distance_m,
+                                last_session_id,
+                                last_reward_at
+                            )
+                            VALUES (
+                                CAST(:session_id AS uuid),
+                                CAST(:user_id AS uuid),
+                                :train_number,
+                                :trip_id,
+                                :from_station_name,
+                                :to_station_name,
+                                CAST(:contribution_date AS date),
+                                CAST(:started_at AS timestamptz),
+                                CAST(:observed_at AS timestamptz),
+                                '',
+                                'active',
+                                CAST(:is_silent AS boolean),
+                                1,
+                                CAST(ARRAY[CAST(:session_id AS uuid)] AS uuid[]),
+                                CAST(:session_progress AS jsonb),
+                                :total_accepted,
+                                :total_rejected,
+                                :total_raw_m,
+                                :total_trusted_m,
+                                :credited_distance_m,
+                                :points_rate_per_km,
+                                :points_awarded,
+                                :profile_distance_delta_m,
+                                :points_delta,
+                                :first_lat,
+                                :first_lng,
+                                :last_lat,
+                                :last_lng,
+                                :max_reported_speed_kmh,
+                                :max_rail_distance_m,
+                                :max_train_distance_m,
+                                CAST(:session_id AS uuid),
+                                CAST(:last_reward_at AS timestamptz)
+                            )
+                            RETURNING
+                                CAST(id AS text) AS id,
+                                train_number,
+                                trusted_distance_m,
+                                points_awarded,
+                                unseen_distance_m,
+                                unseen_points_awarded,
+                                started_at,
+                                ended_at
+                            """
+                        ),
+                        common_params,
+                    )
+                ).mappings().first()
+
+            if points_delta > 0 or profile_distance_delta_m > 0:
+                await session.execute(
+                    text(
+                        """
+                        UPDATE "EgRailway".profiles
+                        SET
+                            is_contributor = TRUE,
+                            contribution_count =
+                                contribution_count + :contribution_count_delta,
+                            total_contribution_distance_km =
+                                total_contribution_distance_km
+                                + :profile_distance_delta_km,
+                            reward_points_balance =
+                                reward_points_balance + :points_delta,
+                            reward_points_lifetime =
+                                reward_points_lifetime + :points_delta,
+                            last_contribution_at = GREATEST(
+                                COALESCE(
+                                    last_contribution_at,
+                                    CAST(:observed_at AS timestamptz)
+                                ),
+                                CAST(:observed_at AS timestamptz)
+                            ),
+                            updated_at = now()
+                        WHERE id = CAST(:user_id AS uuid)
+                        """
+                    ),
+                    common_params,
+                )
+
+            await session.commit()
+
+        if points_delta <= 0:
+            return None
+
+        logger.info(
+            "Reward progress credited: train=%s user=%s date=%s total=%.1fkm "
+            "delta_points=%d",
+            train_number,
+            user_id[:8],
+            contribution_date.isoformat(),
+            _as_float(row["trusted_distance_m"]) / 1000.0 if row else 0.0,
+            points_delta,
+        )
+        return _summary_from_row(row) if row else None
+    except Exception as exc:
+        if _is_likely_schema_error(exc):
+            logger.error(
+                "Contribution rewards schema is not ready for progressive "
+                "crediting. Run the latest contribution reward migrations."
+            )
+        logger.exception(
+            "Failed to credit contribution progress: train=%s user=%s error=%s",
+            train_number,
+            user_id[:8],
+            exc,
+        )
+        raise ContributionRewardPersistenceError(
+            "Failed to credit contribution progress"
+        ) from exc
+
+
 async def finalize_contribution_session(
+    *,
+    session_id: str,
+    user_id: str,
+    train_number: str,
+    trip_id: int | None,
+    from_station_name: str,
+    to_station_name: str,
+    started_at_ts: float,
+    ended_at_ts: float,
+    end_reason: str,
+    is_silent: bool,
+    accepted_updates_count: int,
+    rejected_updates_count: int,
+    raw_distance_m: float,
+    trusted_distance_m: float,
+    first_lat: float | None,
+    first_lng: float | None,
+    last_lat: float | None,
+    last_lng: float | None,
+    max_reported_speed_kmh: float,
+    max_rail_distance_m: float,
+    max_train_distance_m: float,
+) -> dict[str, Any] | None:
+    """
+    Close a contribution run without awarding points.
+
+    Points are credited progressively by ``credit_contribution_progress`` as
+    accepted GPS updates arrive. This finalizer only changes the daily rollup
+    from active to completed/discarded and returns any already-credited unseen
+    summary for the UI.
+    """
+    raw_distance_m = max(0.0, float(raw_distance_m or 0.0))
+    trusted_distance_m = max(0.0, float(trusted_distance_m or 0.0))
+    accepted_updates_count = max(0, int(accepted_updates_count or 0))
+    rejected_updates_count = max(0, int(rejected_updates_count or 0))
+    started_at = _utc_from_ts(started_at_ts)
+    ended_at = _utc_from_ts(ended_at_ts)
+    contribution_date = _contribution_date_from_ts(started_at_ts)
+
+    try:
+        async with AsyncSessionFactory() as session:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+                {
+                    "lock_key": (
+                        f"contribution_reward:"
+                        f"{user_id}:{train_number}:{contribution_date.isoformat()}"
+                    )
+                },
+            )
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO "EgRailway".profiles (id)
+                    VALUES (CAST(:user_id AS uuid))
+                    ON CONFLICT (id) DO NOTHING
+                    """
+                ),
+                {"user_id": user_id},
+            )
+
+            existing = (
+                await session.execute(
+                    text(
+                        """
+                        SELECT
+                            CAST(id AS text) AS id,
+                            source_session_ids,
+                            points_awarded,
+                            unseen_points_awarded
+                        FROM "EgRailway".contribution_sessions
+                        WHERE user_id = CAST(:user_id AS uuid)
+                          AND train_number = :train_number
+                          AND contribution_date = :contribution_date
+                        FOR UPDATE
+                        """
+                    ),
+                    {
+                        "user_id": user_id,
+                        "train_number": train_number,
+                        "contribution_date": contribution_date,
+                    },
+                )
+            ).mappings().first()
+
+            has_existing = existing is not None
+            session_already_recorded = (
+                has_existing and session_id in _source_session_ids(existing)
+            )
+            session_runs_delta = 0 if session_already_recorded else 1
+            status = (
+                "completed"
+                if has_existing and _as_int(existing["points_awarded"]) > 0
+                else "discarded"
+            )
+
+            common_params = {
+                "session_id": session_id,
+                "user_id": user_id,
+                "train_number": train_number,
+                "trip_id": trip_id,
+                "from_station_name": from_station_name or "",
+                "to_station_name": to_station_name or "",
+                "contribution_date": contribution_date,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "end_reason": end_reason or "",
+                "status": status,
+                "is_silent": bool(is_silent),
+                "session_already_recorded": bool(session_already_recorded),
+                "session_runs_delta": session_runs_delta,
+                "accepted_updates_count": accepted_updates_count,
+                "rejected_updates_count": rejected_updates_count,
+                "raw_distance_m": round(raw_distance_m, 2),
+                "trusted_distance_m": round(trusted_distance_m, 2),
+                "points_rate_per_km": POINTS_PER_KM,
+                "first_lat": first_lat,
+                "first_lng": first_lng,
+                "last_lat": last_lat,
+                "last_lng": last_lng,
+                "max_reported_speed_kmh": round(max_reported_speed_kmh or 0.0, 2),
+                "max_rail_distance_m": max_rail_distance_m,
+                "max_train_distance_m": max_train_distance_m,
+            }
+
+            if has_existing:
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            UPDATE "EgRailway".contribution_sessions
+                            SET
+                                trip_id = COALESCE(trip_id, :trip_id),
+                                from_station_name = CASE
+                                    WHEN from_station_name = '' THEN :from_station_name
+                                    ELSE from_station_name
+                                END,
+                                to_station_name = CASE
+                                    WHEN :to_station_name <> '' THEN :to_station_name
+                                    ELSE to_station_name
+                                END,
+                                started_at = LEAST(
+                                    started_at,
+                                    CAST(:started_at AS timestamptz)
+                                ),
+                                ended_at = GREATEST(
+                                    ended_at,
+                                    CAST(:ended_at AS timestamptz)
+                                ),
+                                end_reason = :end_reason,
+                                status = :status,
+                                is_silent = is_silent AND CAST(:is_silent AS boolean),
+                                session_runs_count =
+                                    session_runs_count + :session_runs_delta,
+                                source_session_ids = CASE
+                                    WHEN CAST(:session_already_recorded AS boolean)
+                                        THEN source_session_ids
+                                    ELSE array_append(
+                                        COALESCE(
+                                            source_session_ids,
+                                            CAST(ARRAY[] AS uuid[])
+                                        ),
+                                        CAST(:session_id AS uuid)
+                                    )
+                                END,
+                                points_rate_per_km = :points_rate_per_km,
+                                first_lat = COALESCE(first_lat, :first_lat),
+                                first_lng = COALESCE(first_lng, :first_lng),
+                                last_lat = COALESCE(:last_lat, last_lat),
+                                last_lng = COALESCE(:last_lng, last_lng),
+                                max_reported_speed_kmh = GREATEST(
+                                    max_reported_speed_kmh,
+                                    :max_reported_speed_kmh
+                                ),
+                                max_rail_distance_m = GREATEST(
+                                    max_rail_distance_m,
+                                    :max_rail_distance_m
+                                ),
+                                max_train_distance_m = GREATEST(
+                                    max_train_distance_m,
+                                    :max_train_distance_m
+                                ),
+                                last_session_id = CAST(:session_id AS uuid)
+                            WHERE id = CAST(:id AS uuid)
+                            RETURNING
+                                CAST(id AS text) AS id,
+                                train_number,
+                                trusted_distance_m,
+                                points_awarded,
+                                unseen_distance_m,
+                                unseen_points_awarded,
+                                started_at,
+                                ended_at
+                            """
+                        ),
+                        {**common_params, "id": existing["id"]},
+                    )
+                ).mappings().first()
+            else:
+                row = (
+                    await session.execute(
+                        text(
+                            """
+                            INSERT INTO "EgRailway".contribution_sessions (
+                                id,
+                                user_id,
+                                train_number,
+                                trip_id,
+                                from_station_name,
+                                to_station_name,
+                                contribution_date,
+                                started_at,
+                                ended_at,
+                                end_reason,
+                                status,
+                                is_silent,
+                                session_runs_count,
+                                source_session_ids,
+                                accepted_updates_count,
+                                rejected_updates_count,
+                                raw_distance_m,
+                                trusted_distance_m,
+                                credited_distance_m,
+                                points_rate_per_km,
+                                points_awarded,
+                                unseen_distance_m,
+                                unseen_points_awarded,
+                                first_lat,
+                                first_lng,
+                                last_lat,
+                                last_lng,
+                                max_reported_speed_kmh,
+                                max_rail_distance_m,
+                                max_train_distance_m,
+                                last_session_id
+                            )
+                            VALUES (
+                                CAST(:session_id AS uuid),
+                                CAST(:user_id AS uuid),
+                                :train_number,
+                                :trip_id,
+                                :from_station_name,
+                                :to_station_name,
+                                CAST(:contribution_date AS date),
+                                CAST(:started_at AS timestamptz),
+                                CAST(:ended_at AS timestamptz),
+                                :end_reason,
+                                'discarded',
+                                CAST(:is_silent AS boolean),
+                                1,
+                                CAST(ARRAY[CAST(:session_id AS uuid)] AS uuid[]),
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                :points_rate_per_km,
+                                0,
+                                0,
+                                0,
+                                :first_lat,
+                                :first_lng,
+                                :last_lat,
+                                :last_lng,
+                                :max_reported_speed_kmh,
+                                :max_rail_distance_m,
+                                :max_train_distance_m,
+                                CAST(:session_id AS uuid)
+                            )
+                            RETURNING
+                                CAST(id AS text) AS id,
+                                train_number,
+                                trusted_distance_m,
+                                points_awarded,
+                                unseen_distance_m,
+                                unseen_points_awarded,
+                                started_at,
+                                ended_at
+                            """
+                        ),
+                        common_params,
+                    )
+                ).mappings().first()
+
+            await session.commit()
+
+        if (
+            row is not None
+            and _as_int(row["points_awarded"]) > 0
+            and _as_int(row["unseen_points_awarded"]) > 0
+        ):
+            return _summary_from_row(row)
+        return None
+    except Exception as exc:
+        if _is_likely_schema_error(exc):
+            logger.error(
+                "Contribution rewards schema is not ready. "
+                "Run the latest contribution reward migrations."
+            )
+        logger.exception(
+            "Failed to close contribution reward: train=%s user=%s error=%s",
+            train_number,
+            user_id[:8],
+            exc,
+        )
+        raise ContributionRewardPersistenceError(
+            "Failed to close contribution reward"
+        ) from exc
+
+
+async def _legacy_finalize_contribution_session(
     *,
     session_id: str,
     user_id: str,
@@ -864,6 +1670,26 @@ async def get_pending_reward_summaries(
     exclude_train_numbers = {str(n) for n in (exclude_train_numbers or set())}
     fetch_limit = max(1, min(limit + len(exclude_train_numbers), 20))
     async with AsyncSessionFactory() as session:
+        await session.execute(
+            text(
+                """
+                UPDATE "EgRailway".contribution_sessions
+                SET
+                    status = CASE
+                        WHEN points_awarded > 0 THEN 'completed'
+                        ELSE 'discarded'
+                    END,
+                    end_reason = CASE
+                        WHEN end_reason = '' THEN 'stale_progress_timeout'
+                        ELSE end_reason
+                    END
+                WHERE user_id = CAST(:user_id AS uuid)
+                  AND status = 'active'
+                  AND ended_at < now() - interval '10 minutes'
+                """
+            ),
+            {"user_id": user_id},
+        )
         rows = (
             await session.execute(
                 text(
@@ -889,6 +1715,7 @@ async def get_pending_reward_summaries(
                 {"user_id": user_id, "limit": fetch_limit},
             )
         ).all()
+        await session.commit()
     summaries = [
         _summary_from_row(row)
         for row in rows

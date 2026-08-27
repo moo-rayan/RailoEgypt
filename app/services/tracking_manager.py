@@ -27,6 +27,7 @@ from app.core.cache import cache_delete, cache_get, cache_set
 from app.core.config import settings
 from app.services.contribution_reward_service import (
     ContributionRewardPersistenceError,
+    credit_contribution_progress,
     finalize_contribution_session,
 )
 from app.services.railway_service import railway_graph, _haversine
@@ -46,7 +47,6 @@ _MAX_REWARD_SEGMENT_SPEED_KMH = 180.0  # reward distance plausibility cap
 _REWARD_SEGMENT_GRACE_M = 750.0        # GPS/server timing tolerance
 _PENDING_REWARD_INDEX_KEY = "pending_contribution_reward_sessions"
 _PENDING_REWARD_KEY_PREFIX = "pending_contribution_reward:"
-_PENDING_REWARD_TTL_SECONDS = 7 * 24 * 3600
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -478,132 +478,35 @@ class TrackingManager:
             "max_train_distance_m": _MAX_TRAIN_DISTANCE_M,
         }
 
-    async def _queue_pending_reward_finalization(
-        self,
-        payload: dict,
-        exc: Exception,
-    ) -> None:
-        try:
-            from app.core.cache import get_redis
-
-            r = await get_redis()
-            session_id = str(payload["session_id"])
-            stored_payload = {
-                **payload,
-                "queued_at_ts": time.time(),
-                "last_attempt_ts": time.time(),
-                "attempts": int(payload.get("attempts") or 0) + 1,
-                "last_error": str(getattr(exc, "__cause__", None) or exc)[:500],
-            }
-            await r.setex(
-                f"{_PENDING_REWARD_KEY_PREFIX}{session_id}",
-                _PENDING_REWARD_TTL_SECONDS,
-                json.dumps(stored_payload, ensure_ascii=False),
-            )
-            await r.sadd(_PENDING_REWARD_INDEX_KEY, session_id)
-            await r.expire(_PENDING_REWARD_INDEX_KEY, _PENDING_REWARD_TTL_SECONDS)
-            logger.warning(
-                "Queued contribution reward for retry: train=%s user=%s session=%s",
-                payload.get("train_number"),
-                str(payload.get("user_id", ""))[:8],
-                session_id,
-            )
-        except Exception as queue_exc:
-            logger.exception(
-                "Failed to queue contribution reward retry: train=%s user=%s error=%s",
-                payload.get("train_number"),
-                str(payload.get("user_id", ""))[:8],
-                queue_exc,
-            )
-
-    @staticmethod
-    def _clean_reward_payload(payload: dict) -> dict:
-        allowed_keys = {
-            "session_id",
-            "user_id",
-            "train_number",
-            "trip_id",
-            "from_station_name",
-            "to_station_name",
-            "started_at_ts",
-            "ended_at_ts",
-            "end_reason",
-            "is_silent",
-            "accepted_updates_count",
-            "rejected_updates_count",
-            "raw_distance_m",
-            "trusted_distance_m",
-            "first_lat",
-            "first_lng",
-            "last_lat",
-            "last_lng",
-            "max_reported_speed_kmh",
-            "max_rail_distance_m",
-            "max_train_distance_m",
-        }
-        return {key: payload.get(key) for key in allowed_keys}
-
     async def retry_pending_reward_finalizations(self, limit: int = 25) -> int:
         try:
             from app.core.cache import get_redis
 
             r = await get_redis()
             session_ids = list(await r.smembers(_PENDING_REWARD_INDEX_KEY) or [])
-        except Exception as exc:
-            logger.warning("Failed to read pending reward retry queue: %s", exc)
-            return 0
+            if not session_ids:
+                return 0
 
-        persisted = 0
-        for raw_session_id in session_ids[: max(1, min(limit, 100))]:
-            session_id = (
-                raw_session_id.decode()
-                if isinstance(raw_session_id, bytes)
-                else str(raw_session_id)
+            keys = []
+            for raw_session_id in session_ids[: max(1, min(limit, 100))]:
+                session_id = (
+                    raw_session_id.decode()
+                    if isinstance(raw_session_id, bytes)
+                    else str(raw_session_id)
+                )
+                keys.append(f"{_PENDING_REWARD_KEY_PREFIX}{session_id}")
+
+            if keys:
+                await r.delete(*keys)
+            await r.delete(_PENDING_REWARD_INDEX_KEY)
+            logger.warning(
+                "Dropped %d legacy contribution reward retry payloads; "
+                "rewards are now credited progressively.",
+                len(keys),
             )
-            key = f"{_PENDING_REWARD_KEY_PREFIX}{session_id}"
-            raw_payload = await r.get(key)
-            if not raw_payload:
-                await r.srem(_PENDING_REWARD_INDEX_KEY, session_id)
-                continue
-
-            try:
-                payload = json.loads(raw_payload)
-            except json.JSONDecodeError:
-                await r.delete(key)
-                await r.srem(_PENDING_REWARD_INDEX_KEY, session_id)
-                logger.warning(
-                    "Dropped malformed contribution reward retry payload: %s",
-                    session_id,
-                )
-                continue
-
-            try:
-                await finalize_contribution_session(
-                    **self._clean_reward_payload(payload)
-                )
-            except ContributionRewardPersistenceError as exc:
-                attempts = int(payload.get("attempts") or 0) + 1
-                payload["attempts"] = attempts
-                payload["last_attempt_ts"] = time.time()
-                payload["last_error"] = str(getattr(exc, "__cause__", None) or exc)[:500]
-                await r.setex(
-                    key,
-                    _PENDING_REWARD_TTL_SECONDS,
-                    json.dumps(payload, ensure_ascii=False),
-                )
-                if attempts in (2, 3, 5) or attempts % 10 == 0:
-                    logger.warning(
-                        "Contribution reward retry still failing: session=%s attempts=%d",
-                        session_id,
-                        attempts,
-                    )
-                continue
-
-            await r.delete(key)
-            await r.srem(_PENDING_REWARD_INDEX_KEY, session_id)
-            persisted += 1
-
-        return persisted
+        except Exception as exc:
+            logger.warning("Failed to clear legacy reward retry queue: %s", exc)
+        return 0
 
     async def _finalize_contribution_reward(
         self,
@@ -626,7 +529,14 @@ class TrackingManager:
         try:
             reward_summary = await finalize_contribution_session(**payload)
         except ContributionRewardPersistenceError as exc:
-            await self._queue_pending_reward_finalization(payload, exc)
+            logger.warning(
+                "Contribution reward close failed without awarding points: "
+                "train=%s user=%s session=%s error=%s",
+                room.train_id,
+                contributor.user_id[:8],
+                contributor.reward_session_id,
+                exc,
+            )
             return None
         finally:
             contributor.reward_finalizing = False
@@ -792,16 +702,15 @@ class TrackingManager:
         reward_summary = None
 
         if user_id in room.contributors:
-            contributor = room.contributors[user_id]
+            contributor = room.contributors.pop(user_id)
             display = contributor.display_name or user_id[:8]
+            removed = True
+            was_contributor = True
             reward_summary = await self._finalize_contribution_reward(
                 room,
                 contributor,
                 reason_text,
             )
-            del room.contributors[user_id]
-            removed = True
-            was_contributor = True
             self._log_event(room, "leave", user_id, f"{display} — {reason_text} (remaining: {len(room.contributors)})")
             logger.info("👤- [%s] Contributor left: %s reason=%s (remaining: %d)", train_id, user_id, reason_text, len(room.contributors))
 
@@ -1163,6 +1072,9 @@ class TrackingManager:
                         "message_ar": f"موقعك بعيد عن القطار ({dist_to_train:.0f}م).",
                     }
 
+        if room.contributors.get(user_id) is not contributor:
+            return {"ok": False, "error": "not_a_contributor"}
+
         # Update contributor data
         contributor.lat = lat
         contributor.lng = lng
@@ -1171,6 +1083,36 @@ class TrackingManager:
         contributor.dist_to_rail = distance if distance is not None else 0.0
         contributor.far_from_train_logged = False  # reset: update accepted, contributor is near train
         self._record_reward_update(room, contributor, lat, lng, speed, now)
+        try:
+            await credit_contribution_progress(
+                session_id=contributor.reward_session_id,
+                user_id=contributor.user_id,
+                train_number=room.train_id,
+                trip_id=room.trip_id,
+                from_station_name=contributor.from_station_name,
+                to_station_name=contributor.to_station_name,
+                started_at_ts=contributor.reward_started_at,
+                observed_at_ts=now,
+                is_silent=contributor.is_silent,
+                accepted_updates_count=contributor.reward_accepted_updates,
+                rejected_updates_count=contributor.reward_rejected_updates,
+                raw_distance_m=contributor.reward_raw_distance_m,
+                trusted_distance_m=contributor.reward_trusted_distance_m,
+                first_lat=contributor.reward_first_lat,
+                first_lng=contributor.reward_first_lng,
+                last_lat=contributor.reward_last_lat,
+                last_lng=contributor.reward_last_lng,
+                max_reported_speed_kmh=contributor.reward_max_speed_kmh,
+                max_rail_distance_m=_MAX_RAIL_DISTANCE_M,
+                max_train_distance_m=_MAX_TRAIN_DISTANCE_M,
+            )
+        except ContributionRewardPersistenceError as exc:
+            logger.warning(
+                "Reward progress persistence failed: train=%s user=%s error=%s",
+                train_id,
+                user_id[:8],
+                exc,
+            )
         # Persist last known position (survives room deletion/recreation)
         self._last_positions[user_id] = (lat, lng, speed)
 
