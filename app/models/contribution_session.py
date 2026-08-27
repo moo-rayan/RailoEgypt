@@ -48,7 +48,7 @@ class ContributionSession(Base):
     raw_distance_m: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     trusted_distance_m: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     credited_distance_m: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
-    points_rate_per_km: Mapped[float] = mapped_column(Numeric(8, 2), nullable=False, default=2)
+    points_rate_per_km: Mapped[float] = mapped_column(Numeric(8, 2), nullable=False, default=1)
     points_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unseen_distance_m: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     unseen_points_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

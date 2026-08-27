@@ -14,7 +14,7 @@ from app.core.database import AsyncSessionFactory
 
 logger = logging.getLogger(__name__)
 
-POINTS_PER_KM = 2.0
+POINTS_PER_KM = 1.0
 MIN_REWARDED_DISTANCE_M = 250.0
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
 

@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS "EgRailway".contribution_sessions (
     raw_distance_m          NUMERIC(12, 2) NOT NULL DEFAULT 0,
     trusted_distance_m      NUMERIC(12, 2) NOT NULL DEFAULT 0,
     credited_distance_m     NUMERIC(12, 2) NOT NULL DEFAULT 0,
-    points_rate_per_km      NUMERIC(8, 2) NOT NULL DEFAULT 2,
+    points_rate_per_km      NUMERIC(8, 2) NOT NULL DEFAULT 1,
     points_awarded          INTEGER NOT NULL DEFAULT 0,
     unseen_distance_m       NUMERIC(12, 2) NOT NULL DEFAULT 0,
     unseen_points_awarded   INTEGER NOT NULL DEFAULT 0,
@@ -147,7 +147,7 @@ rollup AS (
         SUM(cs.trusted_distance_m) AS trusted_distance_m,
         CASE
             WHEN SUM(cs.accepted_updates_count) >= 2 AND SUM(cs.trusted_distance_m) >= 250
-                THEN FLOOR((SUM(cs.trusted_distance_m) / 1000.0) * 2.0)::integer
+                THEN FLOOR((SUM(cs.trusted_distance_m) / 1000.0) * 1.0)::integer
             ELSE 0
         END AS points_awarded,
         SUM(cs.unseen_distance_m) AS unseen_distance_m,

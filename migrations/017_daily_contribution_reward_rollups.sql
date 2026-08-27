@@ -101,7 +101,7 @@ rollup AS (
         END AS credited_distance_m,
         CASE
             WHEN SUM(cs.accepted_updates_count) >= 2 AND SUM(cs.trusted_distance_m) >= 250
-                THEN FLOOR((SUM(cs.trusted_distance_m) / 1000.0) * 2.0)::integer
+                THEN FLOOR((SUM(cs.trusted_distance_m) / 1000.0) * 1.0)::integer
             ELSE 0
         END AS points_awarded,
         SUM(cs.unseen_distance_m) AS unseen_distance_m,

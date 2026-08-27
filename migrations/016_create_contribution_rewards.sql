@@ -125,7 +125,7 @@ CREATE TABLE IF NOT EXISTS "EgRailway".contribution_sessions (
     raw_distance_m          NUMERIC(12, 2) NOT NULL DEFAULT 0,
     trusted_distance_m      NUMERIC(12, 2) NOT NULL DEFAULT 0,
     credited_distance_m     NUMERIC(12, 2) NOT NULL DEFAULT 0,
-    points_rate_per_km      NUMERIC(8, 2) NOT NULL DEFAULT 2,
+    points_rate_per_km      NUMERIC(8, 2) NOT NULL DEFAULT 1,
     points_awarded          INTEGER NOT NULL DEFAULT 0,
     unseen_distance_m       NUMERIC(12, 2) NOT NULL DEFAULT 0,
     unseen_points_awarded   INTEGER NOT NULL DEFAULT 0,
