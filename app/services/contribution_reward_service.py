@@ -1,9 +1,11 @@
 import json
 import logging
 import math
+import re
 from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -62,6 +64,10 @@ class InsufficientRewardPoints(ValueError):
     """Raised when a user does not have enough redeemable points."""
 
 
+class InvalidRewardTargetPhone(ValueError):
+    """Raised when a reward redemption phone number is invalid."""
+
+
 class InvalidRewardRedemptionTransition(ValueError):
     """Raised when an admin requests an invalid redemption status change."""
 
@@ -92,6 +98,15 @@ def _as_int(value: Any) -> int:
     return int(value or 0)
 
 
+def _safe_uuid(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _points_for_distance(trusted_distance_m: float, accepted_updates_count: int) -> int:
     if (
         accepted_updates_count < 2
@@ -114,6 +129,20 @@ def _catalog_item_by_key(reward_key: str) -> dict[str, Any]:
     raise RewardCatalogItemNotFound("Unknown reward item")
 
 
+def _normalize_reward_phone(target_phone: str) -> str:
+    translation = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+    phone = (target_phone or "").translate(translation).strip()
+    phone = re.sub(r"[^\d+]", "", phone)
+    if phone.startswith("+20"):
+        phone = "0" + phone[3:]
+    elif phone.startswith("20") and len(phone) == 12:
+        phone = "0" + phone[2:]
+
+    if not re.fullmatch(r"01\d{9}", phone):
+        raise InvalidRewardTargetPhone("Invalid Egyptian mobile phone number")
+    return phone
+
+
 def _redemption_from_row(row: Any) -> dict[str, Any]:
     created_at = _value(row, "created_at")
     updated_at = _value(row, "updated_at")
@@ -126,6 +155,7 @@ def _redemption_from_row(row: Any) -> dict[str, Any]:
         "reward_title_ar": str(_value(row, "reward_title_ar", "")),
         "reward_title_en": str(_value(row, "reward_title_en", "")),
         "points_required": _as_int(_value(row, "points_required")),
+        "target_phone": str(_value(row, "target_phone", "") or ""),
         "status": str(_value(row, "status", "")),
         "user_note": str(_value(row, "user_note", "") or ""),
         "admin_note": str(_value(row, "admin_note", "") or ""),
@@ -741,9 +771,9 @@ async def get_reward_profile(user_id: str) -> dict[str, Any]:
 async def get_reward_leaderboard(
     *,
     user_id: str,
-    limit: int = 50,
+    limit: int = 20,
 ) -> dict[str, Any]:
-    limit = max(1, min(int(limit or 50), 100))
+    limit = max(1, min(int(limit or 20), 20))
 
     async with AsyncSessionFactory() as session:
         rows = (
@@ -892,13 +922,16 @@ async def request_reward_redemption(
     *,
     user_id: str,
     reward_key: str,
+    target_phone: str,
     user_note: str = "",
 ) -> dict[str, Any]:
     catalog_item = _catalog_item_by_key(reward_key)
+    normalized_phone = _normalize_reward_phone(target_phone)
     points_required = int(catalog_item["points_required"])
     metadata = {
         "source": "mobile_app",
         "catalog_snapshot": catalog_item,
+        "target_phone": normalized_phone,
     }
 
     async with AsyncSessionFactory() as session:
@@ -967,6 +1000,7 @@ async def request_reward_redemption(
                         reward_title_ar,
                         reward_title_en,
                         points_required,
+                        target_phone,
                         status,
                         user_note,
                         request_metadata
@@ -977,6 +1011,7 @@ async def request_reward_redemption(
                         :reward_title_ar,
                         :reward_title_en,
                         :points_required,
+                        :target_phone,
                         'pending',
                         :user_note,
                         CAST(:request_metadata AS jsonb)
@@ -988,6 +1023,7 @@ async def request_reward_redemption(
                         reward_title_ar,
                         reward_title_en,
                         points_required,
+                        target_phone,
                         status,
                         user_note,
                         admin_note,
@@ -1004,6 +1040,7 @@ async def request_reward_redemption(
                     "reward_title_ar": catalog_item["title_ar"],
                     "reward_title_en": catalog_item["title_en"],
                     "points_required": points_required,
+                    "target_phone": normalized_phone,
                     "user_note": (user_note or "").strip()[:500],
                     "request_metadata": json.dumps(
                         metadata,
@@ -1218,6 +1255,7 @@ async def list_reward_redemptions(
                 r.reward_title_ar ILIKE :q
                 OR r.reward_title_en ILIKE :q
                 OR r.reward_key ILIKE :q
+                OR r.target_phone ILIKE :q
                 OR CAST(r.user_id AS text) ILIKE :q
                 OR p.email ILIKE :q
                 OR p.display_name ILIKE :q
@@ -1266,6 +1304,7 @@ async def list_reward_redemptions(
                         r.reward_title_ar,
                         r.reward_title_en,
                         r.points_required,
+                        r.target_phone,
                         r.status,
                         r.user_note,
                         r.admin_note,
@@ -1321,6 +1360,10 @@ async def update_reward_redemption_status(
     next_status = (status_value or "").strip()
     if next_status not in {"approved", "rejected", "fulfilled", "cancelled"}:
         raise InvalidRewardRedemptionTransition("Unsupported redemption status")
+    reviewed_by_uuid = _safe_uuid(admin_user_id)
+    reviewed_by_sql = (
+        "CAST(:admin_user_id AS uuid)" if reviewed_by_uuid is not None else "reviewed_by"
+    )
 
     async with AsyncSessionFactory() as session:
         row = (
@@ -1334,6 +1377,7 @@ async def update_reward_redemption_status(
                         r.reward_title_ar,
                         r.reward_title_en,
                         r.points_required,
+                        r.target_phone,
                         r.status,
                         r.user_note,
                         r.admin_note,
@@ -1429,15 +1473,12 @@ async def update_reward_redemption_status(
         updated = (
             await session.execute(
                 text(
-                    """
+                    f"""
                     UPDATE "EgRailway".reward_redemption_requests r
                     SET
                         status = :next_status,
                         admin_note = :admin_note,
-                        reviewed_by = COALESCE(
-                            CAST(:admin_user_id AS uuid),
-                            reviewed_by
-                        ),
+                        reviewed_by = {reviewed_by_sql},
                         reviewed_at = CASE
                             WHEN reviewed_at IS NULL THEN now()
                             ELSE reviewed_at
@@ -1456,6 +1497,7 @@ async def update_reward_redemption_status(
                         r.reward_title_ar,
                         r.reward_title_en,
                         r.points_required,
+                        r.target_phone,
                         r.status,
                         r.user_note,
                         r.admin_note,
@@ -1479,11 +1521,7 @@ async def update_reward_redemption_status(
                     "request_id": request_id,
                     "next_status": next_status,
                     "admin_note": (admin_note or "").strip()[:1000],
-                    "admin_user_id": (
-                        admin_user_id
-                        if admin_user_id and admin_user_id != "legacy-admin"
-                        else None
-                    ),
+                    "admin_user_id": reviewed_by_uuid,
                 },
             )
         ).mappings().first()

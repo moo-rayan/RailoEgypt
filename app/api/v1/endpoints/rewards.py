@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from app.core.security import require_authenticated_user
 from app.services.contribution_reward_service import (
     InsufficientRewardPoints,
+    InvalidRewardTargetPhone,
     RewardCatalogItemNotFound,
     get_pending_reward_summaries,
     get_reward_leaderboard,
@@ -18,6 +19,7 @@ router = APIRouter(prefix="/rewards", tags=["Rewards"])
 
 class RewardRedemptionRequestBody(BaseModel):
     reward_key: str = Field(..., min_length=1, max_length=80)
+    target_phone: str = Field(..., min_length=10, max_length=32)
     user_note: str = Field("", max_length=500)
 
 
@@ -28,7 +30,7 @@ async def rewards_profile(user_id: str = Depends(require_authenticated_user)):
 
 @router.get("/leaderboard")
 async def rewards_leaderboard(
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=20),
     user_id: str = Depends(require_authenticated_user),
 ):
     return await get_reward_leaderboard(user_id=user_id, limit=limit)
@@ -43,6 +45,7 @@ async def redeem_reward(
         redemption = await request_reward_redemption(
             user_id=user_id,
             reward_key=body.reward_key,
+            target_phone=body.target_phone,
             user_note=body.user_note,
         )
     except RewardCatalogItemNotFound as exc:
@@ -51,6 +54,11 @@ async def redeem_reward(
         raise HTTPException(
             status_code=400,
             detail="Not enough reward points",
+        ) from exc
+    except InvalidRewardTargetPhone as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid target phone number",
         ) from exc
     return {"ok": True, "redemption": redemption}
 

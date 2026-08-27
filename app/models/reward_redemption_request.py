@@ -28,6 +28,7 @@ class RewardRedemptionRequest(Base):
     reward_title_ar: Mapped[str] = mapped_column(Text, nullable=False)
     reward_title_en: Mapped[str] = mapped_column(Text, nullable=False)
     points_required: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_phone: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     user_note: Mapped[str] = mapped_column(Text, nullable=False, default="")
     admin_note: Mapped[str] = mapped_column(Text, nullable=False, default="")
