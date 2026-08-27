@@ -60,6 +60,10 @@ class Profile(Base):
         nullable=False, default=0,
         comment="Total reward points redeemed",
     )
+    reward_points_reserved: Mapped[int] = mapped_column(
+        nullable=False, default=0,
+        comment="Reward points reserved by pending redemption requests",
+    )
 
     is_captain: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False,

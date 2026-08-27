@@ -12,6 +12,7 @@ from app.models.news_view import NewsView
 from app.models.notification_history import NotificationHistory
 from app.models.profile import Profile
 from app.models.railway_graph import RailwayGraphData
+from app.models.reward_redemption_request import RewardRedemptionRequest
 from app.models.station import Station
 from app.models.train import Train
 from app.models.train_seat_layout import TrainSeatLayout
@@ -35,6 +36,7 @@ __all__ = [
     "NotificationHistory",
     "Profile",
     "RailwayGraphData",
+    "RewardRedemptionRequest",
     "Station",
     "Train",
     "TrainSeatLayout",

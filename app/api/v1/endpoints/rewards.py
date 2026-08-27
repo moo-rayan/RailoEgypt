@@ -1,19 +1,49 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.core.security import require_authenticated_user
 from app.services.contribution_reward_service import (
+    InsufficientRewardPoints,
+    RewardCatalogItemNotFound,
     get_pending_reward_summaries,
     get_reward_profile,
     mark_reward_seen,
+    request_reward_redemption,
 )
 from app.services.tracking_manager import tracking_manager
 
 router = APIRouter(prefix="/rewards", tags=["Rewards"])
 
 
+class RewardRedemptionRequestBody(BaseModel):
+    reward_key: str = Field(..., min_length=1, max_length=80)
+    user_note: str = Field("", max_length=500)
+
+
 @router.get("/profile")
 async def rewards_profile(user_id: str = Depends(require_authenticated_user)):
     return await get_reward_profile(user_id)
+
+
+@router.post("/redeem", status_code=status.HTTP_201_CREATED)
+async def redeem_reward(
+    body: RewardRedemptionRequestBody,
+    user_id: str = Depends(require_authenticated_user),
+):
+    try:
+        redemption = await request_reward_redemption(
+            user_id=user_id,
+            reward_key=body.reward_key,
+            user_note=body.user_note,
+        )
+    except RewardCatalogItemNotFound as exc:
+        raise HTTPException(status_code=404, detail="Reward item not found") from exc
+    except InsufficientRewardPoints as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough reward points",
+        ) from exc
+    return {"ok": True, "redemption": redemption}
 
 
 @router.get("/contributions/pending")

@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 from collections.abc import Mapping
@@ -16,16 +17,53 @@ MIN_REWARDED_DISTANCE_M = 250.0
 CAIRO_TZ = ZoneInfo("Africa/Cairo")
 
 REWARD_CATALOG: list[dict[str, Any]] = [
-    {"title_ar": "فكة 5 جنيه", "title_en": "EGP 5 top-up", "points_required": 550},
-    {"title_ar": "شحن 10 جنيه", "title_en": "EGP 10 top-up", "points_required": 1100},
-    {"title_ar": "شحن 15 جنيه", "title_en": "EGP 15 top-up", "points_required": 1650},
-    {"title_ar": "شحن 25 جنيه", "title_en": "EGP 25 top-up", "points_required": 2750},
-    {"title_ar": "شحن 50 جنيه", "title_en": "EGP 50 top-up", "points_required": 5500},
+    {
+        "key": "topup_5",
+        "title_ar": "فكة 5 جنيه",
+        "title_en": "EGP 5 top-up",
+        "points_required": 550,
+    },
+    {
+        "key": "topup_10",
+        "title_ar": "شحن 10 جنيه",
+        "title_en": "EGP 10 top-up",
+        "points_required": 1100,
+    },
+    {
+        "key": "topup_15",
+        "title_ar": "شحن 15 جنيه",
+        "title_en": "EGP 15 top-up",
+        "points_required": 1650,
+    },
+    {
+        "key": "topup_25",
+        "title_ar": "شحن 25 جنيه",
+        "title_en": "EGP 25 top-up",
+        "points_required": 2750,
+    },
+    {
+        "key": "topup_50",
+        "title_ar": "شحن 50 جنيه",
+        "title_en": "EGP 50 top-up",
+        "points_required": 5500,
+    },
 ]
 
 
 class ContributionRewardPersistenceError(RuntimeError):
     """Raised when a reward contribution could not be persisted."""
+
+
+class RewardCatalogItemNotFound(ValueError):
+    """Raised when a client requests an unknown reward catalog item."""
+
+
+class InsufficientRewardPoints(ValueError):
+    """Raised when a user does not have enough redeemable points."""
+
+
+class InvalidRewardRedemptionTransition(ValueError):
+    """Raised when an admin requests an invalid redemption status change."""
 
 
 def _utc_from_ts(timestamp: float) -> datetime:
@@ -66,6 +104,54 @@ def _points_for_distance(trusted_distance_m: float, accepted_updates_count: int)
 def _source_session_ids(row: Mapping[str, Any]) -> set[str]:
     raw_ids = row.get("source_session_ids") or []
     return {str(item) for item in raw_ids if item}
+
+
+def _catalog_item_by_key(reward_key: str) -> dict[str, Any]:
+    key = (reward_key or "").strip()
+    for item in REWARD_CATALOG:
+        if item["key"] == key:
+            return item
+    raise RewardCatalogItemNotFound("Unknown reward item")
+
+
+def _redemption_from_row(row: Any) -> dict[str, Any]:
+    created_at = _value(row, "created_at")
+    updated_at = _value(row, "updated_at")
+    reviewed_at = _value(row, "reviewed_at")
+    fulfilled_at = _value(row, "fulfilled_at")
+    return {
+        "id": str(_value(row, "id", "")),
+        "user_id": str(_value(row, "user_id", "")),
+        "reward_key": str(_value(row, "reward_key", "")),
+        "reward_title_ar": str(_value(row, "reward_title_ar", "")),
+        "reward_title_en": str(_value(row, "reward_title_en", "")),
+        "points_required": _as_int(_value(row, "points_required")),
+        "status": str(_value(row, "status", "")),
+        "user_note": str(_value(row, "user_note", "") or ""),
+        "admin_note": str(_value(row, "admin_note", "") or ""),
+        "reviewed_by": (
+            str(_value(row, "reviewed_by"))
+            if _value(row, "reviewed_by") is not None
+            else None
+        ),
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+        "reviewed_at": reviewed_at.isoformat() if reviewed_at else None,
+        "fulfilled_at": fulfilled_at.isoformat() if fulfilled_at else None,
+        "user": {
+            "email": _value(row, "email"),
+            "display_name": _value(row, "display_name"),
+            "avatar_url": _value(row, "avatar_url"),
+            "reward_points_balance": _as_int(_value(row, "reward_points_balance")),
+            "reward_points_reserved": _as_int(_value(row, "reward_points_reserved")),
+            "reward_points_lifetime": _as_int(_value(row, "reward_points_lifetime")),
+            "reward_points_redeemed": _as_int(_value(row, "reward_points_redeemed")),
+            "contribution_count": _as_int(_value(row, "contribution_count")),
+            "total_contribution_distance_km": _as_float(
+                _value(row, "total_contribution_distance_km")
+            ),
+        },
+    }
 
 
 def _is_likely_schema_error(exc: Exception) -> bool:
@@ -612,6 +698,7 @@ async def get_reward_profile(user_id: str) -> dict[str, Any]:
                         contribution_count,
                         total_contribution_distance_km,
                         reward_points_balance,
+                        reward_points_reserved,
                         reward_points_lifetime,
                         reward_points_redeemed,
                         last_contribution_at
@@ -628,6 +715,7 @@ async def get_reward_profile(user_id: str) -> dict[str, Any]:
             "contribution_count": 0,
             "total_contribution_distance_km": 0.0,
             "reward_points_balance": 0,
+            "reward_points_reserved": 0,
             "reward_points_lifetime": 0,
             "reward_points_redeemed": 0,
             "last_contribution_at": None,
@@ -638,6 +726,7 @@ async def get_reward_profile(user_id: str) -> dict[str, Any]:
         "contribution_count": int(row.contribution_count or 0),
         "total_contribution_distance_km": float(row.total_contribution_distance_km or 0),
         "reward_points_balance": int(row.reward_points_balance or 0),
+        "reward_points_reserved": int(row.reward_points_reserved or 0),
         "reward_points_lifetime": int(row.reward_points_lifetime or 0),
         "reward_points_redeemed": int(row.reward_points_redeemed or 0),
         "last_contribution_at": (
@@ -709,3 +798,607 @@ async def mark_reward_seen(user_id: str, contribution_id: str) -> bool:
         )
         await session.commit()
     return bool(result.rowcount and result.rowcount > 0)
+
+
+async def request_reward_redemption(
+    *,
+    user_id: str,
+    reward_key: str,
+    user_note: str = "",
+) -> dict[str, Any]:
+    catalog_item = _catalog_item_by_key(reward_key)
+    points_required = int(catalog_item["points_required"])
+    metadata = {
+        "source": "mobile_app",
+        "catalog_snapshot": catalog_item,
+    }
+
+    async with AsyncSessionFactory() as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO "EgRailway".profiles (id)
+                VALUES (CAST(:user_id AS uuid))
+                ON CONFLICT (id) DO NOTHING
+                """
+            ),
+            {"user_id": user_id},
+        )
+        profile = (
+            await session.execute(
+                text(
+                    """
+                    SELECT
+                        reward_points_balance,
+                        reward_points_reserved
+                    FROM "EgRailway".profiles
+                    WHERE id = CAST(:user_id AS uuid)
+                    FOR UPDATE
+                    """
+                ),
+                {"user_id": user_id},
+            )
+        ).mappings().first()
+
+        if profile is None:
+            raise RewardCatalogItemNotFound("Profile not found")
+
+        current_balance = _as_int(profile["reward_points_balance"])
+        if current_balance < points_required:
+            raise InsufficientRewardPoints("Not enough reward points")
+
+        update_result = await session.execute(
+            text(
+                """
+                UPDATE "EgRailway".profiles
+                SET
+                    reward_points_balance =
+                        reward_points_balance - :points_required,
+                    reward_points_reserved =
+                        reward_points_reserved + :points_required,
+                    updated_at = now()
+                WHERE id = CAST(:user_id AS uuid)
+                  AND reward_points_balance >= :points_required
+                """
+            ),
+            {
+                "user_id": user_id,
+                "points_required": points_required,
+            },
+        )
+        if not update_result.rowcount:
+            raise InsufficientRewardPoints("Not enough reward points")
+
+        row = (
+            await session.execute(
+                text(
+                    """
+                    INSERT INTO "EgRailway".reward_redemption_requests (
+                        user_id,
+                        reward_key,
+                        reward_title_ar,
+                        reward_title_en,
+                        points_required,
+                        status,
+                        user_note,
+                        request_metadata
+                    )
+                    VALUES (
+                        CAST(:user_id AS uuid),
+                        :reward_key,
+                        :reward_title_ar,
+                        :reward_title_en,
+                        :points_required,
+                        'pending',
+                        :user_note,
+                        CAST(:request_metadata AS jsonb)
+                    )
+                    RETURNING
+                        CAST(id AS text) AS id,
+                        CAST(user_id AS text) AS user_id,
+                        reward_key,
+                        reward_title_ar,
+                        reward_title_en,
+                        points_required,
+                        status,
+                        user_note,
+                        admin_note,
+                        CAST(reviewed_by AS text) AS reviewed_by,
+                        created_at,
+                        updated_at,
+                        reviewed_at,
+                        fulfilled_at
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "reward_key": catalog_item["key"],
+                    "reward_title_ar": catalog_item["title_ar"],
+                    "reward_title_en": catalog_item["title_en"],
+                    "points_required": points_required,
+                    "user_note": (user_note or "").strip()[:500],
+                    "request_metadata": json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                },
+            )
+        ).mappings().first()
+        await session.commit()
+
+    redemption = _redemption_from_row(row)
+    redemption["remaining_balance"] = current_balance - points_required
+    return redemption
+
+
+async def list_reward_contributors(
+    *,
+    page: int = 1,
+    limit: int = 30,
+    search: str = "",
+    sort_by: str = "points",
+    sort_order: str = "desc",
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 30), 100))
+    search = (search or "").strip()
+    params: dict[str, Any] = {
+        "limit": limit,
+        "offset": (page - 1) * limit,
+    }
+    filters = [
+        """
+        (
+            p.contribution_count > 0
+            OR p.total_contribution_distance_km > 0
+            OR p.reward_points_lifetime > 0
+            OR p.reward_points_balance > 0
+            OR p.reward_points_reserved > 0
+            OR p.reward_points_redeemed > 0
+        )
+        """
+    ]
+    if search:
+        filters.append(
+            """
+            (
+                p.display_name ILIKE :q
+                OR p.email ILIKE :q
+                OR CAST(p.id AS text) ILIKE :q
+            )
+            """
+        )
+        params["q"] = f"%{search}%"
+
+    sort_columns = {
+        "points": "p.reward_points_lifetime",
+        "balance": "p.reward_points_balance",
+        "reserved": "p.reward_points_reserved",
+        "redeemed": "p.reward_points_redeemed",
+        "contributions": "p.contribution_count",
+        "distance": "p.total_contribution_distance_km",
+        "last": "p.last_contribution_at",
+    }
+    order_column = sort_columns.get(sort_by, sort_columns["points"])
+    direction = "ASC" if sort_order == "asc" else "DESC"
+    where_clause = "WHERE " + " AND ".join(filters)
+
+    async with AsyncSessionFactory() as session:
+        total = int(
+            (
+                await session.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*) AS total
+                        FROM "EgRailway".profiles p
+                        {where_clause}
+                        """
+                    ),
+                    params,
+                )
+            ).scalar_one()
+            or 0
+        )
+
+        stats = (
+            await session.execute(
+                text(
+                    """
+                    SELECT
+                        COUNT(*) FILTER (
+                            WHERE contribution_count > 0
+                               OR reward_points_lifetime > 0
+                               OR reward_points_balance > 0
+                               OR reward_points_reserved > 0
+                               OR reward_points_redeemed > 0
+                        ) AS contributors_count,
+                        COALESCE(SUM(contribution_count), 0) AS total_contributions,
+                        COALESCE(SUM(total_contribution_distance_km), 0) AS total_distance_km,
+                        COALESCE(SUM(reward_points_lifetime), 0) AS total_points,
+                        COALESCE(SUM(reward_points_balance), 0) AS available_points,
+                        COALESCE(SUM(reward_points_reserved), 0) AS reserved_points,
+                        COALESCE(SUM(reward_points_redeemed), 0) AS redeemed_points
+                    FROM "EgRailway".profiles
+                    """
+                )
+            )
+        ).mappings().first()
+
+        rows = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT
+                        CAST(p.id AS text) AS id,
+                        p.email,
+                        p.display_name,
+                        p.avatar_url,
+                        p.contribution_count,
+                        p.total_contribution_distance_km,
+                        p.reward_points_balance,
+                        p.reward_points_reserved,
+                        p.reward_points_lifetime,
+                        p.reward_points_redeemed,
+                        p.reputation_score,
+                        p.last_contribution_at,
+                        p.created_at,
+                        p.updated_at
+                    FROM "EgRailway".profiles p
+                    {where_clause}
+                    ORDER BY {order_column} {direction} NULLS LAST,
+                             p.contribution_count DESC,
+                             p.created_at DESC
+                    LIMIT :limit OFFSET :offset
+                    """
+                ),
+                params,
+            )
+        ).mappings().all()
+
+    items = []
+    for row in rows:
+        last_contribution_at = row["last_contribution_at"]
+        created_at = row["created_at"]
+        updated_at = row["updated_at"]
+        items.append(
+            {
+                "id": str(row["id"]),
+                "email": row["email"],
+                "display_name": row["display_name"],
+                "avatar_url": row["avatar_url"],
+                "contribution_count": _as_int(row["contribution_count"]),
+                "total_contribution_distance_km": _as_float(
+                    row["total_contribution_distance_km"]
+                ),
+                "reward_points_balance": _as_int(row["reward_points_balance"]),
+                "reward_points_reserved": _as_int(row["reward_points_reserved"]),
+                "reward_points_lifetime": _as_int(row["reward_points_lifetime"]),
+                "reward_points_redeemed": _as_int(row["reward_points_redeemed"]),
+                "reputation_score": _as_float(row["reputation_score"]),
+                "last_contribution_at": (
+                    last_contribution_at.isoformat()
+                    if last_contribution_at
+                    else None
+                ),
+                "created_at": created_at.isoformat() if created_at else None,
+                "updated_at": updated_at.isoformat() if updated_at else None,
+            }
+        )
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total + limit - 1) // limit if total > 0 else 0,
+        "stats": {
+            "contributors_count": _as_int(_value(stats, "contributors_count")),
+            "total_contributions": _as_int(_value(stats, "total_contributions")),
+            "total_distance_km": _as_float(_value(stats, "total_distance_km")),
+            "total_points": _as_int(_value(stats, "total_points")),
+            "available_points": _as_int(_value(stats, "available_points")),
+            "reserved_points": _as_int(_value(stats, "reserved_points")),
+            "redeemed_points": _as_int(_value(stats, "redeemed_points")),
+        },
+    }
+
+
+async def list_reward_redemptions(
+    *,
+    page: int = 1,
+    limit: int = 30,
+    status_filter: str = "all",
+    search: str = "",
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 30), 100))
+    search = (search or "").strip()
+    status_filter = (status_filter or "all").strip()
+    params: dict[str, Any] = {
+        "limit": limit,
+        "offset": (page - 1) * limit,
+    }
+    filters: list[str] = []
+    if status_filter != "all":
+        filters.append("r.status = :status")
+        params["status"] = status_filter
+    if search:
+        filters.append(
+            """
+            (
+                r.reward_title_ar ILIKE :q
+                OR r.reward_title_en ILIKE :q
+                OR r.reward_key ILIKE :q
+                OR CAST(r.user_id AS text) ILIKE :q
+                OR p.email ILIKE :q
+                OR p.display_name ILIKE :q
+            )
+            """
+        )
+        params["q"] = f"%{search}%"
+    where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    async with AsyncSessionFactory() as session:
+        total = int(
+            (
+                await session.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*) AS total
+                        FROM "EgRailway".reward_redemption_requests r
+                        LEFT JOIN "EgRailway".profiles p ON p.id = r.user_id
+                        {where_clause}
+                        """
+                    ),
+                    params,
+                )
+            ).scalar_one()
+            or 0
+        )
+        status_rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM "EgRailway".reward_redemption_requests
+                    GROUP BY status
+                    """
+                )
+            )
+        ).mappings().all()
+        rows = (
+            await session.execute(
+                text(
+                    f"""
+                    SELECT
+                        CAST(r.id AS text) AS id,
+                        CAST(r.user_id AS text) AS user_id,
+                        r.reward_key,
+                        r.reward_title_ar,
+                        r.reward_title_en,
+                        r.points_required,
+                        r.status,
+                        r.user_note,
+                        r.admin_note,
+                        CAST(r.reviewed_by AS text) AS reviewed_by,
+                        r.reviewed_at,
+                        r.fulfilled_at,
+                        r.created_at,
+                        r.updated_at,
+                        p.email,
+                        p.display_name,
+                        p.avatar_url,
+                        p.contribution_count,
+                        p.total_contribution_distance_km,
+                        p.reward_points_balance,
+                        p.reward_points_reserved,
+                        p.reward_points_lifetime,
+                        p.reward_points_redeemed
+                    FROM "EgRailway".reward_redemption_requests r
+                    LEFT JOIN "EgRailway".profiles p ON p.id = r.user_id
+                    {where_clause}
+                    ORDER BY
+                        CASE r.status
+                            WHEN 'pending' THEN 0
+                            WHEN 'approved' THEN 1
+                            ELSE 2
+                        END,
+                        r.created_at DESC
+                    LIMIT :limit OFFSET :offset
+                    """
+                ),
+                params,
+            )
+        ).mappings().all()
+
+    status_counts = {row["status"]: _as_int(row["count"]) for row in status_rows}
+    return {
+        "items": [_redemption_from_row(row) for row in rows],
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": (total + limit - 1) // limit if total > 0 else 0,
+        "status_counts": status_counts,
+    }
+
+
+async def update_reward_redemption_status(
+    *,
+    request_id: str,
+    admin_user_id: str | None,
+    status_value: str,
+    admin_note: str = "",
+) -> dict[str, Any]:
+    next_status = (status_value or "").strip()
+    if next_status not in {"approved", "rejected", "fulfilled", "cancelled"}:
+        raise InvalidRewardRedemptionTransition("Unsupported redemption status")
+
+    async with AsyncSessionFactory() as session:
+        row = (
+            await session.execute(
+                text(
+                    """
+                    SELECT
+                        CAST(r.id AS text) AS id,
+                        CAST(r.user_id AS text) AS user_id,
+                        r.reward_key,
+                        r.reward_title_ar,
+                        r.reward_title_en,
+                        r.points_required,
+                        r.status,
+                        r.user_note,
+                        r.admin_note,
+                        CAST(r.reviewed_by AS text) AS reviewed_by,
+                        r.reviewed_at,
+                        r.fulfilled_at,
+                        r.created_at,
+                        r.updated_at,
+                        p.email,
+                        p.display_name,
+                        p.avatar_url,
+                        p.contribution_count,
+                        p.total_contribution_distance_km,
+                        p.reward_points_balance,
+                        p.reward_points_reserved,
+                        p.reward_points_lifetime,
+                        p.reward_points_redeemed
+                    FROM "EgRailway".reward_redemption_requests r
+                    JOIN "EgRailway".profiles p ON p.id = r.user_id
+                    WHERE r.id = CAST(:request_id AS uuid)
+                    FOR UPDATE OF r, p
+                    """
+                ),
+                {"request_id": request_id},
+            )
+        ).mappings().first()
+
+        if row is None:
+            raise RewardCatalogItemNotFound("Redemption request not found")
+
+        current_status = str(row["status"])
+        if current_status in {"rejected", "fulfilled", "cancelled"}:
+            if current_status != next_status:
+                raise InvalidRewardRedemptionTransition(
+                    "Final redemption status cannot be changed"
+                )
+        elif current_status == "approved" and next_status == "approved":
+            pass
+        elif current_status == "pending" and next_status == "approved":
+            pass
+        elif next_status in {"rejected", "cancelled"}:
+            result = await session.execute(
+                text(
+                    """
+                    UPDATE "EgRailway".profiles
+                    SET
+                        reward_points_reserved =
+                            GREATEST(0, reward_points_reserved - :points_required),
+                        reward_points_balance =
+                            reward_points_balance + :points_required,
+                        updated_at = now()
+                    WHERE id = CAST(:user_id AS uuid)
+                    """
+                ),
+                {
+                    "user_id": row["user_id"],
+                    "points_required": _as_int(row["points_required"]),
+                },
+            )
+            if not result.rowcount:
+                raise InvalidRewardRedemptionTransition(
+                    "Could not refund reserved reward points"
+                )
+        elif next_status == "fulfilled":
+            result = await session.execute(
+                text(
+                    """
+                    UPDATE "EgRailway".profiles
+                    SET
+                        reward_points_reserved =
+                            GREATEST(0, reward_points_reserved - :points_required),
+                        reward_points_redeemed =
+                            reward_points_redeemed + :points_required,
+                        updated_at = now()
+                    WHERE id = CAST(:user_id AS uuid)
+                      AND reward_points_reserved >= :points_required
+                    """
+                ),
+                {
+                    "user_id": row["user_id"],
+                    "points_required": _as_int(row["points_required"]),
+                },
+            )
+            if not result.rowcount:
+                raise InvalidRewardRedemptionTransition(
+                    "User does not have enough reserved reward points"
+                )
+        else:
+            raise InvalidRewardRedemptionTransition(
+                f"Cannot change redemption from {current_status} to {next_status}"
+            )
+
+        updated = (
+            await session.execute(
+                text(
+                    """
+                    UPDATE "EgRailway".reward_redemption_requests r
+                    SET
+                        status = :next_status,
+                        admin_note = :admin_note,
+                        reviewed_by = COALESCE(
+                            CAST(:admin_user_id AS uuid),
+                            reviewed_by
+                        ),
+                        reviewed_at = CASE
+                            WHEN reviewed_at IS NULL THEN now()
+                            ELSE reviewed_at
+                        END,
+                        fulfilled_at = CASE
+                            WHEN :next_status = 'fulfilled' THEN now()
+                            ELSE fulfilled_at
+                        END
+                    FROM "EgRailway".profiles p
+                    WHERE r.id = CAST(:request_id AS uuid)
+                      AND p.id = r.user_id
+                    RETURNING
+                        CAST(r.id AS text) AS id,
+                        CAST(r.user_id AS text) AS user_id,
+                        r.reward_key,
+                        r.reward_title_ar,
+                        r.reward_title_en,
+                        r.points_required,
+                        r.status,
+                        r.user_note,
+                        r.admin_note,
+                        CAST(r.reviewed_by AS text) AS reviewed_by,
+                        r.reviewed_at,
+                        r.fulfilled_at,
+                        r.created_at,
+                        r.updated_at,
+                        p.email,
+                        p.display_name,
+                        p.avatar_url,
+                        p.contribution_count,
+                        p.total_contribution_distance_km,
+                        p.reward_points_balance,
+                        p.reward_points_reserved,
+                        p.reward_points_lifetime,
+                        p.reward_points_redeemed
+                    """
+                ),
+                {
+                    "request_id": request_id,
+                    "next_status": next_status,
+                    "admin_note": (admin_note or "").strip()[:1000],
+                    "admin_user_id": (
+                        admin_user_id
+                        if admin_user_id and admin_user_id != "legacy-admin"
+                        else None
+                    ),
+                },
+            )
+        ).mappings().first()
+        await session.commit()
+
+    return _redemption_from_row(updated)

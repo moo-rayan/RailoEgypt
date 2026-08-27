@@ -4,6 +4,7 @@ from app.api.v1.endpoints import (
     account_deletion,
     admin_audit,
     admin_auth,
+    admin_contributions,
     admin_chat,
     admin_global_chat,
     admin_live,
@@ -56,6 +57,7 @@ api_router.include_router(account_deletion.router)
 api_router.include_router(auth.router)
 api_router.include_router(admin_auth.router)
 api_router.include_router(admin_audit.router)
+api_router.include_router(admin_contributions.router)
 api_router.include_router(admin_users.router)
 api_router.include_router(fares.router)
 api_router.include_router(kiosks.router)
