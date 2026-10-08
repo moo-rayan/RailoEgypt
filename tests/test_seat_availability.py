@@ -3,6 +3,7 @@ import unittest
 from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -12,7 +13,7 @@ from app.api.v1.endpoints.seat_availability import router
 from app.core.database import get_db
 from app.core.security import require_authenticated_user
 from app.services.seat_availability_service import (
-    get_seat_availability, normalize_availability, validate_departure_date,
+    booking_url_for_route, get_seat_availability, normalize_availability, validate_departure_date,
 )
 from app.services.train_seat_layout_importer import CAIRO_TZ
 
@@ -39,6 +40,21 @@ def parse(payload):
 
 
 class AvailabilityParsingTests(unittest.TestCase):
+    def test_booking_link_uses_the_official_station_keys_and_travel_date(self):
+        payload = fixture()
+        step = payload[0]["steps"][0]
+        step["from"] = {"name": "ASWAN", "shortName": "ENR_819"}
+        step["to"] = {"name": "CAIRO", "shortName": "ENR_1"}
+        url = booking_url_for_route(payload, train_number="833", from_id="100", to_id="200", departure_date=date(2026, 10, 9))
+        self.assertEqual(urlparse(url).hostname, "obs.enr.gov.eg")
+        self.assertEqual(parse_qs(urlparse(url).query), {
+            "from": ["ENR_819"], "to": ["ENR_1"], "trip": ["oneway"], "departure": ["2026-10-09"],
+        })
+
+    def test_booking_link_without_station_names_uses_the_base_page(self):
+        url = booking_url_for_route(fixture(), train_number="833", from_id="100", to_id="200", departure_date=date(2026, 10, 9))
+        self.assertEqual(urlparse(url).query, "")
+
     def test_seat_ids_not_numbers_or_counts_define_availability(self):
         coach = parse(fixture())[0]
         self.assertEqual(coach["available_seat_numbers"], ["1", "3"])

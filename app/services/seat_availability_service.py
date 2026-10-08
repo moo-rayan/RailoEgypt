@@ -3,6 +3,7 @@
 import asyncio
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import HTTPException
@@ -21,6 +22,23 @@ from app.services.train_seat_layout_importer import (
 )
 
 _upstream_slots = asyncio.Semaphore(4)
+BOOKING_URL = "https://obs.enr.gov.eg/o-city/obs/enr/railway/ar/booktickets"
+
+
+def booking_url_for_route(payload: Any, *, train_number: str, from_id: str, to_id: str, departure_date: date) -> str:
+    for step in _iter_steps(payload):
+        if (str((step.get("train") or {}).get("name", "")).strip() != train_number or
+            str(step.get("fromId")) != from_id or str(step.get("toId")) != to_id):
+            continue
+        start, finish = step.get("from") or {}, step.get("to") or {}
+        from_name = start.get("shortName") or start.get("name")
+        to_name = finish.get("shortName") or finish.get("name")
+        if from_name and to_name:
+            return BOOKING_URL + "?" + urlencode({
+                "from": from_name, "to": to_name, "trip": "oneway",
+                "departure": departure_date.isoformat(),
+            })
+    return BOOKING_URL
 
 
 def validate_departure_date(value: date, today: date | None = None) -> None:
@@ -183,5 +201,9 @@ async def get_seat_availability(
         "from_station": from_info,
         "to_station": to_info,
         "queried_at": datetime.now(CAIRO_TZ).isoformat(),
+        "booking_url": booking_url_for_route(
+            payload, train_number=train_number, from_id=from_enr_id,
+            to_id=to_enr_id, departure_date=departure_date,
+        ),
         "coaches": coaches,
     }
