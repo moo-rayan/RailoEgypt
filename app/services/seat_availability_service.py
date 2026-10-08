@@ -1,6 +1,7 @@
 """Read-only ENR availability; seat states are never inferred from totals."""
 
 import asyncio
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
@@ -129,7 +130,28 @@ def normalize_availability(
                     "s": seats if has_map else [],
                 },
             })
-    return coaches
+    def coach_order(coach):
+        number = re.search(r"\d+", coach["name"])
+        return (int(number.group()) if number else float("inf"), coach["name"], coach["id"])
+
+    return sorted(coaches, key=coach_order)
+
+
+def route_station_ids(trip) -> list[int]:
+    stops = sorted(trip.stops, key=lambda stop: stop.stop_order)
+    return list(dict.fromkeys(station_id for station_id in [
+        trip.from_station_id, *(stop.station_id for stop in stops), trip.to_station_id,
+    ] if station_id is not None))
+
+
+def station_info(station) -> dict[str, Any]:
+    return {"id": station.id, "name_ar": station.name_ar, "name_en": station.name_en}
+
+
+def earlier_boarding_stations(route: list[int], from_id: int, by_id: dict) -> list[dict[str, Any]]:
+    return [station_info(by_id[station_id])
+            for station_id in reversed(route[:route.index(from_id)])
+            if station_id in by_id and (by_id[station_id].enr_station_id or "").strip()]
 
 
 async def get_seat_availability(
@@ -146,17 +168,13 @@ async def get_seat_availability(
         raise HTTPException(404, detail="availability_train_not_found")
     from_station_id = from_station_id or trip.from_station_id
     to_station_id = to_station_id or trip.to_station_id
-    route = list(dict.fromkeys([
-        trip.from_station_id,
-        *(stop.station_id for stop in trip.stops),
-        trip.to_station_id,
-    ]))
+    route = route_station_ids(trip)
     if (from_station_id is None or to_station_id is None or
         from_station_id not in route or to_station_id not in route or
         route.index(from_station_id) >= route.index(to_station_id)):
         raise HTTPException(422, detail="availability_invalid_route")
     stations = (await db.execute(select(Station).where(
-        Station.id.in_([from_station_id, to_station_id]),
+        Station.id.in_(route[:route.index(from_station_id) + 1] + [to_station_id]),
     ))).scalars().all()
     by_id = {station.id: station for station in stations}
     start, finish = by_id.get(from_station_id), by_id.get(to_station_id)
@@ -164,8 +182,9 @@ async def get_seat_availability(
         raise HTTPException(422, detail="availability_station_mapping_missing")
 
     from_enr_id, to_enr_id = start.enr_station_id.strip(), finish.enr_station_id.strip()
-    from_info = {"id": start.id, "name_ar": start.name_ar, "name_en": start.name_en}
-    to_info = {"id": finish.id, "name_ar": finish.name_ar, "name_en": finish.name_en}
+    from_info, to_info = station_info(start), station_info(finish)
+    earlier_stations = earlier_boarding_stations(route, from_station_id, by_id)
+    resolved_trip_id = trip.id
     # Return the DB connection to its pool before waiting on the external service.
     await db.commit()
 
@@ -198,8 +217,10 @@ async def get_seat_availability(
         raise HTTPException(502, detail="availability_upstream_unavailable") from exc
     return {
         "train_number": train_number, "departure_date": departure_date.isoformat(),
+        "trip_id": resolved_trip_id,
         "from_station": from_info,
         "to_station": to_info,
+        "earlier_boarding_stations": earlier_stations,
         "queried_at": datetime.now(CAIRO_TZ).isoformat(),
         "booking_url": booking_url_for_route(
             payload, train_number=train_number, from_id=from_enr_id,

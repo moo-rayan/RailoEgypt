@@ -13,7 +13,8 @@ from app.api.v1.endpoints.seat_availability import router
 from app.core.database import get_db
 from app.core.security import require_authenticated_user
 from app.services.seat_availability_service import (
-    booking_url_for_route, get_seat_availability, normalize_availability, validate_departure_date,
+    booking_url_for_route, earlier_boarding_stations, get_seat_availability,
+    normalize_availability, route_station_ids, validate_departure_date,
 )
 from app.services.train_seat_layout_importer import CAIRO_TZ
 
@@ -40,6 +41,31 @@ def parse(payload):
 
 
 class AvailabilityParsingTests(unittest.TestCase):
+    def test_coaches_sort_by_number_not_source_order_or_lexicographically(self):
+        payload = fixture()
+        raw = payload[0]["steps"][0]["train"]["servicePoints"][0]
+        payload[0]["steps"][0]["train"]["servicePoints"] = [
+            dict(copy.deepcopy(raw), id=f"coach-{name}", name=name)
+            for name in ["12", "3", "9", "1", "10"]
+        ]
+        self.assertEqual([coach["name"] for coach in parse(payload)], ["1", "3", "9", "10", "12"])
+
+    def test_earlier_stations_follow_stop_order_nearest_first_only(self):
+        trip = SimpleNamespace(from_station_id=1, to_station_id=5, stops=[
+            SimpleNamespace(station_id=4, stop_order=4),
+            SimpleNamespace(station_id=2, stop_order=2),
+            SimpleNamespace(station_id=1, stop_order=1),
+            SimpleNamespace(station_id=3, stop_order=3),
+            SimpleNamespace(station_id=5, stop_order=5),
+        ])
+        route = route_station_ids(trip)
+        self.assertEqual(route, [1, 2, 3, 4, 5])
+        stations = {value: SimpleNamespace(id=value, name_ar=str(value), name_en=str(value), enr_station_id=str(value)) for value in route}
+        self.assertEqual([station["id"] for station in earlier_boarding_stations(route, 4, stations)], [3, 2, 1])
+        self.assertEqual(earlier_boarding_stations(route, 1, stations), [])
+        stations[2].enr_station_id = " "
+        self.assertEqual([station["id"] for station in earlier_boarding_stations(route, 4, stations)], [3, 1])
+
     def test_booking_link_uses_the_official_station_keys_and_travel_date(self):
         payload = fixture()
         step = payload[0]["steps"][0]
@@ -137,11 +163,12 @@ class AvailabilityParsingTests(unittest.TestCase):
 
 class AvailabilityServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_mapped_route_and_query_parameters_with_mock_upstream(self):
-        trip = SimpleNamespace(from_station_id=1, to_station_id=2, stops=[])
+        trip = SimpleNamespace(id=508, from_station_id=3, to_station_id=2, stops=[SimpleNamespace(station_id=1, stop_order=1)])
         start = SimpleNamespace(id=1, enr_station_id="100", name_ar="Aswan", name_en="ASWAN")
         finish = SimpleNamespace(id=2, enr_station_id="200", name_ar="Cairo", name_en="CAIRO")
+        earlier = SimpleNamespace(id=3, enr_station_id="300", name_ar="Luxor", name_en="LUXOR")
         trip_result = SimpleNamespace(unique=lambda: SimpleNamespace(scalar_one_or_none=lambda: trip))
-        stations_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [start, finish]))
+        stations_result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: [start, finish, earlier]))
         db = SimpleNamespace(execute=AsyncMock(side_effect=[trip_result, stations_result]), commit=AsyncMock())
         captured = []
 
@@ -152,12 +179,14 @@ class AvailabilityServiceTests(unittest.IsolatedAsyncioTestCase):
 
         original_client = httpx.AsyncClient
         with patch("app.services.seat_availability_service.httpx.AsyncClient", side_effect=lambda **kwargs: original_client(transport=httpx.MockTransport(upstream), **kwargs)):
-            result = await get_seat_availability(db, train_number="833", departure_date=datetime.now(CAIRO_TZ).date())
+            result = await get_seat_availability(db, train_number="833", from_station_id=1, departure_date=datetime.now(CAIRO_TZ).date())
         self.assertEqual(captured[0]["skip_places_information"], "false")
         self.assertEqual(captured[0]["trainNumber"], "833")
         self.assertEqual(captured[0]["from"], "100")
         self.assertEqual(captured[0]["to"], "200")
         self.assertEqual(result["coaches"][0]["available_count"], 2)
+        self.assertEqual(result["trip_id"], 508)
+        self.assertEqual(result["earlier_boarding_stations"], [{"id": 3, "name_ar": "Luxor", "name_en": "LUXOR"}])
 
 
 class AvailabilityEndpointTests(unittest.TestCase):
