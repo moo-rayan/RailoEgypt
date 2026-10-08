@@ -9,13 +9,14 @@ from app.api.v1.endpoints import data_bundle
 from app.models.train_seat_layout import TrainSeatLayout
 
 
-def layout_row(train_number="185", class_code="BUFFET", seats=12):
+def layout_row(train_number="185", class_code="BUFFET", seats=12, coach_number=None):
     name_ar = "عربة البوفيه" if class_code == "BUFFET" else "ثانية مكيفة"
     name_en = "Buffet car" if class_code == "BUFFET" else "AC Second"
     layout = data_bundle._build_manual_seat_layout(
         train_number=train_number, class_code=class_code,
         class_name_ar=name_ar, class_name_en=name_en,
         coach_count=1, seats_per_coach=seats,
+        coach_number=coach_number,
     )
     return TrainSeatLayout(
         train_number=train_number, class_code=class_code,
@@ -45,6 +46,7 @@ class BuffetLayoutTests(unittest.IsolatedAsyncioTestCase):
         payload = data_bundle.SeatLayoutAdminCreateRequest(
             train_number="185", class_code="BUFFET", class_name_ar="عربة البوفيه",
             class_name_en="Buffet car", coach_count=1, seats_per_coach=12,
+            coach_number=7,
         )
         with patch.object(data_bundle, "_build_seat_layouts_version_info", new=AsyncMock(return_value={"version": "new"})):
             result = await data_bundle.create_admin_seat_layout(payload, db)
@@ -57,6 +59,10 @@ class BuffetLayoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row.seat_count, 12)
         self.assertEqual(result["layout"]["layout"]["class"]["code"], "BUFFET")
         self.assertEqual(len(row.layout["coaches"][0]["seats"]), 12)
+        self.assertEqual(row.layout["coaches"][0]["coach_name"], "7")
+        self.assertEqual(row.layout["coaches"][0]["coach_order"], 1)
+        self.assertEqual(data_bundle._compact_seat_layout(row)["ch"][0]["n"], "7")
+        self.assertEqual([seat["y"] for seat in row.layout["coaches"][0]["seats"][:4]], [-96, -48, 48, 96])
         db.commit.assert_awaited_once()
 
     async def test_existing_buffet_is_not_overwritten_or_duplicated(self):
@@ -89,7 +95,7 @@ class BuffetLayoutTests(unittest.IsolatedAsyncioTestCase):
             scalars=lambda: SimpleNamespace(all=lambda: rows),
         )))
         before = await data_bundle._build_seat_layouts_payload(db)
-        rows.append(layout_row())
+        rows.append(layout_row(coach_number=7))
         after = await data_bundle._build_seat_layouts_payload(db)
         self.assertNotEqual(before["version"], after["version"])
         self.assertEqual([layout["c"] for layout in after["layouts"]["185"]], ["AC 2", "BUFFET"])
@@ -98,6 +104,31 @@ class BuffetLayoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((buffet["a"], buffet["e"], buffet["sc"]), ("عربة البوفيه", "Buffet car", 12))
         self.assertEqual([seat[0] for seat in buffet["ch"][0]["s"]], [str(n) for n in range(1, 13)])
         self.assertEqual([seat[5] for seat in buffet["ch"][0]["s"]], [0] * 4 + [1] * 4 + [0] * 4)
+        self.assertEqual(buffet["ch"][0]["n"], "7")
+
+    async def test_coach_number_cannot_be_repeated_across_multiple_coaches(self):
+        db = SimpleNamespace(execute=AsyncMock(), add=Mock())
+        payload = data_bundle.SeatLayoutAdminCreateRequest(
+            train_number="185", class_code="BUFFET", class_name_ar="عربة البوفيه",
+            coach_count=2, coach_number=7,
+        )
+        with self.assertRaises(HTTPException) as caught:
+            await data_bundle.create_admin_seat_layout(payload, db)
+        self.assertEqual(caught.exception.status_code, 422)
+        db.execute.assert_not_awaited()
+        db.add.assert_not_called()
+
+    def test_optional_coach_number_keeps_existing_manual_layouts_compatible(self):
+        row = layout_row(class_code="AC 2")
+        self.assertEqual(row.layout["coaches"][0]["coach_name"], "1")
+        self.assertEqual([seat["y"] for seat in row.layout["coaches"][0]["seats"][:4]], [-72, -24, 24, 72])
+
+    def test_invalid_coach_numbers_rejected_by_api_schema(self):
+        for number in (0, -1, 1000, 2.5, "seven"):
+            with self.subTest(number=number), self.assertRaises(ValidationError):
+                data_bundle.SeatLayoutAdminCreateRequest(
+                    train_number="185", class_code="BUFFET", class_name_ar="عربة البوفيه", coach_number=number,
+                )
 
     def test_invalid_seat_counts_rejected_by_api_schema(self):
         for count in (0, -1, 121, 2.5):

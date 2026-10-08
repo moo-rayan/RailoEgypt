@@ -60,6 +60,7 @@ class SeatLayoutAdminCreateRequest(BaseModel):
     class_name_en: str = ""
     coach_count: int = Field(1, ge=1, le=40)
     seats_per_coach: int = Field(24, ge=1, le=120)
+    coach_number: int | None = Field(None, ge=1, le=999)
 
 
 class SeatLayoutAdminCopyRequest(BaseModel):
@@ -239,8 +240,13 @@ def _build_manual_seat_layout(
     class_name_en: str,
     coach_count: int,
     seats_per_coach: int,
+    coach_number: int | None = None,
 ) -> dict[str, Any]:
-    y_positions = [-72, -24, 24, 72]
+    y_positions = (
+        [-96, -48, 48, 96]
+        if class_code.strip().upper() == "BUFFET"
+        else [-72, -24, 24, 72]
+    )
     seats_in_row = len(y_positions)
     row_gap = 56
     coaches: list[dict[str, Any]] = []
@@ -269,7 +275,7 @@ def _build_manual_seat_layout(
 
         coaches.append({
             "coach_order": coach_index + 1,
-            "coach_name": str(coach_index + 1),
+            "coach_name": str(coach_number if coach_number is not None else coach_index + 1),
             "enr_coach_id": f"manual:{train_number}:{class_code}:{coach_index + 1}",
             "type": class_name_ar,
             "code": class_code,
@@ -784,6 +790,11 @@ async def create_admin_seat_layout(
     class_code = payload.class_code.strip()
     class_name_ar = payload.class_name_ar.strip()
     class_name_en = payload.class_name_en.strip()
+    if payload.coach_number is not None and payload.coach_count != 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A coach number can only be specified for a single coach layout",
+        )
     if not class_code or not class_name_ar:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -825,6 +836,7 @@ async def create_admin_seat_layout(
         class_name_en=class_name_en,
         coach_count=payload.coach_count,
         seats_per_coach=payload.seats_per_coach,
+        coach_number=payload.coach_number,
     )
     prepared_layout, counts = _prepare_admin_seat_layout_for_target(
         train_number=train_number,
