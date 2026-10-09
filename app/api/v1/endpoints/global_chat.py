@@ -7,10 +7,11 @@ from __future__ import annotations
 import json
 import logging
 import random
+from uuid import UUID as PyUUID
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import cast, select, update as sa_update
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -38,6 +39,32 @@ class GlobalChatReportRequest(BaseModel):
     message_id: str = Field(..., min_length=1, max_length=100)
     message_text: str = Field(..., min_length=1, max_length=500)
     report_reason: str = Field("", max_length=300)
+
+
+class GlobalChatEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1, max_length=150)
+
+
+def _mutation_response(result: dict) -> dict:
+    if result.get("ok"):
+        return result
+    error = result.get("error", "internal_error")
+    errors = {
+        "not_message_owner": (403, "يمكنك تعديل أو حذف رسائلك فقط"),
+        "message_not_found": (404, "الرسالة غير موجودة"),
+        "message_deleted": (409, "تم حذف هذه الرسالة بالفعل"),
+        "edit_window_expired": (409, "يمكن تعديل الرسالة خلال 15 دقيقة من إرسالها فقط"),
+        "moderation_blocked": (403, "لا يمكن حفظ النص لأنه يخالف قواعد الشات"),
+        "chat_disabled": (403, "الشات متوقف حالياً"),
+        "banned": (403, "لا يمكنك تعديل الرسائل أثناء الحظر"),
+        "rate_limited": (429, "انتظر قليلاً قبل محاولة التعديل مرة أخرى"),
+        "empty_message": (422, "اكتب نص الرسالة"),
+        "too_long": (422, "الحد الأقصى للرسالة 150 حرفاً"),
+        "invalid_id": (400, "بيانات الرسالة غير صحيحة"),
+    }
+    status, message = errors.get(error, (500, "تعذر تنفيذ الطلب، حاول مرة أخرى"))
+    raise HTTPException(status_code=status, detail={"error": error, "message_ar": message})
 
 
 async def _require_user(authorization: str) -> dict:
@@ -233,7 +260,7 @@ async def global_chat_websocket(
 @router.get("/messages")
 async def get_global_chat_messages(
     offset: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=200),
     authorization: str = Header(..., description="Bearer <access_token>"),
 ):
     user = await _require_user(authorization)
@@ -247,7 +274,30 @@ async def get_global_chat_messages(
 
 @router.get("/count")
 async def get_global_chat_count():
-    return {"count": await global_chat_manager.get_message_count()}
+    return await global_chat_manager.get_message_summary()
+
+
+@router.post("/messages/{message_id}/edit")
+async def edit_global_message(
+    message_id: PyUUID,
+    body: GlobalChatEditRequest,
+    authorization: str = Header(..., description="Bearer <access_token>"),
+):
+    user = await _require_user(authorization)
+    return _mutation_response(await global_chat_manager.edit_own_message(
+        message_id=str(message_id), user_id=user["id"], text_value=body.text,
+    ))
+
+
+@router.post("/messages/{message_id}/delete")
+async def delete_global_message(
+    message_id: PyUUID,
+    authorization: str = Header(..., description="Bearer <access_token>"),
+):
+    user = await _require_user(authorization)
+    return _mutation_response(await global_chat_manager.delete_own_message(
+        message_id=str(message_id), user_id=user["id"],
+    ))
 
 
 @router.post("/react/{message_id}")

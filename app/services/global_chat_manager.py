@@ -7,7 +7,7 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import WebSocket
@@ -30,6 +30,8 @@ _MAX_MESSAGES_STORED = 500
 _RATE_KEY = "gchat:rate:{user_id}"
 _PUBSUB_CHANNEL = "gchat:events"
 _SETTINGS_KEY = "enabled"
+_EDIT_WINDOW = timedelta(minutes=15)
+_DELETED_TEXT = "تم حذف هذه الرسالة"
 
 VALID_MESSAGE_TYPES = {"normal"}
 VALID_ADMIN_NAMES = {"مشرف", "مسؤول"}
@@ -114,10 +116,7 @@ class GlobalChatManager:
         try:
             r = await get_redis()
             key = _RATE_KEY.format(user_id=user_id)
-            if await r.exists(key):
-                return False
-            await r.setex(key, _RATE_LIMIT_SECONDS, "1")
-            return True
+            return bool(await r.set(key, "1", ex=_RATE_LIMIT_SECONDS, nx=True))
         except Exception as exc:
             logger.warning("Global chat rate limit check failed: %s", exc)
             return True
@@ -146,6 +145,10 @@ class GlobalChatManager:
                             m.reply_to_user_name,
                             m.reply_to_text,
                             m.created_at,
+                            m.updated_at,
+                            m.edited_at,
+                            m.is_deleted,
+                            m.revision,
                             COALESCE(rc.love_count, 0)::int AS love_count,
                             CASE
                                 WHEN CAST(:current_user_id AS uuid) IS NULL THEN false
@@ -164,7 +167,7 @@ class GlobalChatManager:
                             WHERE reaction_type = 'love'
                             GROUP BY message_id
                         ) rc ON rc.message_id = m.id
-                        WHERE m.is_deleted = false
+                        WHERE m.is_deleted = false OR m.deleted_by_user = true
                         ORDER BY m.created_at DESC
                         OFFSET :offset
                         LIMIT :limit
@@ -173,30 +176,163 @@ class GlobalChatManager:
                     {
                         "current_user_id": user_uuid,
                         "offset": max(0, offset),
-                        "limit": min(max(1, limit), 100),
+                        "limit": min(max(1, limit), 200),
                     },
                 )
                 return [self._serialize_message(row) for row in result.mappings().all()]
         except Exception as exc:
             logger.error("Failed to get global chat messages: %s", exc)
-            return []
+            raise
 
     async def get_message_count(self) -> int:
+        return (await self.get_message_summary())["count"]
+
+    async def get_message_summary(self) -> dict:
         try:
             async with AsyncSessionFactory() as session:
                 result = await session.execute(
                     text(
                         """
-                        SELECT COUNT(*)
+                        SELECT COUNT(*) FILTER (WHERE is_deleted = false OR deleted_by_user = true) AS count,
+                               COALESCE(SUM(revision), 0)::text AS revision
                         FROM "EgRailway".global_chat_messages
-                        WHERE is_deleted = false
                         """
                     )
                 )
-                return int(result.scalar() or 0)
+                row = result.mappings().one()
+                return {"count": int(row["count"]), "revision": str(row["revision"])}
         except Exception as exc:
             logger.error("Failed to count global chat messages: %s", exc)
-            return 0
+            return {"count": 0, "revision": None}
+
+    async def edit_own_message(self, message_id: str, user_id: str, text_value: str) -> dict:
+        if not isinstance(text_value, str) or not text_value.strip():
+            return {"ok": False, "error": "empty_message"}
+        if len(text_value) > _MAX_MESSAGE_LENGTH:
+            return {"ok": False, "error": "too_long"}
+        if not await self.is_chat_enabled():
+            return {"ok": False, "error": "chat_disabled"}
+        if (await check_user_banned(user_id)).get("banned"):
+            return {"ok": False, "error": "banned"}
+        moderation = moderate_chat_text(text_value)
+        if not moderation.allowed:
+            return {"ok": False, "error": "moderation_blocked"}
+        clean_text = sanitize_message(text_value)
+        if not clean_text:
+            return {"ok": False, "error": "empty_message"}
+        if not await self.check_rate_limit(user_id):
+            return {"ok": False, "error": "rate_limited"}
+        return await self._mutate_own_message(message_id, user_id, clean_text)
+
+    async def delete_own_message(self, message_id: str, user_id: str) -> dict:
+        return await self._mutate_own_message(message_id, user_id, None)
+
+    async def _mutate_own_message(self, message_id: str, user_id: str, new_text: str | None) -> dict:
+        msg_uuid = _uuid_or_none(message_id)
+        user_uuid = _uuid_or_none(user_id)
+        if msg_uuid is None or user_uuid is None:
+            return {"ok": False, "error": "invalid_id"}
+        deleting = new_text is None
+        try:
+            async with AsyncSessionFactory() as session:
+                result = await session.execute(text('''
+                    SELECT id::text, user_id::text, text, is_admin, is_deleted,
+                           deleted_by_user, created_at, edited_at, updated_at, revision, reply_to_text,
+                           clock_timestamp() AS server_now
+                    FROM "EgRailway".global_chat_messages
+                    WHERE id = CAST(:message_id AS uuid)
+                    FOR UPDATE
+                '''), {"message_id": msg_uuid})
+                row = result.mappings().first()
+                if row is None:
+                    return {"ok": False, "error": "message_not_found"}
+                if row["user_id"] != user_uuid or row["is_admin"]:
+                    return {"ok": False, "error": "not_message_owner"}
+                if row["is_deleted"] and not (deleting and row["deleted_by_user"]):
+                    return {"ok": False, "error": "message_deleted"}
+                if not deleting:
+                    age = row["server_now"] - row["created_at"]
+                    if age < timedelta(0) or age >= _EDIT_WINDOW:
+                        return {"ok": False, "error": "edit_window_expired"}
+
+                if (deleting and row["deleted_by_user"]) or (not deleting and row["text"] == new_text):
+                    replies = await session.execute(text('''
+                        SELECT id::text AS message_id, text, is_deleted, edited_at,
+                               reply_to_text, revision, updated_at
+                        FROM "EgRailway".global_chat_messages
+                        WHERE reply_to_message_id = CAST(:message_id AS uuid) AND is_deleted = false
+                    '''), {"message_id": msg_uuid})
+                    reply_updates = [self._reply_mutation_payload(reply) for reply in replies.mappings().all()]
+                    return {"ok": True, **self._mutation_payload(row), "reply_updates": reply_updates}
+
+                if deleting:
+                    query = '''
+                        UPDATE "EgRailway".global_chat_messages
+                        SET text = '', is_deleted = true, deleted_by_user = true,
+                            deleted_at = clock_timestamp(), edited_at = NULL,
+                            reply_to_message_id = NULL, reply_to_user_name = NULL, reply_to_text = NULL,
+                            revision = revision + 1, updated_at = clock_timestamp()
+                        WHERE id = CAST(:message_id AS uuid) AND user_id = CAST(:user_id AS uuid)
+                          AND is_admin = false AND is_deleted = false
+                        RETURNING id::text, text, is_deleted, edited_at, updated_at, revision, reply_to_text
+                    '''
+                else:
+                    query = '''
+                        UPDATE "EgRailway".global_chat_messages
+                        SET text = :text, edited_at = clock_timestamp(),
+                            updated_at = clock_timestamp(), revision = revision + 1
+                        WHERE id = CAST(:message_id AS uuid) AND user_id = CAST(:user_id AS uuid)
+                          AND is_admin = false AND is_deleted = false
+                          AND created_at <= clock_timestamp()
+                          AND created_at > clock_timestamp() - interval '15 minutes'
+                        RETURNING id::text, text, is_deleted, edited_at, updated_at, revision, reply_to_text
+                    '''
+                updated = await session.execute(text(query), {
+                    "message_id": msg_uuid, "user_id": user_uuid, "text": new_text,
+                })
+                changed = updated.mappings().first()
+                if changed is None:
+                    return {"ok": False, "error": "edit_window_expired" if not deleting else "message_deleted"}
+                replies = await session.execute(text('''
+                    UPDATE "EgRailway".global_chat_messages
+                    SET reply_to_text = :text, revision = revision + 1, updated_at = clock_timestamp()
+                    WHERE reply_to_message_id = CAST(:message_id AS uuid) AND is_deleted = false
+                    RETURNING id::text AS message_id, text, is_deleted, edited_at,
+                              reply_to_text, revision, updated_at
+                '''), {"message_id": msg_uuid, "text": _DELETED_TEXT if deleting else new_text[:80]})
+                reply_updates = [self._reply_mutation_payload(reply) for reply in replies.mappings().all()]
+                if deleting:
+                    await session.execute(text('''
+                        DELETE FROM "EgRailway".global_chat_reactions
+                        WHERE message_id = CAST(:message_id AS uuid)
+                    '''), {"message_id": msg_uuid})
+                await session.commit()
+            payload = self._mutation_payload(changed)
+            payload["reply_updates"] = reply_updates
+            await self.broadcast_event({"type": "message_updated", "data": payload})
+            return {"ok": True, **payload}
+        except Exception:
+            logger.exception("Failed to mutate owned global chat message")
+            return {"ok": False, "error": "internal_error"}
+
+    @staticmethod
+    def _mutation_payload(row: Any) -> dict:
+        data = dict(row)
+        return {
+            "message_id": str(data["id"]), "text": "" if data["is_deleted"] else data["text"],
+            "is_deleted": bool(data["is_deleted"]), "revision": int(data["revision"]),
+            "edited_at": data["edited_at"].isoformat() if data["edited_at"] else None,
+            "updated_at": data["updated_at"].isoformat(),
+            "reply_to_text": data.get("reply_to_text"),
+        }
+
+    @staticmethod
+    def _reply_mutation_payload(row: Any) -> dict:
+        data = dict(row)
+        data["updated_at"] = data["updated_at"].isoformat()
+        if "edited_at" in data:
+            data["edited_at"] = data["edited_at"].isoformat() if data["edited_at"] else None
+        return data
 
     async def is_chat_enabled(self) -> bool:
         try:
@@ -361,6 +497,7 @@ class GlobalChatManager:
                         FROM "EgRailway".global_chat_messages
                         WHERE id = CAST(:message_id AS uuid)
                           AND is_deleted = false
+                        FOR SHARE
                         """
                     ),
                     {"message_id": msg_uuid},
@@ -438,10 +575,12 @@ class GlobalChatManager:
                         """
                         UPDATE "EgRailway".global_chat_messages
                         SET is_deleted = true,
+                            deleted_by_user = false,
+                            revision = revision + 1,
                             deleted_at = now(),
                             updated_at = now()
                         WHERE id = CAST(:message_id AS uuid)
-                          AND is_deleted = false
+                          AND (is_deleted = false OR deleted_by_user = true)
                         RETURNING id::text AS id
                         """
                     ),
@@ -469,9 +608,11 @@ class GlobalChatManager:
                         """
                         UPDATE "EgRailway".global_chat_messages
                         SET is_deleted = true,
+                            deleted_by_user = false,
+                            revision = revision + 1,
                             deleted_at = COALESCE(deleted_at, now()),
                             updated_at = now()
-                        WHERE is_deleted = false
+                        WHERE is_deleted = false OR deleted_by_user = true
                         """
                     )
                 )
@@ -567,6 +708,18 @@ class GlobalChatManager:
             reply_text = sanitize_message(str(reply_to.get("text", "")))[:80]
 
         async with AsyncSessionFactory() as session:
+            if reply_message_id:
+                source = await session.execute(text('''
+                    SELECT id::text, user_name, LEFT(text, 80) AS text
+                    FROM "EgRailway".global_chat_messages
+                    WHERE id = CAST(:message_id AS uuid) AND is_deleted = false
+                    FOR SHARE
+                '''), {"message_id": reply_message_id})
+                original = source.mappings().first()
+                if original is None:
+                    reply_message_id = reply_user_name = reply_text = ""
+                else:
+                    reply_user_name, reply_text = original["user_name"], original["text"]
             result = await session.execute(
                 text(
                     """
@@ -633,12 +786,14 @@ class GlobalChatManager:
                         WITH visible AS (
                             SELECT id
                             FROM "EgRailway".global_chat_messages
-                            WHERE is_deleted = false
+                            WHERE is_deleted = false OR deleted_by_user = true
                             ORDER BY created_at DESC
                             OFFSET :max_messages
                         )
                         UPDATE "EgRailway".global_chat_messages m
                         SET is_deleted = true,
+                            deleted_by_user = false,
+                            revision = revision + 1,
                             deleted_at = now(),
                             updated_at = now()
                         FROM visible
@@ -733,16 +888,20 @@ class GlobalChatManager:
             "user_id": str(user_id) if user_id else "admin",
             "user_name": data.get("user_name") or "مجهول",
             "user_avatar": data.get("user_avatar") or "",
-            "text": data.get("text") or "",
+            "text": "" if data.get("is_deleted") else data.get("text") or "",
+            "is_deleted": bool(data.get("is_deleted")),
+            "edited_at": data["edited_at"].isoformat() if data.get("edited_at") else None,
+            "updated_at": data["updated_at"].isoformat() if data.get("updated_at") else timestamp,
+            "revision": int(data.get("revision") or 0),
             "type": data.get("type") or "normal",
             "pinned": False,
             "is_pinned": False,
             "is_admin": bool(data.get("is_admin")),
-            "reply_to_message_id": data.get("reply_to_message_id") or None,
-            "reply_to_user_name": data.get("reply_to_user_name") or None,
-            "reply_to_text": data.get("reply_to_text") or None,
-            "love_count": int(data.get("love_count") or 0),
-            "loved_by_me": bool(data.get("loved_by_me")),
+            "reply_to_message_id": None if data.get("is_deleted") else data.get("reply_to_message_id") or None,
+            "reply_to_user_name": None if data.get("is_deleted") else data.get("reply_to_user_name") or None,
+            "reply_to_text": None if data.get("is_deleted") else data.get("reply_to_text") or None,
+            "love_count": 0 if data.get("is_deleted") else int(data.get("love_count") or 0),
+            "loved_by_me": not data.get("is_deleted") and bool(data.get("loved_by_me")),
             "timestamp": timestamp,
         }
 
