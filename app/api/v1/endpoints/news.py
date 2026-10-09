@@ -164,6 +164,7 @@ async def create_news(
         title=data.title,
         body=data.body,
         image_url=data.image_url,
+        image_urls=data.image_urls or [],
         is_published=data.is_published,
         published_at=func.now() if data.is_published else None,
         created_by=uuid.UUID(admin.user_id),
@@ -192,8 +193,21 @@ async def update_news(
         article.title = data.title
     if data.body is not None:
         article.body = data.body
-    if data.image_url is not None:
-        article.image_url = data.image_url
+    if {"image_url", "image_urls"} & data.model_fields_set:
+        images = list(article.image_urls or ([article.image_url] if article.image_url else []))
+        if "image_urls" in data.model_fields_set:
+            images = list(data.image_urls or [])
+        elif "image_url" in data.model_fields_set:
+            # Preserve legacy clients which only send a single image.
+            if data.image_url is None:
+                images = []
+            elif data.image_url not in images:
+                images = [data.image_url]
+        cover = data.image_url if "image_url" in data.model_fields_set else article.image_url
+        if cover not in images:
+            cover = images[0] if images else None
+        article.image_urls = images
+        article.image_url = cover
     if data.is_published is not None:
         was_published = article.is_published
         article.is_published = data.is_published
